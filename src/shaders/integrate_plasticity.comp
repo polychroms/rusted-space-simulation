@@ -118,7 +118,7 @@ void main() {
     float sigma_eq_eff = 0.0;
     float theta = clamp((temp - 293.0) / max(m.fracture.z - 293.0, 50.0), 0.0, 0.999);
     float thermal_m = max(m.jc_jwl.z, 0.5);
-    float thermal_soft = 1.0 - pow(theta, thermal_m);
+    float thermal_soft = (theta > 1e-4) ? (1.0 - pow(theta, thermal_m)) : 1.0;
 
     if (det_state == 2u || temp >= m.fracture.z) {
         s = vec3(0.0);
@@ -150,7 +150,8 @@ void main() {
 
         float p_conf = max(sph_p, 0.0);
         // Drucker-Prager confined rubble shear resistance survives even after brittle micro-fracture!
-        float y_coh = m.strength.y * (1.0 + m.strength.z * pow(max(eps_p, 0.0), 0.48)) * dmg_soft;
+        float work_h = (eps_p > 1e-6) ? pow(eps_p, 0.48) : 0.0;
+        float y_coh = m.strength.y * (1.0 + m.strength.z * work_h) * dmg_soft;
         float y_rub = m.strength.w * p_conf * (1.0 - 0.35 * dmg);
         float y_flow = (y_coh + y_rub) * rate_mult * thermal_soft;
 
@@ -246,13 +247,24 @@ void main() {
         vel += 0.5 * acc * dt;
     }
 
-    float new_e = max(energy + de_dt * dt + plastic_heat, 0.0);
-    if (det_state == 2u && neighbors < 8.0) {
-        new_e *= max(1.0 - 0.14 * dt, 0.85);
+    float rad_cool_e = 0.0;
+    if (det_state != 2u && neighbors < 7.0 && temp > 700.0) {
+        float t_norm = min(temp, 8000.0) * 0.001;
+        float exposure = clamp(7.5 - neighbors, 0.0, 6.0);
+        rad_cool_e = 1.6e-5 * exposure * (t_norm * t_norm * t_norm * t_norm) * dt;
     }
-    float delta_e = new_e - energy;
-    energy = new_e;
-    temp = clamp(temp + delta_e / max(m.fracture.w, 1e-7), 50.0, 24000.0);
+    if (det_state != 2u && dmg > 0.35 && temp > max(0.55 * m.fracture.z, 450.0) && temp < 0.90 * m.fracture.z && neighbors >= 4.0 && shock_comp < 0.02) {
+        dmg = max(dmg - 0.035 * dt, 0.20);
+    }
+
+    float mech_e = max(energy + de_dt * dt + plastic_heat, 0.0);
+    if (det_state == 2u && neighbors < 8.0) {
+        mech_e *= max(1.0 - 0.14 * dt, 0.85);
+    }
+    float mech_de = mech_e - energy;
+    energy = max(mech_e - rad_cool_e, 0.0);
+    float temp_floor = (temp >= 293.0) ? 293.0 : 50.0;
+    temp = clamp(temp + (mech_de - rad_cool_e) / max(m.fracture.w, 1e-7), temp_floor, 24000.0);
 
     float net_p = (det_state == 2u) ? sph_p : (-sigma_mean);
 

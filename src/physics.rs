@@ -628,122 +628,119 @@ impl ContinuumWorld {
     pub fn import_gpu_particles(&mut self, src: &[GpuParticle], substeps: usize, dt: f32) {
         let n = self.len().min(src.len());
         let (melted, detonated, fractured) = if n >= 2048 {
+            const CHUNK: usize = 512;
             let src_s = &src[..n];
             let mat_ref = &self.mat[..n];
-            self.pos[..n]
-                .par_iter_mut()
-                .zip(&mut self.vel[..n])
-                .zip(&mut self.acc[..n])
-                .zip(&mut self.xsph_dv[..n])
-                .zip(&mut self.rho[..n])
-                .zip(&mut self.energy[..n])
-                .zip(&mut self.temp[..n])
-                .zip(&mut self.s_xx[..n])
-                .zip(&mut self.s_yy[..n])
-                .zip(&mut self.s_xy[..n])
-                .zip(&mut self.sph_pressure[..n])
-                .zip(&mut self.plastic_strain[..n])
-                .zip(&mut self.damage[..n])
-                .zip(&mut self.net_pressure[..n])
-                .zip(&mut self.det_timer[..n])
-                .zip(&mut self.det_age[..n])
-                .zip(&mut self.shock_rate[..n])
-                .zip(&mut self.crumb_angle[..n])
-                .zip(&mut self.crumb_spin[..n])
-                .zip(&mut self.det_state[..n])
-                .enumerate()
-                .map(
-                    |(
-                        i,
-                        (
-                            (
-                                (
-                                    (
-                                        (
-                                            (
-                                                (
-                                                    (
-                                                        (
-                                                            (
-                                                                (
-                                                                    (
-                                                                        (
-                                                                            (
-                                                                                (
-                                                                                    (
-                                                                                        (
-                                                                                            (
-                                                                                                (
-                                                                                                    pos,
-                                                                                                    vel,
-                                                                                                ),
-                                                                                                acc,
-                                                                                            ),
-                                                                                            xsph,
-                                                                                        ),
-                                                                                        rho,
-                                                                                    ),
-                                                                                    energy,
-                                                                                ),
-                                                                                temp,
-                                                                            ),
-                                                                            s_xx,
-                                                                        ),
-                                                                        s_yy,
-                                                                    ),
-                                                                    s_xy,
-                                                                ),
-                                                                sph_p,
-                                                            ),
-                                                            eps_p,
-                                                        ),
-                                                        dmg,
-                                                    ),
-                                                    net_p,
-                                                ),
-                                                det_t,
-                                            ),
-                                            det_a,
-                                        ),
-                                        shock_r,
-                                    ),
-                                    c_ang,
-                                ),
-                                c_spin,
-                            ),
-                            det_s,
-                        ),
-                    )| {
-                        let p = &src_s[i];
-                        *pos = Vec2::new(p.pos_vel[0], p.pos_vel[1]);
-                        *vel = Vec2::new(p.pos_vel[2], p.pos_vel[3]);
-                        *acc = Vec2::new(p.acc_xsph[0], p.acc_xsph[1]);
-                        *xsph = Vec2::new(p.acc_xsph[2], p.acc_xsph[3]);
-                        *rho = p.thermo[0];
-                        *energy = p.thermo[2];
-                        *temp = p.thermo[3];
-                        *s_xx = p.stress[0];
-                        *s_yy = p.stress[1];
-                        *s_xy = p.stress[2];
-                        *sph_p = p.stress[3];
-                        *eps_p = p.mech[0];
-                        *dmg = p.mech[1];
-                        *net_p = p.mech[2];
-                        *det_t = p.det_aux[0];
-                        *det_a = p.det_aux[1];
-                        *shock_r = p.det_aux[2];
-                        *c_ang = p.det_aux[3];
-                        *c_spin = p.grav_pad[2];
-                        *det_s = p.meta[2] as u8;
-
-                        let mp = mat_ref[i].props();
-                        let is_m = usize::from(*temp >= mp.melt_temp);
-                        let is_d = usize::from(*det_s == 2);
-                        let is_f = usize::from(*det_s != 2 && *dmg >= 0.70);
-                        (is_m, is_d, is_f)
-                    },
-                )
-                .reduce(|| (0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
+            let (_, ((m1, d1, f1), (m2, d2, f2))) = rayon::join(
+                || {
+                    rayon::join(
+                        || {
+                            self.pos[..n]
+                                .par_chunks_mut(CHUNK)
+                                .zip(self.vel[..n].par_chunks_mut(CHUNK))
+                                .zip(self.acc[..n].par_chunks_mut(CHUNK))
+                                .zip(self.xsph_dv[..n].par_chunks_mut(CHUNK))
+                                .zip(self.rho[..n].par_chunks_mut(CHUNK))
+                                .zip(self.energy[..n].par_chunks_mut(CHUNK))
+                                .enumerate()
+                                .for_each(|(c, (((((pos, vel), acc), xsph), rho), energy))| {
+                                    let base = c * CHUNK;
+                                    for k in 0..pos.len() {
+                                        let p = &src_s[base + k];
+                                        pos[k] = Vec2::new(p.pos_vel[0], p.pos_vel[1]);
+                                        vel[k] = Vec2::new(p.pos_vel[2], p.pos_vel[3]);
+                                        acc[k] = Vec2::new(p.acc_xsph[0], p.acc_xsph[1]);
+                                        xsph[k] = Vec2::new(p.acc_xsph[2], p.acc_xsph[3]);
+                                        rho[k] = p.thermo[0];
+                                        energy[k] = p.thermo[2];
+                                    }
+                                });
+                        },
+                        || {
+                            self.s_xx[..n]
+                                .par_chunks_mut(CHUNK)
+                                .zip(self.s_yy[..n].par_chunks_mut(CHUNK))
+                                .zip(self.s_xy[..n].par_chunks_mut(CHUNK))
+                                .zip(self.sph_pressure[..n].par_chunks_mut(CHUNK))
+                                .zip(self.plastic_strain[..n].par_chunks_mut(CHUNK))
+                                .zip(self.net_pressure[..n].par_chunks_mut(CHUNK))
+                                .enumerate()
+                                .for_each(|(c, (((((sxx, syy), sxy), sphp), ep), np))| {
+                                    let base = c * CHUNK;
+                                    for k in 0..sxx.len() {
+                                        let p = &src_s[base + k];
+                                        sxx[k] = p.stress[0];
+                                        syy[k] = p.stress[1];
+                                        sxy[k] = p.stress[2];
+                                        sphp[k] = p.stress[3];
+                                        ep[k] = p.mech[0];
+                                        np[k] = p.mech[2];
+                                    }
+                                });
+                        },
+                    )
+                },
+                || {
+                    rayon::join(
+                        || {
+                            self.temp[..n]
+                                .par_chunks_mut(CHUNK)
+                                .zip(self.damage[..n].par_chunks_mut(CHUNK))
+                                .zip(self.det_state[..n].par_chunks_mut(CHUNK))
+                                .enumerate()
+                                .map(|(c, ((temp, dmg), det_s))| {
+                                    let base = c * CHUNK;
+                                    let mut m = 0usize;
+                                    let mut d = 0usize;
+                                    let mut f = 0usize;
+                                    for k in 0..temp.len() {
+                                        let idx = base + k;
+                                        let p = &src_s[idx];
+                                        let t = p.thermo[3];
+                                        let dv = p.mech[1];
+                                        let ds = p.meta[2] as u8;
+                                        temp[k] = t;
+                                        dmg[k] = dv;
+                                        det_s[k] = ds;
+                                        let mp = mat_ref[idx].props();
+                                        if t >= mp.melt_temp {
+                                            m += 1;
+                                        }
+                                        if ds == 2 {
+                                            d += 1;
+                                        } else if dv >= 0.70 {
+                                            f += 1;
+                                        }
+                                    }
+                                    (m, d, f)
+                                })
+                                .reduce(|| (0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
+                        },
+                        || {
+                            self.det_timer[..n]
+                                .par_chunks_mut(CHUNK)
+                                .zip(self.det_age[..n].par_chunks_mut(CHUNK))
+                                .zip(self.shock_rate[..n].par_chunks_mut(CHUNK))
+                                .zip(self.crumb_angle[..n].par_chunks_mut(CHUNK))
+                                .zip(self.crumb_spin[..n].par_chunks_mut(CHUNK))
+                                .enumerate()
+                                .for_each(|(c, ((((dt_buf, da), sr), ca), cs))| {
+                                    let base = c * CHUNK;
+                                    for k in 0..dt_buf.len() {
+                                        let p = &src_s[base + k];
+                                        dt_buf[k] = p.det_aux[0];
+                                        da[k] = p.det_aux[1];
+                                        sr[k] = p.det_aux[2];
+                                        ca[k] = p.det_aux[3];
+                                        cs[k] = p.grav_pad[2];
+                                    }
+                                });
+                            (0usize, 0usize, 0usize)
+                        },
+                    )
+                },
+            );
+            (m1 + m2, d1 + d2, f1 + f2)
         } else {
             let mut melted = 0usize;
             let mut detonated = 0usize;
@@ -1127,6 +1124,29 @@ impl ContinuumWorld {
                                     de += w_visc_i * (-f_eos_used * vn + 0.5 * f_visc * v_close)
                                         / mass_i.max(1e-6);
                                 }
+                                if ((!grav_active && temp_i.max(temp_j) > 450.0)
+                                    || (grav_active && temp_i.max(temp_j) > 1600.0))
+                                    && (temp_j - temp_i).abs() > 80.0
+                                {
+                                    de += 2.2e-7
+                                        * ramp
+                                        * (temp_j - temp_i)
+                                        * (mj / (mass_i + mj).max(1e-6));
+                                }
+                                if body_i == body_j
+                                    && melt_i > 0.75
+                                    && melt_j > 0.75
+                                    && r > 0.98 * dx_val
+                                    && r < 1.22 * dx_val
+                                {
+                                    let phase_liq =
+                                        (pi_c * (r - 0.98 * dx_val) / (0.24 * dx_val)).sin();
+                                    let m_pair_liq = (2.0 * mj) / (mass_i + mj).max(1e-6);
+                                    acc_i -= nij
+                                        * (0.0014 * cbar * cbar / dx_val.max(0.05))
+                                        * phase_liq
+                                        * m_pair_liq;
+                                }
 
                                 c_w_sum += ramp;
                                 if grav_active {
@@ -1468,7 +1488,11 @@ impl ContinuumWorld {
                     let mut sigma_eq_eff = 0.0f32;
                     let theta =
                         ((*temp - 293.0) / (m.melt_temp - 293.0).max(50.0)).clamp(0.0, 0.999);
-                    let thermal_soft = 1.0 - theta.powf(mat_id.thermal_m());
+                    let thermal_soft = if theta > 1e-4 {
+                        1.0 - theta.powf(mat_id.thermal_m())
+                    } else {
+                        1.0
+                    };
 
                     if *det_state == 2 || *temp >= m.melt_temp {
                         *s_xx = 0.0;
@@ -1511,9 +1535,12 @@ impl ContinuumWorld {
                         let rate_mult = 1.0 + mat_id.jc_rate_c() * (edot_eq * 1.0e6).max(1.0).ln();
 
                         let p_conf = sph_p.max(0.0);
-                        let y_coh = m.yield_strength
-                            * (1.0 + m.hardening * eps_p.max(0.0).powf(0.48))
-                            * dmg_soft;
+                        let work_h = if *eps_p > 1e-6 {
+                            eps_p.powf(0.48)
+                        } else {
+                            0.0
+                        };
+                        let y_coh = m.yield_strength * (1.0 + m.hardening * work_h) * dmg_soft;
                         let y_rub = m.pressure_hardening * p_conf * (1.0 - 0.35 * *dmg);
                         let y_flow = (y_coh + y_rub) * rate_mult * thermal_soft;
 
@@ -1623,13 +1650,31 @@ impl ContinuumWorld {
                         *vel += *acc * half_dt;
                     }
 
-                    let mut new_e = (*energy + fo.de * dt + plastic_heat).max(0.0);
-                    if *det_state == 2 && fo.neighbors < 8 {
-                        new_e *= (1.0 - 0.14 * dt).max(0.85);
+                    let mut rad_cool_e = 0.0f32;
+                    if *det_state != 2 && fo.neighbors < 7 && *temp > 700.0 {
+                        let t_norm = temp.min(8000.0) * 0.001;
+                        let exposure = (7.5 - fo.neighbors as f32).clamp(0.0, 6.0);
+                        rad_cool_e = 1.6e-5 * exposure * (t_norm * t_norm * t_norm * t_norm) * dt;
                     }
-                    let delta_e = new_e - *energy;
-                    *energy = new_e;
-                    *temp = (*temp + delta_e / m.cv.max(1e-7)).clamp(50.0, 24_000.0);
+                    if *det_state != 2
+                        && *dmg > 0.35
+                        && *temp > (0.55 * m.melt_temp).max(450.0)
+                        && *temp < 0.90 * m.melt_temp
+                        && fo.neighbors >= 4
+                        && fo.shock_comp < 0.02
+                    {
+                        *dmg = (*dmg - 0.035 * dt).max(0.20);
+                    }
+
+                    let mut mech_e = (*energy + fo.de * dt + plastic_heat).max(0.0);
+                    if *det_state == 2 && fo.neighbors < 8 {
+                        mech_e *= (1.0 - 0.14 * dt).max(0.85);
+                    }
+                    let mech_de = mech_e - *energy;
+                    *energy = (mech_e - rad_cool_e).max(0.0);
+                    let temp_floor = if *temp >= 293.0 { 293.0 } else { 50.0 };
+                    *temp = (*temp + (mech_de - rad_cool_e) / m.cv.max(1e-7))
+                        .clamp(temp_floor, 24_000.0);
 
                     *net_p = if *det_state == 2 { sph_p } else { -sigma_mean };
 

@@ -258,6 +258,15 @@ void main() {
                     if (!grav_active || v_close > 0.022 || vn > 0.022) {
                         de += w_visc_i * (-f_eos_used * vn + 0.5 * f_visc * v_close) / max(mass_i, 1e-6);
                     }
+                    // Fourier contact thermal conduction & molten droplet capillary surface tension
+                    if (((!grav_active && max(temp_i, temp_j) > 450.0) || (grav_active && max(temp_i, temp_j) > 1600.0)) && abs(temp_j - temp_i) > 80.0) {
+                        de += 2.2e-7 * ramp * (temp_j - temp_i) * (mj / max(mass_i + mj, 1e-6));
+                    }
+                    if (body_i == body_j && melt_i > 0.75 && melt_j > 0.75 && r > 0.98 * pc.dx && r < 1.22 * pc.dx) {
+                        float phase_liq = sin(pi_c * (r - 0.98 * pc.dx) / (0.24 * pc.dx));
+                        float m_pair_liq = (2.0 * mj) / max(mass_i + mj, 1e-6);
+                        acc_i -= nij * (0.0014 * cbar * cbar / max(pc.dx, 0.05)) * phase_liq * m_pair_liq;
+                    }
 
                     c_w_sum += ramp;
                     if (grav_active) {

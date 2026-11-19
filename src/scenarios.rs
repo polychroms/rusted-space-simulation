@@ -1593,9 +1593,12 @@ mod tests {
             vk.step_batch(&mut idle, 12, dt);
         }
         let idle_peak_gpa = idle.sph_pressure.iter().copied().fold(0.0f32, f32::max) * 100.0;
+        let m_ice = idle.mat.iter().enumerate().filter(|(i, m)| **m == MaterialId::WaterIce && idle.temp[*i] >= m.props().melt_temp).count();
+        let m_rock = idle.mat.iter().enumerate().filter(|(i, m)| **m == MaterialId::BasaltRock && idle.temp[*i] >= m.props().melt_temp).count();
+        let m_iron = idle.mat.iter().enumerate().filter(|(i, m)| **m == MaterialId::PlanetaryIron && idle.temp[*i] >= m.props().melt_temp).count();
         assert!(
             idle.melted_count == 0 && idle.fractured_count * 100 < idle_n * 5 && idle_peak_gpa < 35.0,
-            "Idle self-gravitating planet must remain stable (spall={}/{}, melt={}, peakP={idle_peak_gpa:.1} GPa)",
+            "Idle self-gravitating planet must remain stable (spall={}/{}, melt={}, peakP={idle_peak_gpa:.1} GPa, m_ice={m_ice}, m_rock={m_rock}, m_iron={m_iron})",
             idle.fractured_count,
             idle_n,
             idle.melted_count
@@ -1652,5 +1655,52 @@ mod tests {
                 && hyper.vel.iter().all(|v| v.x.is_finite() && v.y.is_finite()),
             "100 km/s hypervelocity launch must stay finite without NaNs"
         );
+    }
+
+    #[test]
+    fn radiative_cooling_and_parallel_starfield_render_invariants() {
+        let mut vk =
+            crate::vulkan_gpu::VulkanPhysicsEngine::new().expect("Vulkan GPU engine should init");
+
+        // 1. Hot exposed silicate droplet cools via Stefan-Boltzmann radiation; cold 150K ice stays 150K.
+        let mut w_cpu = ContinuumWorld::new(0.40);
+        w_cpu.push_particle(Vec2::ZERO, Vec2::ZERO, MaterialId::BasaltRock, 1, Some(3200.0));
+        w_cpu.push_particle(Vec2::new(8.0, 0.0), Vec2::ZERO, MaterialId::WaterIce, 2, None);
+
+        let mut w_gpu = ContinuumWorld::new(0.40);
+        w_gpu.push_particle(Vec2::ZERO, Vec2::ZERO, MaterialId::BasaltRock, 1, Some(3200.0));
+        w_gpu.push_particle(Vec2::new(8.0, 0.0), Vec2::ZERO, MaterialId::WaterIce, 2, None);
+
+        for _ in 0..40 {
+            w_cpu.step(0.05);
+        }
+        vk.step_batch(&mut w_gpu, 40, 0.05);
+
+        assert!(
+            w_cpu.temp[0] < 3190.0 && w_gpu.temp[0] < 3190.0,
+            "Surface magma should radiate heat (cpu={:.1}K, gpu={:.1}K)",
+            w_cpu.temp[0],
+            w_gpu.temp[0]
+        );
+        assert!(
+            (w_cpu.temp[0] - w_gpu.temp[0]).abs() < 2.0,
+            "CPU/GPU radiative cooling parity drifted: cpu={:.1}, gpu={:.1}",
+            w_cpu.temp[0],
+            w_gpu.temp[0]
+        );
+        assert!(
+            (w_cpu.temp[1] - 150.0).abs() < 1e-3 && (w_gpu.temp[1] - 150.0).abs() < 1e-3,
+            "Cryogenic 150K water ice must not warm spuriously (cpu={:.2}, gpu={:.2})",
+            w_cpu.temp[1],
+            w_gpu.temp[1]
+        );
+
+        // 2. Parallel band renderer + starfield determinism & rounded molten drops
+        let mut canvas = crate::render::PixelCanvas::new();
+        let cam = crate::render::Camera2D::default();
+        canvas.render_with_opts(&w_gpu, &cam, 320, 240, crate::render::VisMode::MaterialThermal, false, true);
+        let first = canvas.pixels.clone();
+        canvas.render_with_opts(&w_gpu, &cam, 320, 240, crate::render::VisMode::MaterialThermal, false, true);
+        assert_eq!(first, canvas.pixels, "Parallel starfield render must be deterministic");
     }
 }

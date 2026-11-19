@@ -170,6 +170,7 @@ struct ViewportRenderKey {
     zoom_bits: u32,
     vis_mode: VisMode,
     trails_active: bool,
+    show_starfield: bool,
 }
 
 struct RustedSpaceSimApp {
@@ -193,6 +194,7 @@ struct RustedSpaceSimApp {
     paused: bool,
     vis_mode: VisMode,
     motion_trails: bool,
+    show_starfield: bool,
     show_vel_vectors: bool,
     show_hud_graphs: bool,
     substeps_per_frame: usize,
@@ -234,6 +236,7 @@ struct RustedSpaceSimApp {
     last_frame_instant: Instant,
     fps_smooth: f32,
     physics_ms: f32,
+    render_ms: f32,
 }
 
 impl RustedSpaceSimApp {
@@ -273,6 +276,7 @@ impl RustedSpaceSimApp {
             paused: false,
             vis_mode: VisMode::MaterialThermal,
             motion_trails: false,
+            show_starfield: true,
             show_vel_vectors: false,
             show_hud_graphs: true,
             substeps_per_frame: 8,
@@ -321,6 +325,7 @@ impl RustedSpaceSimApp {
             last_frame_instant: Instant::now(),
             fps_smooth: 60.0,
             physics_ms: 0.0,
+            render_ms: 0.0,
         }
     }
 
@@ -2107,6 +2112,7 @@ impl RustedSpaceSimApp {
                 .text("Right-Drag Fire Speed ×"),
         );
         ui.checkbox(&mut self.motion_trails, "High-Speed Camera Trails");
+        ui.checkbox(&mut self.show_starfield, "Deep-Space Parallax Starfield");
         ui.checkbox(
             &mut self.show_vel_vectors,
             "Flow Velocity Vectors (Key: V)",
@@ -2467,17 +2473,21 @@ impl RustedSpaceSimApp {
             zoom_bits: self.cam.zoom.to_bits(),
             vis_mode: self.vis_mode,
             trails_active,
+            show_starfield: self.show_starfield,
         };
 
         if self.texture.is_none() || self.last_render_key != Some(render_key) {
-            self.canvas.render(
+            let t_ren = Instant::now();
+            self.canvas.render_with_opts(
                 &self.world,
                 &self.cam,
                 rw,
                 rh,
                 self.vis_mode,
                 trails_active,
+                self.show_starfield,
             );
+            self.render_ms = 0.85 * self.render_ms + 0.15 * (t_ren.elapsed().as_secs_f32() * 1000.0);
 
             let color_image = ColorImage {
                 size: [rw, rh],
@@ -3789,7 +3799,7 @@ fn run_headless_benchmark() {
 
 fn print_help() {
     println!(
-        "Rusted Space Simulation (rssim) v0.3.0
+        "Rusted Space Simulation (rssim) v0.0.4
 Vulkan GPU-Accelerated Continuum Elasto-Plastic, Reactive Detonation & Planetary Hydrocode
 (Mie-Gruneisen + JWL EOS + CSPM Renormalization + Johnson-Cook Viscoplasticity + 32x32 LDS Self-Gravity)
 

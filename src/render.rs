@@ -93,6 +93,46 @@ fn crumb_templates() -> &'static [CrumbTemplate; 128] {
     })
 }
 
+/// Precomputed seamless 256x256 2-octave turbulent fBm noise LUT: [n1_u8, billow_u8].
+fn plume_fbm_lut() -> &'static [[u8; 2]; 65_536] {
+    static LUT: OnceLock<Vec<[u8; 2]>> = OnceLock::new();
+    let v = LUT.get_or_init(|| {
+        const GRID: i32 = 32;
+        const SUB: i32 = 8;
+        const N: i32 = GRID * SUB; // 256
+        let sample_periodic = |lx: i32, ly: i32, seed: u32| -> f32 {
+            let tx0 = (lx.div_euclid(SUB)).rem_euclid(GRID);
+            let ty0 = (ly.div_euclid(SUB)).rem_euclid(GRID);
+            let tx1 = (tx0 + 1) % GRID;
+            let ty1 = (ty0 + 1) % GRID;
+            let fx = (lx.rem_euclid(SUB)) as f32 * (1.0 / SUB as f32);
+            let fy = (ly.rem_euclid(SUB)) as f32 * (1.0 / SUB as f32);
+            let sx = fx * fx * (3.0 - 2.0 * fx);
+            let sy = fy * fy * (3.0 - 2.0 * fy);
+            let h00 = (cell_hash(tx0, ty0, seed) & 0xFF) as f32 * (1.0 / 255.0);
+            let h10 = (cell_hash(tx1, ty0, seed) & 0xFF) as f32 * (1.0 / 255.0);
+            let h01 = (cell_hash(tx0, ty1, seed) & 0xFF) as f32 * (1.0 / 255.0);
+            let h11 = (cell_hash(tx1, ty1, seed) & 0xFF) as f32 * (1.0 / 255.0);
+            let a = h00 + (h10 - h00) * sx;
+            let b = h01 + (h11 - h01) * sx;
+            a + (b - a) * sy
+        };
+        let mut table = Vec::with_capacity((N * N) as usize);
+        for y in 0..N {
+            for x in 0..N {
+                let n1 = sample_periodic(x, y, 0x517C_C1B7);
+                let n2 = sample_periodic((x * 2) & 255, (y * 2) & 255, 0xEF4A_B82D);
+                let billow = (0.65 * (1.0 - (2.0 * n1 - 1.0).abs()) + 0.35 * n2).clamp(0.0, 1.0);
+                table.push([(n1 * 255.0) as u8, (billow * 255.0) as u8]);
+            }
+        }
+        table
+    });
+    v.as_slice()
+        .try_into()
+        .expect("plume_fbm_lut exact length")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VisMode {
     MaterialThermal,
@@ -487,13 +527,31 @@ struct DrawItem {
     r: f32,
     angle: f32,
     tpl_idx: u8,
+    melt_round: u8,
     mat: MaterialId,
     seed: u32,
     dmg: f32,
     col: [u8; 3],
     bevel: i16,
-    render_kind: u8, // 0 = solid/shard crumb, 1 = volumetric gas/fireball plume, 2 = additive blast glow
+    render_kind: u8, // 0 = solid/shard crumb, 1 = volumetric gas/fireball plume
     halo_r: f32,
+}
+
+#[derive(Clone, Copy)]
+struct StagedDraw {
+    layer: u8,
+    y0: usize,
+    y1: usize,
+    halo_ys: Option<(usize, usize)>,
+    item: DrawItem,
+}
+
+#[derive(Clone, Copy)]
+struct StarDot {
+    x: u16,
+    y: u16,
+    col: Color32,
+    size2px: bool,
 }
 
 pub struct PixelCanvas {
@@ -501,7 +559,11 @@ pub struct PixelCanvas {
     pub height: usize,
     pub pixels: Vec<Color32>,
     draw_items: Vec<DrawItem>,
-    band_buckets: Vec<Vec<usize>>,
+    staged_items: Vec<StagedDraw>,
+    band_buckets: Vec<Vec<u32>>,
+    star_buckets: Vec<Vec<StarDot>>,
+    grid_v_cols: Vec<(usize, Color32)>,
+    grid_h_rows: Vec<(usize, Color32)>,
 }
 
 impl PixelCanvas {
@@ -511,7 +573,11 @@ impl PixelCanvas {
             height: 0,
             pixels: Vec::new(),
             draw_items: Vec::new(),
+            staged_items: Vec::new(),
             band_buckets: Vec::new(),
+            star_buckets: Vec::new(),
+            grid_v_cols: Vec::new(),
+            grid_h_rows: Vec::new(),
         }
     }
 
@@ -524,6 +590,20 @@ impl PixelCanvas {
         mode: VisMode,
         motion_trails: bool,
     ) {
+        self.render_with_opts(world, cam, width, height, mode, motion_trails, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_opts(
+        &mut self,
+        world: &ContinuumWorld,
+        cam: &Camera2D,
+        width: usize,
+        height: usize,
+        mode: VisMode,
+        motion_trails: bool,
+        show_starfield: bool,
+    ) {
         let width = width.max(64);
         let height = height.max(64);
         let total = width * height;
@@ -531,8 +611,11 @@ impl PixelCanvas {
         if resized {
             self.width = width;
             self.height = height;
-            self.pixels.assign_bg(total);
-        } else if motion_trails {
+            self.pixels.resize(total, Color32::from_rgb(11, 14, 20));
+        }
+
+        let fade_trails = motion_trails && !resized;
+        if fade_trails {
             // Subtle high-speed camera persistence fade toward dark lab background (parallel!)
             self.pixels.par_chunks_mut(16384).for_each(|chunk| {
                 for px in chunk {
@@ -544,29 +627,7 @@ impl PixelCanvas {
                     );
                 }
             });
-        } else {
-            self.pixels.assign_bg(total);
         }
-
-        // Draw subtle metric background grid (10 cm major, 2 cm minor, 5 mm microscope)
-        if !motion_trails || resized {
-            self.draw_metric_grid(cam);
-        }
-
-        let n_pts = world.len();
-        if n_pts == 0 {
-            return;
-        }
-
-        let wf = width as f32;
-        let hf = height as f32;
-        let w_max_f = (width - 1) as f32;
-        let h_max_f = (height - 1) as f32;
-
-        let templates = crumb_templates();
-        // World-invariant cohesive continuum radius: 0.87 * dx * zoom seals neighbors cleanly
-        let intact_r = 0.87 * world.dx * cam.zoom;
-        let rich_tex = mode == VisMode::MaterialThermal;
 
         let num_bands = height.div_ceil(BAND_H);
         if self.band_buckets.len() < num_bands {
@@ -575,279 +636,409 @@ impl PixelCanvas {
         for b in &mut self.band_buckets[..num_bands] {
             b.clear();
         }
-        self.draw_items.clear();
+        if self.star_buckets.len() < num_bands {
+            self.star_buckets.resize_with(num_bands, Vec::new);
+        }
+        for sb in &mut self.star_buckets[..num_bands] {
+            sb.clear();
+        }
 
-        // Four-pass depth compositing:
-        // Pass 0: static intact armor/targets
-        // Pass 1: volumetric detonation plumes & smoke clouds (mass-conserving overlapping radii!)
-        // Pass 2: dynamic moving/damaged solids, jets & fragments in front of smoke
-        // Pass 3: pure additive luminous fireball/plasma flash on top
-        for pass in 0..4 {
-            for i in 0..n_pts {
-                let det = world.det_state[i];
-                let is_moving = det == 1 || world.vel[i].length_squared() > 0.0025;
-                let keep = match pass {
-                    0 => det == 0 && !is_moving,
-                    1 => det == 2,
-                    2 => det != 2 && is_moving,
-                    _ => det == 2,
-                };
-                if !keep {
-                    continue;
-                }
+        if !fade_trails {
+            self.prepare_metric_grid(cam);
+            if show_starfield {
+                self.prepare_starfield(cam, num_bands);
+            }
+        }
+
+        let n_pts = world.len();
+        self.draw_items.clear();
+        self.staged_items.clear();
+
+        if n_pts > 0 {
+            let wf = width as f32;
+            let hf = height as f32;
+            let w_max_f = (width - 1) as f32;
+            let h_max_f = (height - 1) as f32;
+            let templates = crumb_templates();
+            let intact_r = 0.87 * world.dx * cam.zoom;
+            let rich_tex = mode == VisMode::MaterialThermal;
+            let coarse_pad = (intact_r * 7.5 + 72.0).max(16.0);
+
+            let build_item = |i: usize| -> Option<StagedDraw> {
                 let sp = cam.world_to_screen(world.pos[i], wf, hf);
                 if !sp.x.is_finite() || !sp.y.is_finite() {
-                    continue;
+                    return None;
+                }
+                if sp.x < -coarse_pad
+                    || sp.x > w_max_f + coarse_pad
+                    || sp.y < -coarse_pad
+                    || sp.y > h_max_f + coarse_pad
+                {
+                    return None;
                 }
 
+                let det = world.det_state[i];
                 let (col, hot_halo) = particle_color(world, i, mode);
 
-                let (render_kind, r, angle, tpl_idx, mat, seed, dmg, bevel, halo_r, bound_r, tx_off, ty_off) =
-                    if det == 2 {
-                        let mat = world.mat[i];
-                        let det_power = if mat == MaterialId::ImpactFuze {
-                            0.18
-                        } else {
-                            (mat.props().detonation_energy / 0.056)
-                                .clamp(0.16, 1.25)
-                                .sqrt()
-                                .clamp(0.42, 1.15)
-                        };
-                        let rho_rel =
-                            (world.rho[i] / world.rho0[i].max(1e-4)).clamp(0.045, 2.4);
-                        let age = world.det_age[i].max(0.0);
-                        // 2D volume expansion: parcel radius grows ~1/sqrt(rho_rel) scaled by explosive yield
-                        let exp_scale = (1.0 / rho_rel).sqrt().clamp(1.0, 4.4);
-                        let age_swell = (1.0 + 0.14 * age).clamp(1.0, 2.4);
-                        let pr = intact_r
-                            * det_power
-                            * (1.42 * exp_scale.max(age_swell)).clamp(1.42, 5.2);
-                        let eff_temp = if mat == MaterialId::ImpactFuze {
-                            (world.temp[i] * 0.25).min(950.0)
-                        } else {
-                            world.temp[i]
-                        };
-                        let temp_c = (eff_temp * 0.1).clamp(40.0, 3000.0) as i16;
-                        let v_code = (world.vel[i].length() * 35.0).clamp(0.0, 255.0) as u8;
-                        let hr = if pass == 3 && hot_halo && mat != MaterialId::ImpactFuze {
-                            (pr * (1.65 - 0.04 * age).max(1.0)).min(64.0)
-                        } else {
-                            0.0
-                        };
-                        if pass == 3 && hr < 0.45 {
-                            continue;
-                        }
-                        (
-                            if pass == 3 { 2u8 } else { 1u8 },
-                            pr,
-                            age,
-                            v_code,
-                            mat,
-                            world.crumb_seed[i],
-                            rho_rel,
-                            temp_c,
-                            hr,
-                            1.38f32,
-                            0.0f32,
-                            0.0f32,
-                        )
+                if det == 2 {
+                    let mat = world.mat[i];
+                    let det_power = if mat == MaterialId::ImpactFuze {
+                        0.18
                     } else {
-                        let dmg = world.damage[i].clamp(0.0, 1.0);
-                        let mat = world.mat[i];
-                        let props = mat.props();
-                        let seed = world.crumb_seed[i];
-                        let shard_bank = usize::from(!props.is_ductile() || dmg >= 0.55) * 64;
-                        let tpl_idx = (shard_bank + ((seed as usize) & 63)) as u8;
-                        let rho_rel =
-                            (world.rho[i] / world.rho0[i].max(1e-4)).clamp(0.45, 2.0);
-                        let melt_swell = if world.temp[i] >= props.melt_temp {
-                            (1.0 / rho_rel).sqrt().clamp(1.0, 1.26)
-                        } else {
-                            1.0
-                        };
-                        let crumb_r = intact_r * (1.0 - 0.04 * dmg) * melt_swell;
-                        let bevel = if dmg >= 0.45 { 20i16 } else { 13i16 };
-                        let hr = if hot_halo {
-                            (crumb_r * 1.55).min(28.0)
-                        } else {
-                            0.0
-                        };
-                        // World-invariant incandescent ember trail ONLY on glowing hot fragments & jets
-                        let vel = world.vel[i];
-                        let spd = vel.length();
-                        let (tx_off, ty_off) = if pass == 2
-                            && rich_tex
-                            && world.temp[i] >= 1100.0
-                            && spd >= 0.12
-                        {
-                            let raw_len =
-                                (crumb_r * 1.20 + spd * 2.6 * cam.zoom).min(7.5 * intact_r);
-                            let inv_spd = 1.0 / spd;
-                            (-vel.x * inv_spd * raw_len, vel.y * inv_spd * raw_len)
-                        } else {
-                            (0.0, 0.0)
-                        };
-                        let br = templates[tpl_idx as usize].bound_r + 0.12;
-                        (
-                            0u8,
-                            crumb_r,
-                            world.crumb_angle[i],
-                            tpl_idx,
-                            mat,
-                            seed,
-                            dmg,
-                            bevel,
-                            hr,
-                            br,
-                            tx_off,
-                            ty_off,
-                        )
+                        (mat.props().detonation_energy / 0.056)
+                            .clamp(0.16, 1.25)
+                            .sqrt()
+                            .clamp(0.42, 1.15)
+                    };
+                    let rho_rel =
+                        (world.rho[i] / world.rho0[i].max(1e-4)).clamp(0.045, 2.4);
+                    let age = world.det_age[i].max(0.0);
+                    let exp_scale = (1.0 / rho_rel).sqrt().clamp(1.0, 4.4);
+                    let age_swell = (1.0 + 0.14 * age).clamp(1.0, 2.4);
+                    let pr = intact_r
+                        * det_power
+                        * (1.42 * exp_scale.max(age_swell)).clamp(1.42, 5.2);
+                    if !pr.is_finite() || !age.is_finite() || pr <= 0.02 {
+                        return None;
+                    }
+                    let eff_temp = if mat == MaterialId::ImpactFuze {
+                        (world.temp[i] * 0.25).min(950.0)
+                    } else {
+                        world.temp[i]
+                    };
+                    let temp_c = (eff_temp * 0.1).clamp(40.0, 3000.0) as i16;
+                    let v_code = (world.vel[i].length() * 35.0).clamp(0.0, 255.0) as u8;
+                    let hr = if hot_halo && mat != MaterialId::ImpactFuze {
+                        (pr * (1.65 - 0.04 * age).max(1.0)).min(64.0)
+                    } else {
+                        0.0
                     };
 
-                if !r.is_finite() || !angle.is_finite() || r <= 0.02 {
-                    continue;
+                    let plume_ext = if pr < 0.72 { 1.0 } else { pr * 1.38 + 0.85 };
+                    let max_ext = plume_ext.max(if hr >= 0.45 { hr } else { 0.0 });
+                    if sp.x + max_ext < 0.0
+                        || sp.x - max_ext > w_max_f
+                        || sp.y + max_ext < 0.0
+                        || sp.y - max_ext > h_max_f
+                    {
+                        return None;
+                    }
+
+                    let y0 = (sp.y - plume_ext).floor().clamp(0.0, h_max_f) as usize;
+                    let y1 = (sp.y + plume_ext).ceil().clamp(0.0, h_max_f) as usize;
+                    if y0 > y1 {
+                        return None;
+                    }
+                    let halo_ys = if hr >= 0.45 {
+                        let hy0 = (sp.y - hr).floor().clamp(0.0, h_max_f) as usize;
+                        let hy1 = (sp.y + hr).ceil().clamp(0.0, h_max_f) as usize;
+                        (hy0 <= hy1).then_some((hy0, hy1))
+                    } else {
+                        None
+                    };
+
+                    return Some(StagedDraw {
+                        layer: 1,
+                        y0,
+                        y1,
+                        halo_ys,
+                        item: DrawItem {
+                            cx: sp.x,
+                            cy: sp.y,
+                            tx_off: 0.0,
+                            ty_off: 0.0,
+                            r: pr,
+                            angle: age,
+                            tpl_idx: v_code,
+                            melt_round: 255,
+                            mat,
+                            seed: world.crumb_seed[i],
+                            dmg: rho_rel,
+                            col,
+                            bevel: temp_c,
+                            render_kind: 1,
+                            halo_r: hr,
+                        },
+                    });
                 }
 
-                let body_ext = if render_kind == 2 {
-                    halo_r
-                } else if r < 0.72 {
+                let is_moving = det == 1 || world.vel[i].length_squared() > 0.0025;
+                let layer = if is_moving { 2u8 } else { 0u8 };
+                let dmg = world.damage[i].clamp(0.0, 1.0);
+                let mat = world.mat[i];
+                let props = mat.props();
+                let seed = world.crumb_seed[i];
+                let shard_bank = usize::from(!props.is_ductile() || dmg >= 0.55) * 64;
+                let tpl_idx = (shard_bank + ((seed as usize) & 63)) as u8;
+                let rho_rel = (world.rho[i] / world.rho0[i].max(1e-4)).clamp(0.45, 2.0);
+                let is_melted = world.temp[i] >= props.melt_temp;
+                let melt_swell = if is_melted {
+                    (1.0 / rho_rel).sqrt().clamp(1.0, 1.26)
+                } else {
+                    1.0
+                };
+                let melt_round = (((world.temp[i] - 0.92 * props.melt_temp)
+                    / (0.25 * props.melt_temp).max(40.0))
+                .clamp(0.0, 1.0)
+                    * 255.0) as u8;
+                let crumb_r = intact_r * (1.0 - 0.04 * dmg) * melt_swell;
+                let angle = world.crumb_angle[i];
+                if !crumb_r.is_finite() || !angle.is_finite() || crumb_r <= 0.02 {
+                    return None;
+                }
+                let bevel = if dmg >= 0.45 { 20i16 } else { 13i16 };
+                let hr = if hot_halo {
+                    (crumb_r * 1.55).min(28.0)
+                } else {
+                    0.0
+                };
+                let vel = world.vel[i];
+                let spd = vel.length();
+                let (tx_off, ty_off) = if layer == 2
+                    && rich_tex
+                    && world.temp[i] >= 1100.0
+                    && spd >= 0.12
+                {
+                    let raw_len = (crumb_r * 1.20 + spd * 2.6 * cam.zoom).min(7.5 * intact_r);
+                    let inv_spd = 1.0 / spd;
+                    (-vel.x * inv_spd * raw_len, vel.y * inv_spd * raw_len)
+                } else {
+                    (0.0, 0.0)
+                };
+                let br = templates[tpl_idx as usize].bound_r + 0.12;
+                let body_ext = if crumb_r < 0.72 {
                     1.0
                 } else {
-                    r * bound_r + 0.85
+                    crumb_r * br + 0.85
                 };
-                let max_ext = body_ext.max(if halo_r >= 0.45 { halo_r } else { 0.0 });
+                let max_ext = body_ext.max(if hr >= 0.45 { hr } else { 0.0 });
                 let min_x = sp.x.min(sp.x + tx_off) - max_ext;
                 let max_x = sp.x.max(sp.x + tx_off) + max_ext;
                 let min_y = sp.y.min(sp.y + ty_off) - max_ext;
                 let max_y = sp.y.max(sp.y + ty_off) + max_ext;
                 if max_x < 0.0 || min_x > w_max_f || max_y < 0.0 || min_y > h_max_f {
-                    continue;
+                    return None;
                 }
-
                 let y0 = min_y.floor().clamp(0.0, h_max_f) as usize;
                 let y1 = max_y.ceil().clamp(0.0, h_max_f) as usize;
                 if y0 > y1 {
-                    continue;
+                    return None;
                 }
 
-                let item_idx = self.draw_items.len();
-                self.draw_items.push(DrawItem {
-                    cx: sp.x,
-                    cy: sp.y,
-                    tx_off,
-                    ty_off,
-                    r,
-                    angle,
-                    tpl_idx,
-                    mat,
-                    seed,
-                    dmg,
-                    col,
-                    bevel,
-                    render_kind,
-                    halo_r,
-                });
+                Some(StagedDraw {
+                    layer,
+                    y0,
+                    y1,
+                    halo_ys: None,
+                    item: DrawItem {
+                        cx: sp.x,
+                        cy: sp.y,
+                        tx_off,
+                        ty_off,
+                        r: crumb_r,
+                        angle,
+                        tpl_idx,
+                        melt_round,
+                        mat,
+                        seed,
+                        dmg,
+                        col,
+                        bevel,
+                        render_kind: 0,
+                        halo_r: hr,
+                    },
+                })
+            };
 
-                let b0 = y0 / BAND_H;
-                let b1 = (y1 / BAND_H).min(num_bands - 1);
+            if n_pts >= 2048 {
+                self.staged_items = (0..n_pts).into_par_iter().filter_map(build_item).collect();
+            } else {
+                for i in 0..n_pts {
+                    if let Some(st) = build_item(i) {
+                        self.staged_items.push(st);
+                    }
+                }
+            }
+
+            self.draw_items.reserve(self.staged_items.len());
+            for st in &self.staged_items {
+                let idx = self.draw_items.len();
+                self.draw_items.push(st.item);
+                let packed = ((st.layer as u32) << 28) | (idx as u32);
+                let b0 = st.y0 / BAND_H;
+                let b1 = (st.y1 / BAND_H).min(num_bands - 1);
                 for bucket in &mut self.band_buckets[b0..=b1] {
-                    bucket.push(item_idx);
+                    bucket.push(packed);
+                }
+                if let Some((hy0, hy1)) = st.halo_ys {
+                    let hb0 = hy0 / BAND_H;
+                    let hb1 = (hy1 / BAND_H).min(num_bands - 1);
+                    let h_packed = (3u32 << 28) | (idx as u32);
+                    for bucket in &mut self.band_buckets[hb0..=hb1] {
+                        bucket.push(h_packed);
+                    }
                 }
             }
         }
 
-        // Rasterize all horizontal screen bands concurrently across all CPU cores!
         let band_len = BAND_H * width;
         let draw_items = &self.draw_items;
-        let band_buckets = &self.band_buckets[..num_bands];
+        let band_buckets = &mut self.band_buckets[..num_bands];
+        let star_buckets = &self.star_buckets[..num_bands];
+        let grid_v = &self.grid_v_cols;
+        let grid_h = &self.grid_h_rows;
+        let rich_tex = mode == VisMode::MaterialThermal;
+        let templates = crumb_templates();
+        let inv_h = 1.0 / (height.max(1) as f32);
 
+        // Single-pass L1-cached parallel band fill + starfield + metric grid + sorted particle rasterization!
         self.pixels
             .par_chunks_mut(band_len)
+            .zip(band_buckets.par_iter_mut())
             .enumerate()
-            .for_each(|(b, band_px)| {
+            .for_each(|(b, (band_px, bucket))| {
                 let band_y0 = b * BAND_H;
                 let band_rows = band_px.len() / width;
                 if band_rows == 0 {
                     return;
                 }
                 let band_y1 = band_y0 + band_rows - 1;
-                for &idx in &band_buckets[b] {
+
+                if !fade_trails {
+                    if show_starfield {
+                        for local_y in 0..band_rows {
+                            let sy = band_y0 + local_y;
+                            let t = sy as f32 * inv_h;
+                            let dust = (1.0 - (2.0 * t - 1.0).abs()).powf(1.8);
+                            let r = (7.0 + 6.0 * t + 3.0 * dust) as u8;
+                            let g = (10.0 + 7.0 * t + 4.0 * dust) as u8;
+                            let bl = (16.0 + 11.0 * t + 7.0 * dust) as u8;
+                            let row_start = local_y * width;
+                            band_px[row_start..row_start + width].fill(Color32::from_rgb(r, g, bl));
+                        }
+                        for st in &star_buckets[b] {
+                            let sx = st.x as usize;
+                            let sy = st.y as usize;
+                            if sy >= band_y0 && sy <= band_y1 && sx < width {
+                                let ly = sy - band_y0;
+                                band_px[ly * width + sx] = st.col;
+                                if st.size2px && sx + 1 < width {
+                                    band_px[ly * width + sx + 1] = Color32::from_rgb(
+                                        (st.col.r() as u16 * 3 / 5) as u8,
+                                        (st.col.g() as u16 * 3 / 5) as u8,
+                                        (st.col.b() as u16 * 3 / 5) as u8,
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        band_px.fill(Color32::from_rgb(11, 14, 20));
+                    }
+
+                    for &(vx, col) in grid_v {
+                        if vx < width {
+                            for local_y in 0..band_rows {
+                                band_px[local_y * width + vx] = col;
+                            }
+                        }
+                    }
+                    for &(hy, col) in grid_h {
+                        if hy >= band_y0 && hy <= band_y1 {
+                            let row_start = (hy - band_y0) * width;
+                            band_px[row_start..row_start + width].fill(col);
+                        }
+                    }
+                }
+
+                if n_pts == 0 || bucket.is_empty() {
+                    return;
+                }
+                bucket.sort_unstable();
+                for &packed in bucket.iter() {
+                    let layer = (packed >> 28) as u8;
+                    let idx = (packed & 0x0FFF_FFFF) as usize;
                     let it = &draw_items[idx];
-                    match it.render_kind {
-                        2 => {
-                            let hot_fade = (1.0 - (it.angle / 16.0).clamp(0.0, 1.0)).max(0.15);
+                    if layer == 3 {
+                        let hot_fade = (1.0 - (it.angle / 16.0).clamp(0.0, 1.0)).max(0.15);
+                        splat_additive_halo_band(
+                            band_px,
+                            width,
+                            band_y0,
+                            band_y1,
+                            it.cx,
+                            it.cy,
+                            it.halo_r,
+                            it.col,
+                            0.14 * hot_fade,
+                        );
+                    } else if it.render_kind == 1 {
+                        splat_explosion_plume_band(
+                            band_px,
+                            width,
+                            band_y0,
+                            band_y1,
+                            it.cx,
+                            it.cy,
+                            it.r,
+                            it.angle,
+                            it.dmg,
+                            it.bevel as f32 * 10.0,
+                            it.seed,
+                            it.col,
+                            rich_tex,
+                        );
+                    } else {
+                        if it.tx_off * it.tx_off + it.ty_off * it.ty_off > 0.64 {
+                            splat_ember_streak_band(
+                                band_px,
+                                width,
+                                band_y0,
+                                band_y1,
+                                it.cx,
+                                it.cy,
+                                it.cx + it.tx_off,
+                                it.cy + it.ty_off,
+                                it.r * 0.78,
+                                it.col,
+                            );
+                        }
+                        if it.halo_r >= 0.45 {
                             splat_additive_halo_band(
-                                band_px,
-                                width,
-                                band_y0,
-                                band_y1,
-                                it.cx,
-                                it.cy,
-                                it.halo_r,
-                                it.col,
-                                0.14 * hot_fade,
+                                band_px, width, band_y0, band_y1, it.cx, it.cy, it.halo_r,
+                                it.col, 0.11,
                             );
                         }
-                        1 => {
-                            splat_explosion_plume_band(
-                                band_px,
-                                width,
-                                band_y0,
-                                band_y1,
-                                it.cx,
-                                it.cy,
-                                it.r,
-                                it.angle,
-                                it.dmg,
-                                it.bevel as f32 * 10.0,
-                                it.seed,
-                                it.col,
-                                rich_tex,
-                            );
-                        }
-                        _ => {
-                            if it.tx_off * it.tx_off + it.ty_off * it.ty_off > 0.64 {
-                                splat_ember_streak_band(
-                                    band_px, width, band_y0, band_y1, it.cx, it.cy,
-                                    it.cx + it.tx_off, it.cy + it.ty_off, it.r * 0.78, it.col,
-                                );
-                            }
-                            if it.halo_r >= 0.45 {
-                                splat_additive_halo_band(
-                                    band_px, width, band_y0, band_y1, it.cx, it.cy, it.halo_r,
-                                    it.col, 0.11,
-                                );
-                            }
-                            splat_crumb_polygon_band(
-                                band_px,
-                                width,
-                                band_y0,
-                                band_y1,
-                                it.cx,
-                                it.cy,
-                                it.r,
-                                it.angle,
-                                &templates[it.tpl_idx as usize],
-                                it.mat,
-                                it.seed,
-                                it.dmg,
-                                rich_tex,
-                                it.col,
-                                it.bevel,
-                            );
-                        }
+                        splat_crumb_polygon_band(
+                            band_px,
+                            width,
+                            band_y0,
+                            band_y1,
+                            it.cx,
+                            it.cy,
+                            it.r,
+                            it.angle,
+                            &templates[it.tpl_idx as usize],
+                            it.melt_round,
+                            it.mat,
+                            it.seed,
+                            it.dmg,
+                            rich_tex,
+                            it.col,
+                            it.bevel,
+                        );
                     }
                 }
             });
     }
 
-    fn draw_metric_grid(&mut self, cam: &Camera2D) {
+    fn prepare_metric_grid(&mut self, cam: &Camera2D) {
+        self.grid_v_cols.clear();
+        self.grid_h_rows.clear();
         let wf = self.width as f32;
         let hf = self.height as f32;
         let w_min = cam.screen_to_world(Vec2::new(0.0, hf), wf, hf);
         let w_max = cam.screen_to_world(Vec2::new(wf, 0.0), wf, hf);
 
-        // Fine 0.5 cm (5 mm) microscope grid when zoomed way in
         if cam.zoom >= 36.0 {
             let step = 0.5f32;
             let gx0 = (w_min.x / step).floor() as i32;
@@ -858,10 +1049,8 @@ impl PixelCanvas {
                 }
                 let sx = (0.5 * wf + (gx as f32 * step - cam.center.x) * cam.zoom).round() as isize;
                 if sx >= 0 && (sx as usize) < self.width {
-                    let x = sx as usize;
-                    for y in 0..self.height {
-                        self.pixels[y * self.width + x] = Color32::from_rgb(14, 18, 25);
-                    }
+                    self.grid_v_cols
+                        .push((sx as usize, Color32::from_rgb(14, 18, 25)));
                 }
             }
             let gy0 = (w_min.y / step).floor() as i32;
@@ -872,15 +1061,12 @@ impl PixelCanvas {
                 }
                 let sy = (0.5 * hf - (gy as f32 * step - cam.center.y) * cam.zoom).round() as isize;
                 if sy >= 0 && (sy as usize) < self.height {
-                    let row = sy as usize * self.width;
-                    for x in 0..self.width {
-                        self.pixels[row + x] = Color32::from_rgb(14, 18, 25);
-                    }
+                    self.grid_h_rows
+                        .push((sy as usize, Color32::from_rgb(14, 18, 25)));
                 }
             }
         }
 
-        // Minor 2 cm grid if zoomed in enough
         if cam.zoom >= 10.0 {
             let step = 2.0f32;
             let gx0 = (w_min.x / step).floor() as i32;
@@ -891,10 +1077,8 @@ impl PixelCanvas {
                 }
                 let sx = (0.5 * wf + (gx as f32 * step - cam.center.x) * cam.zoom).round() as isize;
                 if sx >= 0 && (sx as usize) < self.width {
-                    let x = sx as usize;
-                    for y in 0..self.height {
-                        self.pixels[y * self.width + x] = Color32::from_rgb(16, 20, 28);
-                    }
+                    self.grid_v_cols
+                        .push((sx as usize, Color32::from_rgb(16, 20, 28)));
                 }
             }
             let gy0 = (w_min.y / step).floor() as i32;
@@ -905,30 +1089,24 @@ impl PixelCanvas {
                 }
                 let sy = (0.5 * hf - (gy as f32 * step - cam.center.y) * cam.zoom).round() as isize;
                 if sy >= 0 && (sy as usize) < self.height {
-                    let row = sy as usize * self.width;
-                    for x in 0..self.width {
-                        self.pixels[row + x] = Color32::from_rgb(16, 20, 28);
-                    }
+                    self.grid_h_rows
+                        .push((sy as usize, Color32::from_rgb(16, 20, 28)));
                 }
             }
         }
 
-        // Major 10 cm grid (or 100 cm when zoomed far out)
         let major = if cam.zoom < 3.0 { 100.0f32 } else { 10.0f32 };
         let gx0 = (w_min.x / major).floor() as i32;
         let gx1 = (w_max.x / major).ceil() as i32;
         for gx in gx0..=gx1 {
             let sx = (0.5 * wf + (gx as f32 * major - cam.center.x) * cam.zoom).round() as isize;
             if sx >= 0 && (sx as usize) < self.width {
-                let x = sx as usize;
                 let col = if gx == 0 {
                     Color32::from_rgb(34, 44, 62)
                 } else {
                     Color32::from_rgb(23, 29, 40)
                 };
-                for y in 0..self.height {
-                    self.pixels[y * self.width + x] = col;
-                }
+                self.grid_v_cols.push((sx as usize, col));
             }
         }
         let gy0 = (w_min.y / major).floor() as i32;
@@ -936,14 +1114,62 @@ impl PixelCanvas {
         for gy in gy0..=gy1 {
             let sy = (0.5 * hf - (gy as f32 * major - cam.center.y) * cam.zoom).round() as isize;
             if sy >= 0 && (sy as usize) < self.height {
-                let row = sy as usize * self.width;
                 let col = if gy == 0 {
                     Color32::from_rgb(34, 44, 62)
                 } else {
                     Color32::from_rgb(23, 29, 40)
                 };
-                for x in 0..self.width {
-                    self.pixels[row + x] = col;
+                self.grid_h_rows.push((sy as usize, col));
+            }
+        }
+    }
+
+    fn prepare_starfield(&mut self, cam: &Camera2D, num_bands: usize) {
+        let w = self.width as i32;
+        let h = self.height as i32;
+        for (layer_idx, &(cell_px, parallax, seed_l)) in [
+            (64.0f32, 0.22f32, 0x91E1_55A3u32),
+            (96.0f32, 0.45f32, 0x3C6E_F372u32),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let shift_x = cam.center.x * parallax * cam.zoom.sqrt();
+            let shift_y = -cam.center.y * parallax * cam.zoom.sqrt();
+            let tx0 = (shift_x / cell_px).floor() as i32 - 1;
+            let ty0 = (shift_y / cell_px).floor() as i32 - 1;
+            let tx1 = ((shift_x + w as f32) / cell_px).ceil() as i32 + 1;
+            let ty1 = ((shift_y + h as f32) / cell_px).ceil() as i32 + 1;
+            if (tx1 - tx0) > 80 || (ty1 - ty0) > 60 {
+                continue;
+            }
+            for ty in ty0..=ty1 {
+                for tx in tx0..=tx1 {
+                    let h0 = cell_hash(tx, ty, seed_l);
+                    if (h0 & 7) >= if layer_idx == 0 { 4 } else { 3 } {
+                        continue;
+                    }
+                    let ox = ((h0 >> 8) & 255) as f32 * (cell_px / 256.0);
+                    let oy = ((h0 >> 16) & 255) as f32 * (cell_px / 256.0);
+                    let sx = (tx as f32 * cell_px + ox - shift_x).round() as i32;
+                    let sy = (ty as f32 * cell_px + oy - shift_y).round() as i32;
+                    if sx < 0 || sx >= w || sy < 0 || sy >= h {
+                        continue;
+                    }
+                    let lum = 72 + (((h0 >> 24) & 63) as u8);
+                    let tint = (h0 >> 3) & 3;
+                    let col = match tint {
+                        0 => Color32::from_rgb(lum, lum + 10, (lum as u16 + 34).min(255) as u8),
+                        1 => Color32::from_rgb((lum as u16 + 24).min(255) as u8, lum + 8, lum - 12),
+                        _ => Color32::from_rgb(lum, lum, lum + 8),
+                    };
+                    let band = (sy as usize / BAND_H).min(num_bands - 1);
+                    self.star_buckets[band].push(StarDot {
+                        x: sx as u16,
+                        y: sy as u16,
+                        col,
+                        size2px: layer_idx == 1 && (h0 & 31) == 0,
+                    });
                 }
             }
         }
@@ -979,6 +1205,7 @@ impl PixelCanvas {
             r,
             angle,
             tpl,
+            0,
             mat,
             seed,
             dmg,
@@ -1099,6 +1326,7 @@ fn splat_crumb_polygon_band(
     r: f32,
     angle: f32,
     tpl: &CrumbTemplate,
+    melt_round: u8,
     mat: MaterialId,
     seed: u32,
     dmg: f32,
@@ -1156,6 +1384,7 @@ fn splat_crumb_polygon_band(
     let y1 = (y1_i.min(band_y1 as isize)) as usize;
 
     let nf = tpl.n_facets;
+    let melt_f = melt_round as f32 * (1.0 / 255.0);
     let (sin_a, cos_a) = angle.sin_cos();
     let mut rx = [0.0f32; MAX_FACETS];
     let mut ry = [0.0f32; MAX_FACETS];
@@ -1170,7 +1399,8 @@ fn splat_crumb_polygon_band(
         let ny = tpl.nx[k] * sin_a + tpl.ny[k] * cos_a;
         rx[k] = nx;
         ry[k] = ny;
-        dk[k] = tpl.dist[k] * r;
+        // Blend sharp fracture facets into organic rounded droplet silhouettes as particles melt!
+        dk[k] = (tpl.dist[k] + (0.93 - tpl.dist[k]) * melt_f) * r;
         let dot_l = -std::f32::consts::FRAC_1_SQRT_2 * (nx + ny);
         f_light[k] = (((dot_l * bevel as f32) as i32 * tex_w) >> 8) as i16;
     }
@@ -1183,20 +1413,46 @@ fn splat_crumb_polygon_band(
     let u_off = (((seed & 0xFF) as i32) << 12).wrapping_add(16 * 65536);
     let v_off = ((((seed >> 8) & 0xFF) as i32) << 12).wrapping_add(16 * 65536);
 
-    let rough_amp = if !mat.props().is_ductile() || dmg >= 0.45 {
+    let rough_amp = (if !mat.props().is_ductile() || dmg >= 0.45 {
         0.088 * r
     } else {
         0.036 * r
-    };
+    }) * (1.0 - 0.85 * melt_f);
+    let clip_margin = rough_amp + 0.66;
     let serr_scale = (rough_amp * (tex_w as f32 * (1.0 / 256.0))) * (1.0 / 128.0);
     let serr_gate = -0.32 * r - 0.65;
     let solid = Color32::from_rgb(col[0], col[1], col[2]);
-    let start_dx = (x0 as f32 + 0.5) - cx;
 
     for y in y0..=y1 {
         let dy = (y as f32 + 0.5) - cy;
         let row = (y - band_y0) * width;
 
+        // Convex scanline X-span clipping against rotated polygon half-planes
+        let mut dx_min = (x0 as f32 + 0.5) - cx;
+        let mut dx_max = (x1 as f32 + 0.5) - cx;
+        let mut row_empty = false;
+        for k in 0..nf {
+            let rhs = dk[k] + clip_margin - ry[k] * dy;
+            let ak = rx[k];
+            if ak > 1e-4 {
+                dx_max = dx_max.min(rhs / ak);
+            } else if ak < -1e-4 {
+                dx_min = dx_min.max(rhs / ak);
+            } else if rhs < 0.0 {
+                row_empty = true;
+                break;
+            }
+        }
+        if row_empty || dx_min > dx_max {
+            continue;
+        }
+        let sx0 = (cx + dx_min - 0.5).floor().max(x0 as f32) as usize;
+        let sx1 = (cx + dx_max - 0.5).ceil().min(x1 as f32) as usize;
+        if sx0 > sx1 {
+            continue;
+        }
+
+        let start_dx = (sx0 as f32 + 0.5) - cx;
         let mut p = [0.0f32; MAX_FACETS];
         for k in 0..nf {
             p[k] = start_dx * rx[k] + dy * ry[k] - dk[k];
@@ -1210,7 +1466,7 @@ fn splat_crumb_polygon_band(
         let mut cached_dt = [0i16; 3];
         let mut cached_dt_valid = false;
 
-        for x in x0..=x1 {
+        for x in sx0..=sx1 {
             let mut max_e = p[0];
             let mut max_k = 0usize;
             p[0] += rx[0];
@@ -1228,7 +1484,6 @@ fn splat_crumb_polygon_band(
             u_fp = u_fp.wrapping_add(du_dx);
             v_fp = v_fp.wrapping_add(dv_dx);
 
-            // Fast early reject far outside the polygon before hashing
             if max_e > rough_amp + 0.65 {
                 continue;
             }
@@ -1250,7 +1505,6 @@ fn splat_crumb_polygon_band(
                 continue;
             }
 
-            // Scanline texel-run register cache: skips ~80-90% of hash + texture calls when zoomed in!
             if tx != prev_tx || ty != prev_ty {
                 prev_tx = tx;
                 prev_ty = ty;
@@ -1270,20 +1524,27 @@ fn splat_crumb_polygon_band(
             }
 
             if !cached_dt_valid {
-                cached_dt =
-                    crumb_pixel_tex_rgb(mat, tx, ty, cached_tex_h, seed, dmg, tex_w, rich_tex);
+                cached_dt = crumb_pixel_tex_rgb(
+                    mat,
+                    tx,
+                    ty,
+                    cached_tex_h,
+                    seed,
+                    if melt_round >= 180 { 0.0 } else { dmg },
+                    tex_w,
+                    rich_tex,
+                );
                 cached_dt_valid = true;
             }
             let mut dt = cached_dt;
 
-            // World-proportional facet bevel & dark grain-boundary outline
             let e_norm = max_e_s * inv_r;
             if e_norm > -0.22 {
                 let dl = f_light[max_k];
                 dt[0] += dl;
                 dt[1] += dl;
                 dt[2] += dl;
-                if rich_tex && e_norm > -0.09 {
+                if rich_tex && melt_round < 180 && e_norm > -0.09 {
                     let seam = ((12 * tex_w) >> 8) as i16;
                     dt[0] -= seam;
                     dt[1] -= seam;
@@ -1380,13 +1641,16 @@ fn splat_explosion_plume_band(
     let swirl = (seed as f32 * 0.00173) + det_age * 0.14 * if (seed & 1) == 0 { 1.0 } else { -1.0 };
     let (sin_s, cos_s) = swirl.sin_cos();
 
-    // Smooth scale-invariant billowing fBm turbulence (soft cloud tendrils, zero circular borders!)
+    // Smooth scale-invariant billowing fBm LUT coordinates (8 subtexels per lattice cell across 32x32)
     let tex_scale = (2.4 * 65536.0) * inv_r;
     let du_dx = (cos_s * tex_scale).round() as i32;
     let dv_dx = (-sin_s * tex_scale).round() as i32;
     let age_shift = (det_age * 0.85).round() as i32;
     let u_off = (((seed & 0xFF) as i32) << 12).wrapping_add(age_shift << 15);
     let v_off = ((((seed >> 8) & 0xFF) as i32) << 12).wrapping_sub(age_shift << 14);
+    let lut = plume_fbm_lut();
+    let seed_lx = ((seed >> 16) & 255) as i32;
+    let seed_ly = ((seed >> 24) & 255) as i32;
 
     // Incandescent plasma flash -> bright fireball -> warm ember-lit atmospheric smoke veil
     let young_flash = (1.0 - (det_age / 3.2).clamp(0.0, 1.0)).powf(1.3);
@@ -1394,24 +1658,6 @@ fn splat_explosion_plume_band(
     let heat_norm = ((temp_k - 700.0) / 3400.0).clamp(0.0, 1.25);
     let hot_drive = (heat_norm * (0.20 + 0.80 * fire_life)).max(0.85 * fire_life);
     let gas_optical = (0.14 + 0.34 * fire_life) * (0.64 + 0.36 * rho_rel.clamp(0.0, 1.0));
-
-    // Precomputed smooth value-noise helper
-    #[inline(always)]
-    fn value_noise(ux: i32, vy: i32, seed: u32) -> f32 {
-        let tx = ux >> 16;
-        let ty = vy >> 16;
-        let fx = (ux & 0xFFFF) as f32 * (1.0 / 65536.0);
-        let fy = (vy & 0xFFFF) as f32 * (1.0 / 65536.0);
-        let sx = fx * fx * (3.0 - 2.0 * fx);
-        let sy = fy * fy * (3.0 - 2.0 * fy);
-        let h00 = (cell_hash(tx, ty, seed) & 0xFF) as f32 * (1.0 / 255.0);
-        let h10 = (cell_hash(tx + 1, ty, seed) & 0xFF) as f32 * (1.0 / 255.0);
-        let h01 = (cell_hash(tx, ty + 1, seed) & 0xFF) as f32 * (1.0 / 255.0);
-        let h11 = (cell_hash(tx + 1, ty + 1, seed) & 0xFF) as f32 * (1.0 / 255.0);
-        let a = h00 + (h10 - h00) * sx;
-        let b = h01 + (h11 - h01) * sx;
-        a + (b - a) * sy
-    }
 
     let start_dx = (x0 as f32 + 0.5) - cx;
     let r_bound_sq = r_bound * r_bound;
@@ -1437,11 +1683,13 @@ fn splat_explosion_plume_band(
             }
             let r_lin = d2.sqrt() * inv_rb;
 
-            // Smooth 2-octave fBm cloud turbulence warps the silhouette organically!
-            let n1 = value_noise(cu, cv, seed);
-            let n2 = value_noise(cu << 1, cv << 1, seed ^ 0x9E37_79B9);
-            let billow = 0.65 * (1.0 - (2.0 * n1 - 1.0).abs()) + 0.35 * n2;
-            let r_warped = (r_lin + 0.42 * (n1 - 0.5) + 0.22 * (n2 - 0.5)).clamp(0.0, 1.0);
+            // L1-cached 2-octave fBm plume warp lookup
+            let lx = ((cu >> 13).wrapping_add(seed_lx)) & 255;
+            let ly = ((cv >> 13).wrapping_add(seed_ly)) & 255;
+            let [n1_u, b_u] = lut[((ly as usize) << 8) | (lx as usize)];
+            let n1 = n1_u as f32 * (1.0 / 255.0);
+            let billow = b_u as f32 * (1.0 / 255.0);
+            let r_warped = (r_lin + 0.44 * (n1 - 0.5)).clamp(0.0, 1.0);
             let omr = 1.0 - r_warped;
             let cloud_env = omr * omr * (1.0 + 2.0 * r_warped);
 
@@ -1915,10 +2163,12 @@ fn crumb_pixel_tex_rgb(
     ]
 }
 
+#[cfg(test)]
 trait BgFill {
     fn assign_bg(&mut self, len: usize);
 }
 
+#[cfg(test)]
 impl BgFill for Vec<Color32> {
     fn assign_bg(&mut self, len: usize) {
         let bg = Color32::from_rgb(11, 14, 20);
