@@ -6,6 +6,32 @@ use crate::physics::ContinuumWorld;
 use crate::scene::{ArmorLayer, PlanetShell, ProjectileSpec, SceneSpec, TargetKind, TargetSpec};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScenarioCategory {
+    All,
+    ArmorShapedCharges,
+    NavalBunker,
+    PlanetaryOrbital,
+}
+
+impl ScenarioCategory {
+    pub const ALL: [ScenarioCategory; 4] = [
+        ScenarioCategory::All,
+        ScenarioCategory::ArmorShapedCharges,
+        ScenarioCategory::NavalBunker,
+        ScenarioCategory::PlanetaryOrbital,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All Scenarios",
+            Self::ArmorShapedCharges => "Armor & Shaped Charges",
+            Self::NavalBunker => "Naval, Bunker & Structural",
+            Self::PlanetaryOrbital => "Planetary & Orbital",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScenarioPreset {
     HeatVsRhaArmor,
     ApfsdsVsKontakt5Era,
@@ -19,11 +45,14 @@ pub enum ScenarioPreset {
     IcyCometCollision,
     HypervelocityWhipple,
     LowSpeedPlasticRicochet,
+    RocheLimitRingFormation,
+    BinaryPlanetInspiral,
+    KineticRodBunkerBuster,
     EmptySpace,
 }
 
 impl ScenarioPreset {
-    pub const ALL: [ScenarioPreset; 13] = [
+    pub const ALL: [ScenarioPreset; 16] = [
         ScenarioPreset::HeatVsRhaArmor,
         ScenarioPreset::ApfsdsVsKontakt5Era,
         ScenarioPreset::TandemHeatVsEra,
@@ -36,8 +65,32 @@ impl ScenarioPreset {
         ScenarioPreset::IcyCometCollision,
         ScenarioPreset::HypervelocityWhipple,
         ScenarioPreset::LowSpeedPlasticRicochet,
+        ScenarioPreset::RocheLimitRingFormation,
+        ScenarioPreset::BinaryPlanetInspiral,
+        ScenarioPreset::KineticRodBunkerBuster,
         ScenarioPreset::EmptySpace,
     ];
+
+    pub fn category(self) -> ScenarioCategory {
+        match self {
+            Self::HeatVsRhaArmor
+            | Self::ApfsdsVsKontakt5Era
+            | Self::TandemHeatVsEra
+            | Self::EfpVsSpacedArmor
+            | Self::HeshSquashSpall
+            | Self::ApfsdsVsChobhamNera => ScenarioCategory::ArmorShapedCharges,
+            Self::ApheTankAmmoRack
+            | Self::ApheVsConcreteBunker
+            | Self::LowSpeedPlasticRicochet
+            | Self::KineticRodBunkerBuster => ScenarioCategory::NavalBunker,
+            Self::PlanetaryImpact
+            | Self::IcyCometCollision
+            | Self::HypervelocityWhipple
+            | Self::RocheLimitRingFormation
+            | Self::BinaryPlanetInspiral => ScenarioCategory::PlanetaryOrbital,
+            Self::EmptySpace => ScenarioCategory::All,
+        }
+    }
 
     pub fn title(self) -> &'static str {
         match self {
@@ -53,6 +106,9 @@ impl ScenarioPreset {
             ScenarioPreset::IcyCometCollision => "10. Icy Comet vs Rocky Moon (6.8 km/s)",
             ScenarioPreset::HypervelocityWhipple => "11. Spacecraft Whipple Shield (7.2 km/s)",
             ScenarioPreset::LowSpeedPlasticRicochet => "12. Sub-Hydrodynamic Plastic Dent (0.42 km/s)",
+            ScenarioPreset::RocheLimitRingFormation => "14. Tidal Roche-Limit Ring Disruption (Orbital)",
+            ScenarioPreset::BinaryPlanetInspiral => "15. Binary Proto-Planet Inspiral Merger",
+            ScenarioPreset::KineticRodBunkerBuster => "16. Tungsten Bunker-Buster vs Reinforced Vault",
             ScenarioPreset::EmptySpace => "13. Empty Continuum Space",
         }
     }
@@ -94,6 +150,15 @@ impl ScenarioPreset {
             }
             ScenarioPreset::LowSpeedPlasticRicochet => {
                 "Contrast regime at 420 m/s: impact pressure stays near material strength instead of hydrodynamic fluid flow. The sloped steel plate permanently bends plastically while the deformed projectile ricochets."
+            }
+            ScenarioPreset::RocheLimitRingFormation => {
+                "A fragile cryogenic water-ice moon skims inside a dense iron-silicate super-planet's Roche limit under self-gravity. Tidal differential acceleration shears the moon into elongated orbital ring arcs!"
+            }
+            ScenarioPreset::BinaryPlanetInspiral => {
+                "Two differentiated Fe-Ni core + basalt planets orbit on a decaying binary trajectory under self-gravity, tidally stretching into prolate ellipsoids before coalescing into a hot post-impact body."
+            }
+            ScenarioPreset::KineticRodBunkerBuster => {
+                "Heavy 2.4 km/s Tungsten penetrator rod dives through multi-story steel-rebar Concrete vault roof slabs and spall liners to breach a buried Comp-B munitions chamber."
             }
             ScenarioPreset::EmptySpace => {
                 "Empty borderless continuum space. Design custom warheads & targets in Targets Builder & Projectiles Builder, place & aim them in STAGING, or pick a ballistic/astrophysics preset above."
@@ -984,6 +1049,152 @@ pub fn preset_to_scene(preset: ScenarioPreset) -> SceneSpec {
             ));
         }
 
+        ScenarioPreset::RocheLimitRingFormation => {
+            scene.self_gravity = true;
+            scene.grav_g = 9.0e-5;
+            scene.targets.push(TargetSpec {
+                name: "Super-Planet Core".to_string(),
+                pos: Vec2::new(0.0, 0.0),
+                angle_deg: 0.0,
+                vel: Vec2::ZERO,
+                temp_k: 520.0,
+                kind: TargetKind::LayeredPlanet {
+                    shells: vec![
+                        PlanetShell {
+                            thickness: 9.0,
+                            mat: MaterialId::PlanetaryIron,
+                            temp_k: 1200.0,
+                        },
+                        PlanetShell {
+                            thickness: 9.0,
+                            mat: MaterialId::BasaltRock,
+                            temp_k: 520.0,
+                        },
+                    ],
+                },
+            });
+            let mut moon = ProjectileSpec::default_with_shape(
+                ProjectileShape::DifferentiatedAsteroid,
+                Vec2::new(0.0, 26.5),
+                MaterialId::WaterIce,
+            );
+            moon.name = "Roche Icy Moonlet".to_string();
+            moon.core_mat = MaterialId::BasaltRock;
+            moon.radius_cm = 5.2;
+            moon.core_frac = 0.25;
+            moon.temp_k = 145.0;
+            scene.projectiles.push(moon);
+            if let Some((spd, ang)) = scene.compute_orbit_velocity(0, false, 0.94) {
+                scene.projectiles[0].speed_kms = spd;
+                scene.projectiles[0].angle_deg = ang;
+            }
+        }
+
+        ScenarioPreset::BinaryPlanetInspiral => {
+            scene.self_gravity = true;
+            scene.grav_g = 8.5e-5;
+            scene.targets.push(TargetSpec {
+                name: "Proto-Planet Alpha".to_string(),
+                pos: Vec2::new(-14.5, -2.5),
+                angle_deg: 0.0,
+                vel: Vec2::new(0.025, 0.055),
+                temp_k: 450.0,
+                kind: TargetKind::LayeredPlanet {
+                    shells: vec![
+                        PlanetShell {
+                            thickness: 6.5,
+                            mat: MaterialId::PlanetaryIron,
+                            temp_k: 1050.0,
+                        },
+                        PlanetShell {
+                            thickness: 8.5,
+                            mat: MaterialId::BasaltRock,
+                            temp_k: 450.0,
+                        },
+                    ],
+                },
+            });
+            scene.targets.push(TargetSpec {
+                name: "Proto-Planet Beta".to_string(),
+                pos: Vec2::new(15.0, 2.5),
+                angle_deg: 0.0,
+                vel: Vec2::new(-0.025, -0.068),
+                temp_k: 430.0,
+                kind: TargetKind::LayeredPlanet {
+                    shells: vec![
+                        PlanetShell {
+                            thickness: 5.5,
+                            mat: MaterialId::PlanetaryIron,
+                            temp_k: 950.0,
+                        },
+                        PlanetShell {
+                            thickness: 7.5,
+                            mat: MaterialId::BasaltRock,
+                            temp_k: 430.0,
+                        },
+                    ],
+                },
+            });
+        }
+
+        ScenarioPreset::KineticRodBunkerBuster => {
+            scene.targets.push(TargetSpec {
+                name: "Reinforced Vault Overburden".to_string(),
+                pos: Vec2::new(8.0, 0.0),
+                angle_deg: 0.0,
+                vel: Vec2::ZERO,
+                temp_k: 293.0,
+                kind: TargetKind::CompositePlate {
+                    height: 46.0,
+                    layers: vec![
+                        ArmorLayer {
+                            thickness: 7.5,
+                            mat: MaterialId::Concrete,
+                        },
+                        ArmorLayer {
+                            thickness: 1.5,
+                            mat: MaterialId::MildSteel,
+                        },
+                        ArmorLayer {
+                            thickness: 6.5,
+                            mat: MaterialId::Concrete,
+                        },
+                        ArmorLayer {
+                            thickness: 2.2,
+                            mat: MaterialId::RhaSteel,
+                        },
+                        ArmorLayer {
+                            thickness: 1.4,
+                            mat: MaterialId::AramidLiner,
+                        },
+                    ],
+                },
+            });
+            scene.targets.push(TargetSpec {
+                name: "Underground Munitions Cache".to_string(),
+                pos: Vec2::new(23.5, 0.0),
+                angle_deg: 0.0,
+                vel: Vec2::ZERO,
+                temp_k: 293.0,
+                kind: TargetKind::SolidBox {
+                    width: 5.0,
+                    height: 22.0,
+                    mat: MaterialId::CompB,
+                },
+            });
+            let mut rod = ProjectileSpec::default_with_shape(
+                ProjectileShape::LongRodDart,
+                Vec2::new(-16.0, 0.0),
+                MaterialId::Tungsten,
+            );
+            rod.name = "Heavy Bunker-Buster Rod".to_string();
+            rod.length_cm = 18.0;
+            rod.radius_cm = 1.65;
+            rod.speed_kms = 2.40;
+            rod.angle_deg = 0.0;
+            scene.projectiles.push(rod);
+        }
+
         ScenarioPreset::EmptySpace => {}
     }
 
@@ -1813,6 +2024,57 @@ mod tests {
                 world.pos[i].is_finite() && world.vel[i].is_finite(),
                 "Live tool mutations must remain numerically finite after integration"
             );
+        }
+    }
+
+    #[test]
+    fn orbital_velocity_trajectory_preview_and_astrophysics_presets_invariants() {
+        // 1. Orbit assist computation produces orthogonal circular prograde & retrograde vectors
+        let mut sc = preset_to_scene(ScenarioPreset::RocheLimitRingFormation);
+        let (spd_pro, ang_pro) = sc
+            .compute_orbit_velocity(0, false, 1.0)
+            .expect("Self-gravitating scene must solve orbital velocity");
+        let (spd_ret, ang_ret) = sc
+            .compute_orbit_velocity(0, true, 1.0)
+            .expect("Retrograde orbit velocity must exist");
+        assert!(spd_pro > 0.1 && (spd_pro - spd_ret).abs() < 1e-3);
+        let r_hat = (sc.projectiles[0].pos - sc.targets[0].pos).normalize();
+        let v_pro = Vec2::from_angle(ang_pro.to_radians());
+        let v_ret = Vec2::from_angle(ang_ret.to_radians());
+        assert!(r_hat.dot(v_pro).abs() < 1e-3, "Prograde orbit must be tangential");
+        assert!(v_pro.dot(v_ret) < -0.99, "Prograde and retrograde must be opposite");
+
+        // 2. Curved N-body trajectory prediction for circular orbit vs direct radial impact
+        sc.projectiles[0].speed_kms = spd_pro;
+        sc.projectiles[0].angle_deg = ang_pro;
+        let traces_orbit = sc.predict_staging_trajectories();
+        assert!(traces_orbit.len() == 2);
+        assert!(traces_orbit[1].points.len() > 20);
+        assert!(
+            traces_orbit[1].impact.is_none(),
+            "Circular orbit at r=26.5 around R=18 planet should not impact"
+        );
+
+        sc.projectiles[0].set_vel_cm_per_us(Vec2::new(0.0, -0.35));
+        let traces_hit = sc.predict_staging_trajectories();
+        assert!(
+            traces_hit[1].impact.is_some(),
+            "Inward dive trajectory must predict impact intersection marker"
+        );
+
+        // 3. New presets build cleanly and step with finite states
+        for preset in [
+            ScenarioPreset::RocheLimitRingFormation,
+            ScenarioPreset::BinaryPlanetInspiral,
+            ScenarioPreset::KineticRodBunkerBuster,
+        ] {
+            let mut w = build_scenario(preset, 0.55);
+            assert!(w.len() > 200, "{:?} must spawn continuum particles", preset);
+            for _ in 0..25 {
+                let dt = w.compute_cfl_dt();
+                w.step(dt);
+            }
+            assert!(w.pos.iter().all(|p| p.is_finite()));
         }
     }
 }

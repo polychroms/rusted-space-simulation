@@ -238,6 +238,71 @@ impl TargetSpec {
         }
     }
 
+    pub fn bounding_radius(&self) -> f32 {
+        match &self.kind {
+            TargetKind::SolidBox { width, height, .. }
+            | TargetKind::TriangleWedge { width, height, .. } => {
+                0.5 * (width * width + height * height).sqrt()
+            }
+            TargetKind::Ellipse { rx, ry, .. } => rx.max(*ry),
+            TargetKind::HollowRing { outer_r, .. } => *outer_r,
+            TargetKind::CompositePlate { height, layers } => {
+                let w: f32 = layers.iter().map(|l| l.thickness).sum();
+                0.5 * (w * w + height * height).sqrt()
+            }
+            TargetKind::LayeredPlanet { shells } => {
+                shells.iter().map(|s| s.thickness).sum::<f32>().max(1.0)
+            }
+            TargetKind::Blueprint { bp } => bp.world_half_extents(0.35).length().max(1.0),
+        }
+    }
+
+    pub fn estimate_mass(&self) -> f32 {
+        match &self.kind {
+            TargetKind::SolidBox { width, height, mat } => {
+                width * height * mat.props().rho0
+            }
+            TargetKind::TriangleWedge { width, height, mat } => {
+                0.5 * width * height * mat.props().rho0
+            }
+            TargetKind::Ellipse { rx, ry, mat } => {
+                std::f32::consts::PI * rx * ry * mat.props().rho0
+            }
+            TargetKind::HollowRing {
+                outer_r,
+                wall_thick,
+                mat,
+            } => {
+                let inner = (outer_r - wall_thick).max(0.0);
+                std::f32::consts::PI * (outer_r * outer_r - inner * inner) * mat.props().rho0
+            }
+            TargetKind::CompositePlate { height, layers } => layers
+                .iter()
+                .map(|l| l.thickness * height * l.mat.props().rho0)
+                .sum(),
+            TargetKind::LayeredPlanet { shells } => {
+                let mut r_prev = 0.0f32;
+                let mut m = 0.0f32;
+                for s in shells {
+                    let r_next = r_prev + s.thickness.max(0.0);
+                    m += std::f32::consts::PI
+                        * (r_next * r_next - r_prev * r_prev)
+                        * s.mat.props().rho0;
+                    r_prev = r_next;
+                }
+                m
+            }
+            TargetKind::Blueprint { bp } => {
+                let cell_area = 0.35f32 * 0.35f32;
+                let mut m = 0.0f32;
+                for mat in bp.cells.iter().flatten() {
+                    m += cell_area * mat.props().rho0;
+                }
+                m.max(1.0)
+            }
+        }
+    }
+
     pub fn spawn_into(&self, world: &mut ContinuumWorld) {
         match &self.kind {
             TargetKind::SolidBox { width, height, mat } => {
@@ -445,6 +510,51 @@ impl ProjectileSpec {
         }
     }
 
+    pub fn bounding_radius(&self) -> f32 {
+        match self.shape {
+            ProjectileShape::Sphere
+            | ProjectileShape::HollowRing
+            | ProjectileShape::DifferentiatedAsteroid => self.radius_cm.max(0.8),
+            ProjectileShape::CustomBlueprint => self
+                .blueprint
+                .as_ref()
+                .map(|b| b.world_half_extents(0.35).length())
+                .unwrap_or_else(|| (0.5 * self.length_cm).hypot(self.radius_cm))
+                .max(0.8),
+            _ => (0.5 * self.length_cm).hypot(self.radius_cm).max(0.8),
+        }
+    }
+
+    pub fn estimate_mass(&self) -> f32 {
+        let r = self.radius_cm.max(0.4);
+        match self.shape {
+            ProjectileShape::Sphere => std::f32::consts::PI * r * r * self.mat.props().rho0,
+            ProjectileShape::HollowRing => {
+                let inner = (r * (1.0 - self.core_frac.clamp(0.1, 0.9))).max(0.0);
+                std::f32::consts::PI * (r * r - inner * inner) * self.mat.props().rho0
+            }
+            ProjectileShape::DifferentiatedAsteroid => {
+                let rc = r * self.core_frac.clamp(0.1, 0.9);
+                std::f32::consts::PI
+                    * (rc * rc * self.core_mat.props().rho0
+                        + (r * r - rc * rc) * self.mat.props().rho0)
+            }
+            ProjectileShape::CustomBlueprint => {
+                if let Some(bp) = &self.blueprint {
+                    let cell_area = 0.35f32 * 0.35f32;
+                    let mut m = 0.0f32;
+                    for mat in bp.cells.iter().flatten() {
+                        m += cell_area * mat.props().rho0;
+                    }
+                    m.max(1.0)
+                } else {
+                    self.length_cm * 2.0 * r * self.mat.props().rho0
+                }
+            }
+            _ => self.length_cm * 2.0 * r * self.mat.props().rho0,
+        }
+    }
+
     pub fn spawn_into(&self, world: &mut ContinuumWorld) {
         let vel = self.vel_cm_per_us();
         if self.shape == ProjectileShape::CustomBlueprint {
@@ -476,6 +586,13 @@ impl ProjectileSpec {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct TrajectoryTrace {
+    pub is_projectile: bool,
+    pub points: Vec<Vec2>,
+    pub impact: Option<Vec2>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SceneSpec {
     pub targets: Vec<TargetSpec>,
@@ -492,6 +609,177 @@ impl SceneSpec {
             self_gravity: false,
             grav_g: 7.0e-5,
         }
+    }
+
+    /// Compute circular or eccentric orbit `(speed_kms, angle_deg)` for `projectiles[proj_idx]`
+    /// around the nearest massive target body under softened 2D N-body gravity.
+    pub fn compute_orbit_velocity(
+        &self,
+        proj_idx: usize,
+        retrograde: bool,
+        eccentricity_factor: f32,
+    ) -> Option<(f32, f32)> {
+        let p = self.projectiles.get(proj_idx)?;
+        if !self.self_gravity || self.grav_g <= 0.0 || self.targets.is_empty() {
+            return None;
+        }
+        let mut best_target: Option<(&TargetSpec, f32)> = None;
+        for t in &self.targets {
+            let score = t.estimate_mass() / (t.pos - p.pos).length_squared().max(1.0);
+            if best_target.is_none_or(|(_, s)| score > s) {
+                best_target = Some((t, score));
+            }
+        }
+        let (tgt, _) = best_target?;
+        let rel = p.pos - tgt.pos;
+        let r = rel.length().max(1.0);
+        let r_hat = rel / r;
+        let tang = if retrograde {
+            Vec2::new(r_hat.y, -r_hat.x)
+        } else {
+            Vec2::new(-r_hat.y, r_hat.x)
+        };
+        let m_tot = tgt.estimate_mass() + p.estimate_mass();
+        let soft_sq = 2.0f32;
+        let denom = (r * r + soft_sq).powf(1.5);
+        let v_rel = (self.grav_g * m_tot * r * r / denom).max(0.0).sqrt() * eccentricity_factor;
+        let v_vec = tgt.vel + tang * v_rel;
+        let speed_kms = (v_vec.length() * 10.0).clamp(0.0, 100.0);
+        let angle_deg = if v_vec.length_squared() > 1e-12 {
+            v_vec.y.atan2(v_vec.x).to_degrees()
+        } else {
+            0.0
+        };
+        Some((speed_kms, angle_deg))
+    }
+
+    /// Integrate softened N-body trajectories in staging to visualize curved gravitational orbits & impact markers.
+    pub fn predict_staging_trajectories(&self) -> Vec<TrajectoryTrace> {
+        let n_t = self.targets.len();
+        let n_p = self.projectiles.len();
+        let n = n_t + n_p;
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut pos = Vec::with_capacity(n);
+        let mut vel = Vec::with_capacity(n);
+        let mut mass = Vec::with_capacity(n);
+        let mut rad = Vec::with_capacity(n);
+        let mut is_proj = Vec::with_capacity(n);
+        for t in &self.targets {
+            pos.push(t.pos);
+            vel.push(t.vel);
+            mass.push(t.estimate_mass());
+            rad.push(t.bounding_radius());
+            is_proj.push(false);
+        }
+        for p in &self.projectiles {
+            pos.push(p.pos);
+            vel.push(p.vel_cm_per_us());
+            mass.push(p.estimate_mass());
+            rad.push(p.bounding_radius());
+            is_proj.push(true);
+        }
+
+        let grav = if self.self_gravity && self.grav_g > 0.0 {
+            self.grav_g
+        } else {
+            0.0
+        };
+
+        let mut traces: Vec<TrajectoryTrace> = (0..n)
+            .map(|i| TrajectoryTrace {
+                is_projectile: is_proj[i],
+                points: vec![pos[i]],
+                impact: None,
+            })
+            .collect();
+        let mut active = vec![true; n];
+
+        let steps = if grav > 0.0 { 260usize } else { 90usize };
+        let soft_sq = 2.0f32;
+        let compute_acc = |positions: &[Vec2], alive: &[bool]| -> Vec<Vec2> {
+            let mut acc = vec![Vec2::ZERO; n];
+            if grav <= 0.0 {
+                return acc;
+            }
+            for i in 0..n {
+                if !alive[i] {
+                    continue;
+                }
+                let mut g = Vec2::ZERO;
+                for j in 0..n {
+                    if i == j || !alive[j] {
+                        continue;
+                    }
+                    let d = positions[j] - positions[i];
+                    let r2 = d.length_squared() + soft_sq;
+                    g += d * (grav * mass[j] / (r2 * r2.sqrt()));
+                }
+                acc[i] = g;
+            }
+            acc
+        };
+
+        let max_v = vel.iter().map(|v| v.length()).fold(0.05f32, f32::max);
+        let dt = if grav > 0.0 {
+            (1.6 / max_v.max(0.04)).clamp(0.45, 5.5)
+        } else {
+            (1.2 / max_v.max(0.04)).clamp(0.25, 2.5)
+        };
+        let mut acc = compute_acc(&pos, &active);
+
+        for step_idx in 0..steps {
+            for i in 0..n {
+                if !active[i] {
+                    continue;
+                }
+                pos[i] += vel[i] * dt + 0.5 * acc[i] * dt * dt;
+            }
+            let next_acc = compute_acc(&pos, &active);
+            for i in 0..n {
+                if !active[i] {
+                    continue;
+                }
+                vel[i] += 0.5 * (acc[i] + next_acc[i]) * dt;
+            }
+            acc = next_acc;
+
+            for i in 0..n {
+                if !active[i] {
+                    continue;
+                }
+                for j in (i + 1)..n {
+                    if !active[j] {
+                        continue;
+                    }
+                    let d = pos[j] - pos[i];
+                    let hit_r = 0.88 * (rad[i] + rad[j]);
+                    if d.length_squared() <= hit_r * hit_r {
+                        let contact = 0.5 * (pos[i] + pos[j]);
+                        if is_proj[i] || !is_proj[j] {
+                            traces[i].points.push(contact);
+                            traces[i].impact = Some(contact);
+                            active[i] = false;
+                        }
+                        if is_proj[j] || !is_proj[i] {
+                            traces[j].points.push(contact);
+                            traces[j].impact = Some(contact);
+                            active[j] = false;
+                        }
+                    }
+                }
+            }
+
+            if step_idx % 4 == 3 || step_idx + 1 == steps {
+                for i in 0..n {
+                    if active[i] && (traces[i].is_projectile || vel[i].length_squared() > 1e-8) {
+                        traces[i].points.push(pos[i]);
+                    }
+                }
+            }
+        }
+        traces
     }
 
     pub fn build_world(&self, dx: f32) -> ContinuumWorld {
