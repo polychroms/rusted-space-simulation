@@ -17,8 +17,10 @@ use eframe::egui::{
 use glam::Vec2;
 
 use crate::analysis::{
-    analyze_caliper_ray, draw_caliper_overlay, draw_quantitative_colorbar, draw_velocity_vectors,
-    export_telemetry_csv, export_viewport_png, GaugeBank, GaugeChannel, TimelineRecorder,
+    analyze_caliper_ray, analyze_remnant_clusters, draw_caliper_overlay, draw_quantitative_colorbar,
+    draw_velocity_vectors, export_animated_gif, export_telemetry_csv, export_viewport_png,
+    quantize_rgba_downsampled, GaugeBank, GaugeChannel, GifFrame, RemnantAnalysis,
+    TimelineRecorder,
 };
 use crate::blueprint::{BuiltinProjectileBp, BuiltinTargetBp};
 use crate::editor_ui::{BlueprintEditor, BlueprintEditorAction};
@@ -315,6 +317,10 @@ struct RustedSpaceSimApp {
     scenario_filter: ScenarioCategory,
     show_help_modal: bool,
     hover_world_pos: Option<Vec2>,
+    gif_recording: bool,
+    gif_frames: Vec<GifFrame>,
+    last_gif_capture_step: u64,
+    remnant_report: Option<RemnantAnalysis>,
 
     // Vulkan GPU Compute Accelerator
     vulkan_engine: Option<VulkanPhysicsEngine>,
@@ -430,6 +436,10 @@ impl RustedSpaceSimApp {
             scenario_filter: ScenarioCategory::All,
             show_help_modal: false,
             hover_world_pos: None,
+            gif_recording: false,
+            gif_frames: Vec::new(),
+            last_gif_capture_step: 0,
+            remnant_report: None,
             vulkan_engine,
             vulkan_init_err,
             use_vulkan_gpu,
@@ -609,6 +619,56 @@ impl RustedSpaceSimApp {
         match export_telemetry_csv(self.preset.title(), &self.world, &self.gauges) {
             Ok(path) => self.set_toast(format!("Exported CSV waveforms: {}", path.display())),
             Err(e) => self.set_toast(format!("CSV export failed: {e}")),
+        }
+    }
+
+    fn toggle_or_save_gif_now(&mut self) {
+        if self.gif_recording {
+            self.gif_recording = false;
+            let frames = std::mem::take(&mut self.gif_frames);
+            match export_animated_gif(self.preset.title(), &frames, 5) {
+                Ok(path) => self.set_toast(format!("Saved GIF ({} frames): {}", frames.len(), path.display())),
+                Err(e) => self.set_toast(format!("GIF export failed: {e}")),
+            }
+        } else {
+            self.gif_frames.clear();
+            self.last_gif_capture_step = 0;
+            self.gif_recording = true;
+            self.set_toast("Recording live viewport GIF (up to 120 frames)...");
+        }
+    }
+
+    fn export_replay_gif_now(&mut self) {
+        if self.timeline.keyframes.is_empty() {
+            self.set_toast("No timeline keyframes recorded yet");
+            return;
+        }
+        let mut replay_world = ContinuumWorld::new(self.world.dx);
+        replay_world.self_gravity = self.world.self_gravity;
+        replay_world.grav_g = self.world.grav_g;
+        replay_world.down_gravity = self.world.down_gravity;
+        let mut scratch_canvas = PixelCanvas::new();
+        let rw = 480usize;
+        let rh = 300usize;
+        let max_frames = self.timeline.keyframes.len().min(96);
+        let stride = (self.timeline.keyframes.len() / max_frames).max(1);
+        let mut frames = Vec::with_capacity(max_frames);
+        for kf in self.timeline.keyframes.iter().step_by(stride).take(max_frames) {
+            replay_world.restore_snapshot(kf, false);
+            scratch_canvas.render_with_opts(
+                &replay_world,
+                &self.cam,
+                rw,
+                rh,
+                self.vis_mode,
+                false,
+                self.show_starfield,
+            );
+            frames.push(quantize_rgba_downsampled(&scratch_canvas.pixels, rw, rh, 480));
+        }
+        match export_animated_gif(self.preset.title(), &frames, 6) {
+            Ok(path) => self.set_toast(format!("Exported Replay GIF ({} frames): {}", frames.len(), path.display())),
+            Err(e) => self.set_toast(format!("Replay GIF export failed: {e}")),
         }
     }
 
@@ -801,6 +861,7 @@ impl RustedSpaceSimApp {
         self.ui_edit_baseline = None;
         self.gauges.clear();
         self.caliper_line = None;
+        self.remnant_report = None;
         self.selection = if !self.scene.projectiles.is_empty() {
             Some(SceneSelection::Projectile(0))
         } else if !self.scene.targets.is_empty() {
@@ -818,6 +879,10 @@ impl RustedSpaceSimApp {
             ScenarioPreset::RocheLimitRingFormation | ScenarioPreset::BinaryPlanetInspiral => {
                 self.cam.center = Vec2::ZERO;
                 self.cam.zoom = 8.5;
+            }
+            ScenarioPreset::OceanMoonHyperImpact => {
+                self.cam.center = Vec2::new(1.0, 0.0);
+                self.cam.zoom = 9.5;
             }
             ScenarioPreset::KineticRodBunkerBuster | ScenarioPreset::EfpVsSpacedArmor => {
                 self.cam.center = Vec2::new(8.0, 0.0);
@@ -857,6 +922,7 @@ impl RustedSpaceSimApp {
         self.slowmo_timer = 0.0;
         self.camera_shake = 0.0;
         self.prev_detonated_count = 0;
+        self.remnant_report = None;
         self.rebuild_staging_world();
     }
 
@@ -877,6 +943,7 @@ impl RustedSpaceSimApp {
         self.slowmo_timer = 0.0;
         self.camera_shake = 0.0;
         self.prev_detonated_count = 0;
+        self.remnant_report = None;
         self.pending_drag_undo = None;
         self.ui_edit_baseline = None;
         self.gauges.clear();
@@ -1668,6 +1735,13 @@ impl eframe::App for RustedSpaceSimApp {
                         if self.timeline.active_index.is_some() && ui.button("▶ Resume From Here").clicked() {
                             self.timeline.commit_branch(&mut self.world);
                             self.paused = false;
+                        }
+                        if ui
+                            .small_button("🎞 Replay GIF")
+                            .on_hover_text("Export animated GIF89a from recorded timeline keyframes")
+                            .clicked()
+                        {
+                            self.export_replay_gif_now();
                         }
                     });
                 });
@@ -2708,6 +2782,38 @@ impl RustedSpaceSimApp {
                 self.export_png_now();
             }
         });
+        ui.horizontal(|ui| {
+            let gif_label = if self.gif_recording {
+                format!("⏹ Save GIF ({}f)", self.gif_frames.len())
+            } else {
+                "🔴 Record GIF".to_string()
+            };
+            if ui.button(gif_label).clicked() {
+                self.toggle_or_save_gif_now();
+            }
+            if ui.button("🎞 Replay GIF").clicked() {
+                self.export_replay_gif_now();
+            }
+            if ui.button("🪐 Analyze Remnants").clicked() {
+                self.remnant_report = Some(analyze_remnant_clusters(&self.world));
+            }
+        });
+        if let Some(rep) = &self.remnant_report {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Clusters: {} | Largest: {:.1}% | 2nd: {:.1}%\nBound: {:.1}% | Escaped: {:.1}% | Peak Ejecta: {:.2} km/s",
+                    rep.cluster_count,
+                    rep.largest_mass_frac * 100.0,
+                    rep.second_mass_frac * 100.0,
+                    rep.bound_mass_frac * 100.0,
+                    rep.escaped_mass_frac * 100.0,
+                    rep.peak_ejecta_kms
+                ))
+                .monospace()
+                .size(10.0)
+                .color(Color32::from_rgb(155, 225, 200)),
+            );
+        }
 
         ui.add_space(6.0);
         ui.separator();
@@ -3107,6 +3213,19 @@ impl RustedSpaceSimApp {
                 self.show_starfield,
             );
             self.render_ms = 0.85 * self.render_ms + 0.15 * (t_ren.elapsed().as_secs_f32() * 1000.0);
+
+            if self.gif_recording
+                && self.phase == SimPhase::Running
+                && !self.paused
+                && self.world.step_count >= self.last_gif_capture_step + 4
+            {
+                self.gif_frames
+                    .push(quantize_rgba_downsampled(&self.canvas.pixels, rw, rh, 520));
+                self.last_gif_capture_step = self.world.step_count;
+                if self.gif_frames.len() >= 120 {
+                    self.toggle_or_save_gif_now();
+                }
+            }
 
             let color_image = ColorImage {
                 size: [rw, rh],
@@ -4812,7 +4931,7 @@ fn run_headless_benchmark() {
 
 fn print_help() {
     println!(
-        "Rusted Space Simulation (rssim) v0.0.6
+        "Rusted Space Simulation (rssim) v0.0.7
 Vulkan GPU-Accelerated Continuum Elasto-Plastic, Reactive Detonation & Planetary Hydrocode
 (Mie-Gruneisen + JWL EOS + CSPM Renormalization + Johnson-Cook Viscoplasticity + 32x32 LDS Self-Gravity)
 
@@ -4822,12 +4941,11 @@ USAGE:
     rssim --help     Show this help message
 
 KEY CAPABILITIES & INSTRUMENTATION:
+    • 32 Continuum Materials (Metals, Ceramics, Concrete, Polymers, Liquid Water, Octol & Condensed Thermite)
     • Vulkan 1.2 SPIR-V Compute Pipeline (131K spatial hash, GPU-resident 32x32 LDS self-gravity, HOST_CACHED DMA)
-    • Johnson-Cook Viscoplasticity + CSPM 1st-Order Gradients + JWL Detonation EOS (HEAT, Tandem, EFP, ERA, APHE, HESH)
-    • Pixel-by-Pixel Blueprint CAD (.rsim) + Full Multi-Object Scene Persistence (.rscene)
-    • Interactive Ballistic Caliper & Line-of-Sight RHAe Armor Analyzer (Key: M)
-    • Lagrangian Witness Sensor Gauges & Multi-Channel Oscilloscope (Alt+Click) + CSV/PNG Exports (F12)
-    • Instant Microsecond Keyframe Replay & Timeline Scrubber (Left/Right Arrows)"
+    • Live Physics Tools: Matter Brush, Void Eraser, Thermal Laser, Gravity Vortex, Shock Blast (Q/B/E/L/G/X)
+    • Orbital N-Body Trajectory Preview & 17 Presets (HEAT, EFP, ERA, APHE, Roche Ring, Binary Planets, Europa)
+    • GIF89a Recorder, Remnant Cluster Analyzer, Caliper RHAe Analyzer (M), Witness Gauges & CSV/PNG (F12)"
     );
 }
 

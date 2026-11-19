@@ -962,6 +962,383 @@ pub fn export_telemetry_csv(
     Ok(path)
 }
 
+#[derive(Clone, Debug)]
+pub struct GifFrame {
+    pub width: u16,
+    pub height: u16,
+    pub indices: Vec<u8>,
+}
+
+fn gif_palette_bytes() -> Vec<u8> {
+    let mut pal = Vec::with_capacity(256 * 3);
+    // Index 0: exact viewport deep-space background match
+    pal.extend_from_slice(&[11, 14, 20]);
+    // Indices 1..=252: 6x7x6 uniform RGB cube
+    for r_i in 0..6u8 {
+        let r = r_i * 51;
+        for g_i in 0..7u8 {
+            let g = g_i * 42;
+            for b_i in 0..6u8 {
+                let b = b_i * 51;
+                pal.extend_from_slice(&[r, g, b]);
+            }
+        }
+    }
+    // 253..=255: crisp UI/fireball extremes
+    pal.extend_from_slice(&[255, 255, 255]);
+    pal.extend_from_slice(&[255, 210, 120]);
+    pal.extend_from_slice(&[0, 0, 0]);
+    pal
+}
+
+#[inline]
+fn rgb_to_gif_idx(r: u8, g: u8, b: u8) -> u8 {
+    if r == 11 && g == 14 && b == 20 {
+        return 0;
+    }
+    if r >= 248 && g >= 248 && b >= 248 {
+        return 253;
+    }
+    if r >= 245 && (190..=230).contains(&g) && (95..=145).contains(&b) {
+        return 254;
+    }
+    if r <= 5 && g <= 5 && b <= 5 {
+        return 255;
+    }
+    let ri = ((r as u16 * 5 + 127) / 255) as u8;
+    let gi = ((g as u16 * 6 + 127) / 255) as u8;
+    let bi = ((b as u16 * 5 + 127) / 255) as u8;
+    1 + ri * 42 + gi * 6 + bi
+}
+
+pub fn quantize_rgba_downsampled(
+    pixels: &[Color32],
+    src_w: usize,
+    src_h: usize,
+    max_w: usize,
+) -> GifFrame {
+    if src_w == 0 || src_h == 0 || pixels.len() < src_w * src_h {
+        return GifFrame {
+            width: 16,
+            height: 16,
+            indices: vec![0; 16 * 16],
+        };
+    }
+    let out_w = src_w.min(max_w.max(16)).min(u16::MAX as usize);
+    let out_h = ((src_h * out_w) / src_w).max(16).min(u16::MAX as usize);
+    let mut indices = Vec::with_capacity(out_w * out_h);
+    for y in 0..out_h {
+        let sy = (y * src_h) / out_h;
+        let row = &pixels[sy * src_w..(sy + 1) * src_w];
+        for x in 0..out_w {
+            let sx = (x * src_w) / out_w;
+            let c = row[sx];
+            indices.push(rgb_to_gif_idx(c.r(), c.g(), c.b()));
+        }
+    }
+    GifFrame {
+        width: out_w as u16,
+        height: out_h as u16,
+        indices,
+    }
+}
+
+fn lzw_encode_gif(indices: &[u8]) -> Vec<u8> {
+    const TABLE_SZ: usize = 8192;
+    const TABLE_MASK: usize = TABLE_SZ - 1;
+    let mut keys = vec![0u32; TABLE_SZ];
+    let mut vals = vec![0u16; TABLE_SZ];
+
+    let mut out = Vec::with_capacity(indices.len() / 2 + 64);
+    let mut cur_sub = Vec::with_capacity(255);
+    let mut bit_buf: u32 = 0;
+    let mut bit_cnt: u8 = 0;
+
+    let emit_code = |code: u16,
+                     bits: u8,
+                     bit_buf: &mut u32,
+                     bit_cnt: &mut u8,
+                     cur_sub: &mut Vec<u8>,
+                     out: &mut Vec<u8>| {
+        *bit_buf |= (code as u32) << *bit_cnt;
+        *bit_cnt += bits;
+        while *bit_cnt >= 8 {
+            cur_sub.push((*bit_buf & 0xFF) as u8);
+            *bit_buf >>= 8;
+            *bit_cnt -= 8;
+            if cur_sub.len() == 255 {
+                out.push(255);
+                out.extend_from_slice(cur_sub);
+                cur_sub.clear();
+            }
+        }
+    };
+
+    let clear_code: u16 = 256;
+    let eoi_code: u16 = 257;
+    let mut code_bits: u8 = 9;
+    let mut next_code: u16 = 258;
+
+    emit_code(clear_code, code_bits, &mut bit_buf, &mut bit_cnt, &mut cur_sub, &mut out);
+    if indices.is_empty() {
+        emit_code(eoi_code, code_bits, &mut bit_buf, &mut bit_cnt, &mut cur_sub, &mut out);
+    } else {
+        let mut prefix = indices[0] as u16;
+        for &k in &indices[1..] {
+            let key = 0x8000_0000u32 | ((prefix as u32) << 8) | (k as u32);
+            let mut slot = ((prefix as usize).wrapping_mul(37) ^ (k as usize)) & TABLE_MASK;
+            let mut found = None;
+            while keys[slot] != 0 {
+                if keys[slot] == key {
+                    found = Some(vals[slot]);
+                    break;
+                }
+                slot = (slot + 1) & TABLE_MASK;
+            }
+            if let Some(c) = found {
+                prefix = c;
+            } else {
+                emit_code(prefix, code_bits, &mut bit_buf, &mut bit_cnt, &mut cur_sub, &mut out);
+                if next_code < 4096 {
+                    keys[slot] = key;
+                    vals[slot] = next_code;
+                    if next_code == (1u16 << code_bits) && code_bits < 12 {
+                        code_bits += 1;
+                    }
+                    next_code += 1;
+                } else {
+                    emit_code(clear_code, code_bits, &mut bit_buf, &mut bit_cnt, &mut cur_sub, &mut out);
+                    keys.fill(0);
+                    code_bits = 9;
+                    next_code = 258;
+                }
+                prefix = k as u16;
+            }
+        }
+        emit_code(prefix, code_bits, &mut bit_buf, &mut bit_cnt, &mut cur_sub, &mut out);
+        emit_code(eoi_code, code_bits, &mut bit_buf, &mut bit_cnt, &mut cur_sub, &mut out);
+    }
+
+    if bit_cnt > 0 {
+        cur_sub.push((bit_buf & 0xFF) as u8);
+    }
+    if !cur_sub.is_empty() {
+        out.push(cur_sub.len() as u8);
+        out.extend_from_slice(&cur_sub);
+    }
+    out.push(0); // Sub-block terminator
+    out
+}
+
+pub fn encode_animated_gif(frames: &[GifFrame], delay_cs: u16) -> Vec<u8> {
+    if frames.is_empty() {
+        return Vec::new();
+    }
+    let w = frames[0].width.max(1);
+    let h = frames[0].height.max(1);
+    let mut gif = Vec::with_capacity(frames.len() * (w as usize * h as usize / 3) + 1024);
+
+    // Header & Logical Screen Descriptor
+    gif.extend_from_slice(b"GIF89a");
+    gif.extend_from_slice(&w.to_le_bytes());
+    gif.extend_from_slice(&h.to_le_bytes());
+    gif.push(0xF7); // Global Color Table flag + 8-bit resolution + 256 colors
+    gif.push(0);    // Background index 0
+    gif.push(0);    // Pixel aspect ratio
+    gif.extend_from_slice(&gif_palette_bytes());
+
+    // NETSCAPE2.0 Infinite Loop Application Extension
+    gif.extend_from_slice(&[0x21, 0xFF, 0x0B]);
+    gif.extend_from_slice(b"NETSCAPE2.0");
+    gif.extend_from_slice(&[0x03, 0x01, 0x00, 0x00, 0x00]);
+
+    for frame in frames {
+        // Graphic Control Extension
+        gif.extend_from_slice(&[0x21, 0xF9, 0x04, 0x04]);
+        gif.extend_from_slice(&delay_cs.to_le_bytes());
+        gif.extend_from_slice(&[0x00, 0x00]);
+
+        // Image Descriptor
+        gif.push(0x2C);
+        gif.extend_from_slice(&0u16.to_le_bytes());
+        gif.extend_from_slice(&0u16.to_le_bytes());
+        gif.extend_from_slice(&frame.width.to_le_bytes());
+        gif.extend_from_slice(&frame.height.to_le_bytes());
+        gif.push(0x00);
+
+        // Image Data (LZW min code size = 8)
+        gif.push(8);
+        gif.extend_from_slice(&lzw_encode_gif(&frame.indices));
+    }
+
+    gif.push(0x3B); // GIF Trailer
+    gif
+}
+
+pub fn export_animated_gif(
+    prefix: &str,
+    frames: &[GifFrame],
+    delay_cs: u16,
+) -> Result<PathBuf, String> {
+    if frames.is_empty() {
+        return Err("No frames recorded for GIF export".to_string());
+    }
+    let dir = blueprint_storage_dir("captures");
+    let safe: String = prefix
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .take(24)
+        .collect();
+    let path = dir.join(format!("{}_{}.gif", safe.trim_matches('_'), unix_stamp()));
+    let bytes = encode_animated_gif(frames, delay_cs);
+    fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RemnantAnalysis {
+    pub cluster_count: usize,
+    pub largest_mass_frac: f32,
+    pub second_mass_frac: f32,
+    pub bound_mass_frac: f32,
+    pub escaped_mass_frac: f32,
+    pub peak_ejecta_kms: f32,
+}
+
+/// Connected-component & escape-velocity remnant analyzer over condensed continuum bodies (`det_state != 2`).
+pub fn analyze_remnant_clusters(world: &ContinuumWorld) -> RemnantAnalysis {
+    let mut solid_idx = Vec::with_capacity(world.len());
+    let mut total_mass = 0.0f32;
+    for i in 0..world.len() {
+        if world.det_state[i] != 2 && world.pos[i].is_finite() {
+            solid_idx.push(i);
+            total_mass += world.mass[i];
+        }
+    }
+    let n = solid_idx.len();
+    if n == 0 || total_mass <= 0.0 {
+        return RemnantAnalysis::default();
+    }
+
+    let link_r = (1.65 * world.dx).max(0.1);
+    let link_r2 = link_r * link_r;
+    let inv_cell = 1.0 / link_r;
+    const B: usize = 65_536;
+    const BMASK: usize = B - 1;
+    let mut head = vec![-1i32; B];
+    let mut next = vec![-1i32; n];
+    let hash = |cx: i32, cy: i32| -> usize {
+        let ux = (cx as u32).wrapping_mul(0x9E37_79B1);
+        let uy = (cy as u32).wrapping_mul(0x85EB_CA77);
+        ((ux ^ uy.wrapping_add(0xC2B2_AE3D)) as usize) & BMASK
+    };
+    for (k, &i) in solid_idx.iter().enumerate() {
+        let p = world.pos[i];
+        let b = hash((p.x * inv_cell).floor() as i32, (p.y * inv_cell).floor() as i32);
+        next[k] = head[b];
+        head[b] = k as i32;
+    }
+
+    let mut parent: Vec<usize> = (0..n).collect();
+    let find = |x: usize, par: &mut [usize]| -> usize {
+        let mut r = x;
+        while par[r] != r {
+            r = par[r];
+        }
+        let mut cur = x;
+        while cur != r {
+            let nx = par[cur];
+            par[cur] = r;
+            cur = nx;
+        }
+        r
+    };
+
+    for (ka, &ia) in solid_idx.iter().enumerate() {
+        let pa = world.pos[ia];
+        let cx = (pa.x * inv_cell).floor() as i32;
+        let cy = (pa.y * inv_cell).floor() as i32;
+        for dy in -1..=1 {
+            for dx_c in -1..=1 {
+                let b = hash(cx + dx_c, cy + dy);
+                let mut cur = head[b];
+                while cur >= 0 {
+                    let kb = cur as usize;
+                    cur = next[kb];
+                    if kb <= ka {
+                        continue;
+                    }
+                    let ib = solid_idx[kb];
+                    if (pa - world.pos[ib]).length_squared() <= link_r2 {
+                        let ra = find(ka, &mut parent);
+                        let rb = find(kb, &mut parent);
+                        if ra != rb {
+                            parent[rb] = ra;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut root_id = vec![0usize; n];
+    let mut comp_mass = vec![0.0f32; n];
+    let mut comp_com = vec![Vec2::ZERO; n];
+    let mut comp_vel = vec![Vec2::ZERO; n];
+    for k in 0..n {
+        let r = find(k, &mut parent);
+        root_id[k] = r;
+        let i = solid_idx[k];
+        let m = world.mass[i];
+        comp_mass[r] += m;
+        comp_com[r] += world.pos[i] * m;
+        comp_vel[r] += world.vel[i] * m;
+    }
+
+    let mut clusters: Vec<(usize, f32)> = comp_mass
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| **m > 0.0)
+        .map(|(r, m)| (r, *m))
+        .collect();
+    clusters.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+    let prim_root = clusters[0].0;
+    let prim_mass = clusters[0].1;
+    let prim_pos = comp_com[prim_root] / prim_mass.max(1e-6);
+    let prim_vel = comp_vel[prim_root] / prim_mass.max(1e-6);
+
+    let mut escaped_mass = 0.0f32;
+    let mut peak_ejecta_v = 0.0f32;
+    for (k, &i) in solid_idx.iter().enumerate() {
+        let dv = world.vel[i] - prim_vel;
+        let dv2 = dv.length_squared();
+        if root_id[k] != prim_root {
+            peak_ejecta_v = peak_ejecta_v.max(dv2.sqrt());
+            let is_escaped = if world.self_gravity && world.grav_g > 0.0 {
+                let r = (world.pos[i] - prim_pos).length().max(world.dx);
+                let v_esc2 = 2.0 * world.grav_g * prim_mass / r;
+                dv2 >= v_esc2
+            } else {
+                true
+            };
+            if is_escaped {
+                escaped_mass += world.mass[i];
+            }
+        }
+    }
+
+    let escaped_frac = (escaped_mass / total_mass).clamp(0.0, 1.0);
+    RemnantAnalysis {
+        cluster_count: clusters.len(),
+        largest_mass_frac: (prim_mass / total_mass).clamp(0.0, 1.0),
+        second_mass_frac: (clusters.get(1).map_or(0.0, |c| c.1) / total_mass).clamp(0.0, 1.0),
+        bound_mass_frac: (1.0 - escaped_frac).clamp(0.0, 1.0),
+        escaped_mass_frac: escaped_frac,
+        peak_ejecta_kms: peak_ejecta_v * 10.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,6 +1351,123 @@ mod tests {
         assert_eq!(&png[12..16], b"IHDR");
         assert_eq!(&png[png.len() - 8..png.len() - 4], b"IEND");
         assert!(png.len() > 16 * 12 * 3);
+    }
+
+    #[test]
+    fn animated_gif_encoder_produces_valid_gif89a_stream() {
+        let w = 120usize;
+        let h = 90usize;
+        let mut grad = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                let n = ((x * 37 + y * 73) ^ (x * y)) & 255;
+                grad.push(Color32::from_rgb(
+                    ((x * 2) % 255) as u8,
+                    ((y * 3) % 255) as u8,
+                    n as u8,
+                ));
+            }
+        }
+        let f1 = quantize_rgba_downsampled(&vec![Color32::from_rgb(11, 14, 20); w * h], w, h, 120);
+        let f2 = quantize_rgba_downsampled(&grad, w, h, 120);
+        assert_eq!(f2.width as usize, w);
+        assert_eq!(f2.height as usize, h);
+
+        // Verify LZW compressor + sub-block stream decodes bit-for-bit across dictionary doublings
+        let lzw = lzw_encode_gif(&f2.indices);
+        let mut raw_bytes = Vec::new();
+        let mut pos = 0usize;
+        while pos < lzw.len() {
+            let sz = lzw[pos] as usize;
+            pos += 1;
+            if sz == 0 {
+                break;
+            }
+            raw_bytes.extend_from_slice(&lzw[pos..pos + sz]);
+            pos += sz;
+        }
+        let mut dict: Vec<Vec<u8>> = (0..=255u8).map(|b| vec![b]).collect();
+        dict.resize(258, Vec::new());
+        let mut bits = 9usize;
+        let mut bit_pos = 0usize;
+        let read_code = |buf: &[u8], bp: &mut usize, width: usize| -> u16 {
+            let mut val = 0u32;
+            for k in 0..width {
+                let i = *bp + k;
+                if ((buf[i >> 3] >> (i & 7)) & 1) != 0 {
+                    val |= 1u32 << k;
+                }
+            }
+            *bp += width;
+            val as u16
+        };
+        let mut decoded = Vec::with_capacity(f2.indices.len());
+        let mut prev: Option<Vec<u8>> = None;
+        while bit_pos + bits <= raw_bytes.len() * 8 {
+            let c = read_code(&raw_bytes, &mut bit_pos, bits);
+            if c == 256 {
+                dict.truncate(258);
+                bits = 9;
+                prev = None;
+                continue;
+            }
+            if c == 257 {
+                break;
+            }
+            let entry = if (c as usize) < dict.len() {
+                dict[c as usize].clone()
+            } else {
+                let mut p = prev.as_ref().expect("LZW kwkwk rule").clone();
+                p.push(p[0]);
+                p
+            };
+            decoded.extend_from_slice(&entry);
+            if let Some(mut p) = prev {
+                if dict.len() < 4096 {
+                    p.push(entry[0]);
+                    dict.push(p);
+                    if dict.len() == (1usize << bits) && bits < 12 {
+                        bits += 1;
+                    }
+                }
+            }
+            prev = Some(entry);
+        }
+        assert_eq!(decoded, f2.indices, "GIF LZW stream must roundtrip bit-for-bit");
+
+        let gif = encode_animated_gif(&[f1, f2], 6);
+        assert_eq!(&gif[0..6], b"GIF89a");
+        assert!(gif.windows(11).any(|w| w == b"NETSCAPE2.0"));
+        assert_eq!(*gif.last().unwrap(), 0x3B);
+    }
+
+    #[test]
+    fn remnant_cluster_analyzer_identifies_two_separated_bodies() {
+        let mut world = ContinuumWorld::new(0.45);
+        world.self_gravity = false;
+        let n1 = world.paint_matter_disc(
+            Vec2::new(0.0, 0.0),
+            3.0,
+            MaterialId::BasaltRock,
+            Vec2::ZERO,
+            None,
+            1,
+        );
+        let n2 = world.paint_matter_disc(
+            Vec2::new(18.0, 0.0),
+            1.6,
+            MaterialId::BasaltRock,
+            Vec2::new(0.35, 0.0),
+            None,
+            2,
+        );
+        assert!(n1 > n2 && n2 > 5);
+        let rep = analyze_remnant_clusters(&world);
+        assert_eq!(rep.cluster_count, 2);
+        assert!(rep.largest_mass_frac > 0.65 && rep.largest_mass_frac < 0.90);
+        assert!(rep.second_mass_frac > 0.10);
+        assert!((rep.bound_mass_frac + rep.escaped_mass_frac - 1.0).abs() < 1e-4);
+        assert!(rep.peak_ejecta_kms > 3.0);
     }
 
     #[test]

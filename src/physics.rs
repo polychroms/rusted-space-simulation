@@ -33,8 +33,8 @@ pub struct GpuMaterial {
 }
 
 impl GpuMaterial {
-    pub fn table() -> [GpuMaterial; 24] {
-        let mut out = [GpuMaterial::default(); 24];
+    pub fn table() -> [GpuMaterial; 32] {
+        let mut out = [GpuMaterial::default(); 32];
         for (idx, m) in MATERIALS.iter().enumerate() {
             let mat_id = MaterialId::from_index(idx);
             let jwl = mat_id.jwl_params();
@@ -951,8 +951,11 @@ impl ContinuumWorld {
                     rho_i * m_i.c0
                 };
 
-                let melt_i =
-                    ((temp_i - 300.0) / (m_i.melt_temp - 300.0).max(50.0)).clamp(0.0, 1.0);
+                let melt_i = if temp_i >= m_i.melt_temp {
+                    1.0
+                } else {
+                    ((temp_i - 300.0) / (m_i.melt_temp - 300.0).max(50.0)).clamp(0.0, 1.0)
+                };
                 let intact_i = if det_i == 2 {
                     0.0
                 } else {
@@ -1039,8 +1042,12 @@ impl ContinuumWorld {
                                 }
                             }
 
-                            let melt_j = ((temp_j - 300.0) / (m_j.melt_temp - 300.0).max(50.0))
-                                .clamp(0.0, 1.0);
+                            let melt_j = if temp_j >= m_j.melt_temp {
+                                1.0
+                            } else {
+                                ((temp_j - 300.0) / (m_j.melt_temp - 300.0).max(50.0))
+                                    .clamp(0.0, 1.0)
+                            };
                             let intact_j = if det_j == 2 {
                                 0.0
                             } else {
@@ -1642,6 +1649,19 @@ impl ContinuumWorld {
                         } else if *det_state == 2 {
                             *det_age += dt;
                         }
+                    } else if mat_ref[i] == MaterialId::ThermitePyro {
+                        if *det_state == 0 && (*temp >= 1150.0 || fo.shock_comp >= 0.045) {
+                            *det_state = 1;
+                            *det_age = 0.0;
+                        }
+                        if *det_state == 1 {
+                            let burn_dt = dt.min((8.0 - *det_age).max(0.0));
+                            *det_age += dt;
+                            plastic_heat += (m.detonation_energy / 8.0) * burn_dt;
+                            if *det_age >= 8.0 {
+                                *det_state = 3;
+                            }
+                        }
                     }
 
                     // Velocity kick + thermal update
@@ -2211,6 +2231,12 @@ impl ContinuumWorld {
             {
                 self.det_state[i] = 1;
                 self.det_timer[i] = 0.015;
+            } else if self.mat[i] == MaterialId::ThermitePyro
+                && self.det_state[i] == 0
+                && self.temp[i] >= 1150.0
+            {
+                self.det_state[i] = 1;
+                self.det_age[i] = 0.0;
             }
             hit_sum += self.pos[i] * w;
             hit_w += w;
@@ -2282,6 +2308,12 @@ impl ContinuumWorld {
             {
                 self.det_state[i] = 1;
                 self.det_timer[i] = 0.01;
+            } else if self.mat[i] == MaterialId::ThermitePyro
+                && self.det_state[i] == 0
+                && self.temp[i] >= 1150.0
+            {
+                self.det_state[i] = 1;
+                self.det_age[i] = 0.0;
             }
             hit += 1;
         }

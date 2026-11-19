@@ -2141,6 +2141,55 @@ fn crumb_pixel_tex_rgb(
             let dl = knurl + ((n0 * 8) >> 7);
             (dl + 2, dl + 1, dl - 2)
         }
+        MaterialId::Granite => {
+            // Salt-and-pepper feldspar/quartz/mica crystal flecks
+            let fleck = match sub & 7 {
+                0 => 28,
+                1 => -30,
+                _ => (n0 * 14) >> 7,
+            };
+            (fleck + 3, fleck + 1, fleck - 2)
+        }
+        MaterialId::LiquidWater => {
+            // Shimmering fluid ripple caustics
+            let wave = (((tx.wrapping_add(ty * 2)) & 3) - 2) * 7;
+            let dl = wave + ((n0 * 10) >> 7);
+            (dl - 6, dl + 4, dl + 16)
+        }
+        MaterialId::Gold | MaterialId::MagnesiumAlloy => {
+            // Fine metallic satin shimmer
+            let sheen = ((fine * 14) >> 7) + if (ty & 1) == 0 { 8 } else { -5 };
+            if mat == MaterialId::Gold {
+                (sheen + 10, sheen + 5, sheen - 8)
+            } else {
+                (sheen, sheen + 2, sheen + 4)
+            }
+        }
+        MaterialId::TungstenCarbide => {
+            // Ultra-dense sintered carbide micro-speckle
+            let grit = ((n0 * 20) >> 7) - 4;
+            (grit - 2, grit, grit + 3)
+        }
+        MaterialId::UhMwPe => {
+            // Diagonal cross-linked polymer weave
+            let diag = if ((tx + ty) & 2) == 0 { 14 } else { -12 };
+            let dl = diag + ((n0 * 6) >> 7);
+            (dl, dl + 2, dl + 5)
+        }
+        MaterialId::OctolExplosive => {
+            // High-velocity HMX/TNT melt-cast platelets
+            let crystal = if (sub & 3) == 0 { 22 } else { (n0 * 18) >> 7 };
+            (crystal + 6, crystal - 2, crystal + 3)
+        }
+        MaterialId::ThermitePyro => {
+            // Dual-phase iron oxide rust + silver aluminum powder grains
+            let speck = if (sub & 3) == 0 { 26 } else { ((n0 * 20) >> 7) - 10 };
+            if speck > 12 {
+                (speck, speck, speck + 4)
+            } else {
+                (speck + 12, speck - 4, speck - 8)
+            }
+        }
     };
 
     // Connected jagged 1-texel micro-crack bolts across damaged crumbs!

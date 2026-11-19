@@ -48,11 +48,12 @@ pub enum ScenarioPreset {
     RocheLimitRingFormation,
     BinaryPlanetInspiral,
     KineticRodBunkerBuster,
+    OceanMoonHyperImpact,
     EmptySpace,
 }
 
 impl ScenarioPreset {
-    pub const ALL: [ScenarioPreset; 16] = [
+    pub const ALL: [ScenarioPreset; 17] = [
         ScenarioPreset::HeatVsRhaArmor,
         ScenarioPreset::ApfsdsVsKontakt5Era,
         ScenarioPreset::TandemHeatVsEra,
@@ -68,6 +69,7 @@ impl ScenarioPreset {
         ScenarioPreset::RocheLimitRingFormation,
         ScenarioPreset::BinaryPlanetInspiral,
         ScenarioPreset::KineticRodBunkerBuster,
+        ScenarioPreset::OceanMoonHyperImpact,
         ScenarioPreset::EmptySpace,
     ];
 
@@ -87,7 +89,8 @@ impl ScenarioPreset {
             | Self::IcyCometCollision
             | Self::HypervelocityWhipple
             | Self::RocheLimitRingFormation
-            | Self::BinaryPlanetInspiral => ScenarioCategory::PlanetaryOrbital,
+            | Self::BinaryPlanetInspiral
+            | Self::OceanMoonHyperImpact => ScenarioCategory::PlanetaryOrbital,
             Self::EmptySpace => ScenarioCategory::All,
         }
     }
@@ -109,6 +112,7 @@ impl ScenarioPreset {
             ScenarioPreset::RocheLimitRingFormation => "14. Tidal Roche-Limit Ring Disruption (Orbital)",
             ScenarioPreset::BinaryPlanetInspiral => "15. Binary Proto-Planet Inspiral Merger",
             ScenarioPreset::KineticRodBunkerBuster => "16. Tungsten Bunker-Buster vs Reinforced Vault",
+            ScenarioPreset::OceanMoonHyperImpact => "17. Europa Ocean-Moon Hyper-Impact (9.2 km/s)",
             ScenarioPreset::EmptySpace => "13. Empty Continuum Space",
         }
     }
@@ -159,6 +163,9 @@ impl ScenarioPreset {
             }
             ScenarioPreset::KineticRodBunkerBuster => {
                 "Heavy 2.4 km/s Tungsten penetrator rod dives through multi-story steel-rebar Concrete vault roof slabs and spall liners to breach a buried Comp-B munitions chamber."
+            }
+            ScenarioPreset::OceanMoonHyperImpact => {
+                "An ice-shelled Europa-like ocean moon (Fe-Ni core + Granite mantle + deep Liquid Water subsurface ocean + cryogenic Water Ice crust) under self-gravity is punched open by a hypervelocity 9.2 km/s metallic impactor, venting massive hydrodynamic ocean plumes!"
             }
             ScenarioPreset::EmptySpace => {
                 "Empty borderless continuum space. Design custom warheads & targets in Targets Builder & Projectiles Builder, place & aim them in STAGING, or pick a ballistic/astrophysics preset above."
@@ -1195,6 +1202,52 @@ pub fn preset_to_scene(preset: ScenarioPreset) -> SceneSpec {
             scene.projectiles.push(rod);
         }
 
+        ScenarioPreset::OceanMoonHyperImpact => {
+            scene.self_gravity = true;
+            scene.grav_g = 7.5e-5;
+            scene.targets.push(TargetSpec {
+                name: "Ocean-Moon Target".to_string(),
+                pos: Vec2::new(6.0, 0.0),
+                angle_deg: 0.0,
+                vel: Vec2::ZERO,
+                temp_k: 293.0,
+                kind: TargetKind::LayeredPlanet {
+                    shells: vec![
+                        PlanetShell {
+                            thickness: 6.5,
+                            mat: MaterialId::PlanetaryIron,
+                            temp_k: 1050.0,
+                        },
+                        PlanetShell {
+                            thickness: 7.0,
+                            mat: MaterialId::Granite,
+                            temp_k: 450.0,
+                        },
+                        PlanetShell {
+                            thickness: 5.5,
+                            mat: MaterialId::LiquidWater,
+                            temp_k: 280.0,
+                        },
+                        PlanetShell {
+                            thickness: 2.2,
+                            mat: MaterialId::WaterIce,
+                            temp_k: 145.0,
+                        },
+                    ],
+                },
+            });
+            let mut imp = ProjectileSpec::default_with_shape(
+                ProjectileShape::Sphere,
+                Vec2::new(-22.5, 5.0),
+                MaterialId::TungstenCarbide,
+            );
+            imp.name = "9.2 km/s Hyper-Impactor".to_string();
+            imp.radius_cm = 4.2;
+            imp.temp_k = 310.0;
+            imp.set_vel_cm_per_us(Vec2::new(0.91, -0.14));
+            scene.projectiles.push(imp);
+        }
+
         ScenarioPreset::EmptySpace => {}
     }
 
@@ -2076,5 +2129,89 @@ mod tests {
             }
             assert!(w.pos.iter().all(|p| p.is_finite()));
         }
+    }
+
+    #[test]
+    fn thirty_two_materials_thermite_octol_gpu_parity_and_ocean_moon() {
+        // 1. All 32 materials roundtrip cleanly by code and index
+        assert_eq!(MaterialId::ALL.len(), 32);
+        for (idx, m) in crate::materials::MATERIALS.iter().enumerate() {
+            let id = MaterialId::from_index(idx);
+            assert_eq!(id as usize, idx);
+            assert_eq!(MaterialId::from_code(m.code), Some(id));
+        }
+
+        // 2. Condensed-phase Thermite exothermic burn CPU vs Vulkan GPU parity
+        let make_thermite = || {
+            let mut w = ContinuumWorld::new(0.40);
+            w.paint_matter_disc(
+                Vec2::ZERO,
+                1.8,
+                MaterialId::ThermitePyro,
+                Vec2::ZERO,
+                Some(1220.0), // ignited above 1150 K threshold
+                1,
+            );
+            w
+        };
+        let mut w_cpu = make_thermite();
+        let mut w_gpu = make_thermite();
+        for _ in 0..64 {
+            w_cpu.step(0.12);
+        }
+        let mut vk_opt = crate::vulkan_gpu::VulkanPhysicsEngine::new().ok();
+        if let Some(vk) = &mut vk_opt {
+            vk.step_batch(&mut w_gpu, 64, 0.12);
+        } else {
+            for _ in 0..64 {
+                w_gpu.step(0.12);
+            }
+        }
+        let cpu_peak_t: f32 = w_cpu.temp.iter().sum::<f32>() / w_cpu.len() as f32;
+        let gpu_peak_t: f32 = w_gpu.temp.iter().sum::<f32>() / w_gpu.len() as f32;
+        assert!(
+            cpu_peak_t > 2400.0 && gpu_peak_t > 2400.0,
+            "Active Thermite burn must exceed 2400 K (cpu={cpu_peak_t:.0}, gpu={gpu_peak_t:.0})"
+        );
+        assert!(
+            (cpu_peak_t - gpu_peak_t).abs() < 35.0,
+            "CPU/GPU peak Thermite parity drifted (cpu={cpu_peak_t:.1}, gpu={gpu_peak_t:.1})"
+        );
+
+        for _ in 0..16 {
+            w_cpu.step(0.12);
+        }
+        if let Some(vk) = &mut vk_opt {
+            vk.step_batch(&mut w_gpu, 16, 0.12);
+        } else {
+            for _ in 0..16 {
+                w_gpu.step(0.12);
+            }
+        }
+        let cpu_avg_t: f32 = w_cpu.temp.iter().sum::<f32>() / w_cpu.len() as f32;
+        let gpu_avg_t: f32 = w_gpu.temp.iter().sum::<f32>() / w_gpu.len() as f32;
+        assert!(
+            cpu_avg_t > 1900.0 && gpu_avg_t > 1900.0,
+            "Completed Thermite slag must stay above 1810 K melt point (cpu={cpu_avg_t:.0}, gpu={gpu_avg_t:.0})"
+        );
+        assert!(
+            w_cpu.detonated_count == 0 && w_gpu.detonated_count == 0,
+            "Thermite must remain condensed phase (det_state != 2)"
+        );
+        assert!(
+            (cpu_avg_t - gpu_avg_t).abs() < 35.0,
+            "CPU/GPU Thermite parity drifted (cpu={cpu_avg_t:.1}, gpu={gpu_avg_t:.1})"
+        );
+
+        // 3. Europa Ocean-Moon Hyper-Impact builds with Granite/LiquidWater/WaterIce/WC and integrates cleanly
+        let mut ocean = build_scenario(ScenarioPreset::OceanMoonHyperImpact, 0.55);
+        assert!(ocean.mat.contains(&MaterialId::Granite));
+        assert!(ocean.mat.contains(&MaterialId::LiquidWater));
+        assert!(ocean.mat.contains(&MaterialId::TungstenCarbide));
+        for _ in 0..20 {
+            let dt = ocean.compute_cfl_dt();
+            ocean.step(dt);
+        }
+        assert!(ocean.pos.iter().all(|p| p.is_finite()));
     }
 }

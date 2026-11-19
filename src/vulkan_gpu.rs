@@ -190,7 +190,7 @@ impl VulkanPhysicsEngine {
             let (materials_buf, _) = Self::alloc_buffer(
                 &device,
                 &mem_props,
-                (24 * size_of::<GpuMaterial>()) as vk::DeviceSize,
+                (32 * size_of::<GpuMaterial>()) as vk::DeviceSize,
                 vk::BufferUsageFlags::STORAGE_BUFFER,
                 MemKind::HostCoherentUpload,
             )?;
@@ -227,7 +227,7 @@ impl VulkanPhysicsEngine {
             ptr::copy_nonoverlapping(
                 mat_table.as_ptr() as *const u8,
                 materials_buf.mapped,
-                size_of::<[GpuMaterial; 24]>(),
+                size_of::<[GpuMaterial; 32]>(),
             );
 
             let bindings: [vk::DescriptorSetLayoutBinding<'_>; 6] = std::array::from_fn(|b| {

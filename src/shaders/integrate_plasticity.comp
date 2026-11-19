@@ -35,7 +35,7 @@ layout(std430, set = 0, binding = 0) buffer ParticleBuf {
 };
 
 layout(std430, set = 0, binding = 1) readonly buffer MaterialBuf {
-    Material materials[24];
+    Material materials[32];
 };
 
 layout(std430, set = 0, binding = 2) readonly buffer ScratchBuf {
@@ -63,7 +63,7 @@ void main() {
     Particle p = particles[i];
     ForceOut fo = scratch[i];
 
-    uint mat_id = min(p.meta.x, 23u);
+    uint mat_id = min(p.meta.x, 31u);
     Material m = materials[mat_id];
 
     vec2 acc = fo.acc_xsph.xy;
@@ -234,6 +234,20 @@ void main() {
             }
         } else if (det_state == 2u) {
             det_age += dt;
+        }
+    } else if (mat_id == 31u) {
+        // Condensed-phase pyrotechnic Thermite burn (Fe2O3 + Al): sustains molten ~3100 K iron slag without JWL gas expansion
+        if (det_state == 0u && (temp >= 1150.0 || shock_comp >= 0.045)) {
+            det_state = 1u;
+            det_age = 0.0;
+        }
+        if (det_state == 1u) {
+            float burn_dt = min(dt, max(8.0 - det_age, 0.0));
+            det_age += dt;
+            plastic_heat += (m.energetic.y / 8.0) * burn_dt;
+            if (det_age >= 8.0) {
+                det_state = 3u;
+            }
         }
     }
 

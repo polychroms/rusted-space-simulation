@@ -35,7 +35,7 @@ layout(std430, set = 0, binding = 0) readonly buffer ParticleBuf {
 };
 
 layout(std430, set = 0, binding = 1) readonly buffer MaterialBuf {
-    Material materials[24];
+    Material materials[32];
 };
 
 layout(std430, set = 0, binding = 2) writeonly buffer ScratchBuf {
@@ -85,14 +85,16 @@ void main() {
     float press_i = pi_p.stress.w;
     float dmg_i = clamp(pi_p.mech.y, 0.0, 1.0);
     float mass_i = pi_p.mech.w;
-    uint mat_i = min(pi_p.meta.x, 23u);
+    uint mat_i = min(pi_p.meta.x, 31u);
     uint body_i = pi_p.meta.y;
     uint det_i = pi_p.meta.z;
 
     Material m_i = materials[mat_i];
     float ci = m_i.eos.y;
     float z_i = (det_i == 2u) ? (rho_i * 0.22) : (rho_i * ci);
-    float melt_i = clamp((temp_i - 300.0) / max(m_i.fracture.z - 300.0, 50.0), 0.0, 1.0);
+    float melt_i = (temp_i >= m_i.fracture.z)
+        ? 1.0
+        : clamp((temp_i - 300.0) / max(m_i.fracture.z - 300.0, 50.0), 0.0, 1.0);
     float intact_i = (det_i == 2u) ? 0.0 : (1.0 - dmg_i) * (1.0 - melt_i * sqrt(melt_i));
     vec3 s_i = s_i_raw * intact_i;
     float rho_i2 = max(rho_i * rho_i, 1e-6);
@@ -171,7 +173,7 @@ void main() {
                 float press_j = stress_j.w;
                 float dmg_j = clamp(mech_j.y, 0.0, 1.0);
                 float mj = mech_j.w;
-                uint mat_j = min(meta_j.x, 23u);
+                uint mat_j = min(meta_j.x, 31u);
                 uint body_j = meta_j.y;
                 uint det_j = meta_j.z;
                 Material m_j = materials[mat_j];
@@ -189,7 +191,9 @@ void main() {
                     }
                 }
 
-                float melt_j = clamp((temp_j - 300.0) / max(m_j.fracture.z - 300.0, 50.0), 0.0, 1.0);
+                float melt_j = (temp_j >= m_j.fracture.z)
+                    ? 1.0
+                    : clamp((temp_j - 300.0) / max(m_j.fracture.z - 300.0, 50.0), 0.0, 1.0);
                 float intact_j = (det_j == 2u) ? 0.0 : (1.0 - dmg_j) * (1.0 - melt_j * sqrt(melt_j));
                 float c_coh = (body_i == body_j && det_i != 2u && det_j != 2u) ? (intact_i * intact_j) : 0.0;
 
