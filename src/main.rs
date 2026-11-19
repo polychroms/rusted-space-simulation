@@ -6,13 +6,14 @@ mod physics;
 mod render;
 mod scene;
 mod scenarios;
+mod ui_theme;
 mod vulkan_gpu;
 
 use std::time::Instant;
 
 use eframe::egui::{
-    self, Align2, Color32, ColorImage, CornerRadius, FontId, Key, PointerButton, Pos2, Rect, Sense,
-    Stroke, TextureHandle, TextureOptions, Vec2 as EguiVec2,
+    self, Align2, Color32, ColorImage, CornerRadius, FontId, Frame, Key, Margin, PointerButton,
+    Pos2, Rect, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2 as EguiVec2,
 };
 use glam::Vec2;
 
@@ -32,6 +33,12 @@ use crate::scene::{
     SceneSpec, TargetKind, TargetSpec,
 };
 use crate::scenarios::{preset_to_scene, ProjectileShape, ScenarioCategory, ScenarioPreset};
+use crate::ui_theme::{
+    bg_glass, configure_modern_theme, draw_glass_panel, keycap_badge, pill_badge, studio_card,
+    ACCENT_AMBER, ACCENT_CYAN, ACCENT_EMERALD, ACCENT_ROSE, ACCENT_SKY_DIM, ACCENT_VIOLET,
+    BG_CANVAS, BG_CARD, BG_PANEL, BORDER_GLASS, BORDER_HAIRLINE, TEXT_MUTED, TEXT_PRIMARY,
+    TEXT_SECONDARY,
+};
 use crate::vulkan_gpu::VulkanPhysicsEngine;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,8 +83,8 @@ impl ActiveTool {
     fn short_label(self) -> &'static str {
         match self {
             Self::Interact => "⌖ Interact (Q)",
-            Self::BrushMatter => "🖌 Brush (B)",
-            Self::EraseMatter => "🧹 Erase (E)",
+            Self::BrushMatter => "✏ Brush (B)",
+            Self::EraseMatter => "✖ Erase (E)",
             Self::ThermalLaser => "🔥 Laser (L)",
             Self::GravityVortex => "🌀 Gravity (G)",
             Self::ShockBlast => "💥 Blast (X)",
@@ -135,13 +142,13 @@ impl TargetBuildShape {
     fn short_label(self) -> &'static str {
         match self {
             TargetBuildShape::Line => "📏 Line",
-            TargetBuildShape::Rectangle => "▭ Rect",
-            TargetBuildShape::Ellipse => "⬭ Ellipse",
-            TargetBuildShape::Circle => "● Circle",
-            TargetBuildShape::HollowRing => "◯ Ring",
+            TargetBuildShape::Rectangle => "■ Rect",
+            TargetBuildShape::Ellipse => "▫ Ellipse",
+            TargetBuildShape::Circle => "⚪ Circle",
+            TargetBuildShape::HollowRing => "⭕ Ring",
             TargetBuildShape::TriangleWedge => "▶ Wedge",
             TargetBuildShape::CompositePlate => "☰ Layers",
-            TargetBuildShape::LayeredPlanet => "🪐 Planet",
+            TargetBuildShape::LayeredPlanet => "🌍 Planet",
         }
     }
 
@@ -1351,77 +1358,115 @@ impl eframe::App for RustedSpaceSimApp {
         }
         self.update_camera_tracking(wall_dt.min(0.1));
 
-        // --- TOP COMMAND & TABS BAR ---
+        // --- TOP STUDIO COMMAND BAR ---
         egui::TopBottomPanel::top("top_bar")
-            .exact_height(46.0)
+            .frame(
+                Frame::new()
+                    .fill(BG_PANEL)
+                    .stroke(Stroke::new(1.0_f32, BORDER_HAIRLINE))
+                    .inner_margin(Margin::symmetric(12, 6)),
+            )
+            .exact_height(48.0)
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
+                    // Brand badge
                     ui.label(
-                        egui::RichText::new("RUSTED SPACE SIMULATION")
+                        egui::RichText::new("RSSIM")
                             .strong()
-                            .size(14.5)
-                            .color(Color32::from_rgb(108, 212, 255)),
+                            .size(15.0)
+                            .color(ACCENT_CYAN),
                     );
+                    pill_badge(
+                        ui,
+                        "v0.1.0",
+                        ACCENT_CYAN,
+                        Color32::from_rgb(16, 36, 54),
+                    );
+                    ui.add_space(4.0);
+
+                    // Segmented 3-Mode Workspace Rail
+                    Frame::new()
+                        .fill(Color32::from_rgb(9, 13, 20))
+                        .stroke(Stroke::new(1.0_f32, BORDER_HAIRLINE))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(Margin::symmetric(4, 2))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = 3.0;
+                            for (tab, lbl, acc) in [
+                                (WorkspaceTab::Targets, "🎯 Targets", ACCENT_CYAN),
+                                (WorkspaceTab::Projectiles, "🚀 Projectiles", ACCENT_AMBER),
+                                (WorkspaceTab::Simulation, "⚡ Simulation", ACCENT_EMERALD),
+                            ] {
+                                let active = self.tab == tab;
+                                let btn = egui::Button::new(
+                                    egui::RichText::new(lbl).strong().size(11.5).color(if active {
+                                        Color32::WHITE
+                                    } else {
+                                        TEXT_SECONDARY
+                                    }),
+                                )
+                                .fill(if active {
+                                    Color32::from_rgb(24, 42, 66)
+                                } else {
+                                    Color32::TRANSPARENT
+                                })
+                                .stroke(if active {
+                                    Stroke::new(1.0_f32, acc)
+                                } else {
+                                    Stroke::NONE
+                                })
+                                .corner_radius(CornerRadius::same(6));
+                                if ui.add(btn).clicked() {
+                                    self.tab = tab;
+                                }
+                            }
+                        });
+
                     ui.separator();
 
-                    // Separate Workspace Tabs
-                    if ui
-                        .selectable_label(
-                            self.tab == WorkspaceTab::Targets,
-                            egui::RichText::new("🎯 Targets Builder").strong(),
-                        )
-                        .clicked()
-                    {
-                        self.tab = WorkspaceTab::Targets;
-                    }
-                    if ui
-                        .selectable_label(
-                            self.tab == WorkspaceTab::Projectiles,
-                            egui::RichText::new("🚀 Projectiles Builder").strong(),
-                        )
-                        .clicked()
-                    {
-                        self.tab = WorkspaceTab::Projectiles;
-                    }
-                    if ui
-                        .selectable_label(
-                            self.tab == WorkspaceTab::Simulation,
-                            egui::RichText::new("⚡ Simulation").strong(),
-                        )
-                        .clicked()
-                    {
-                        self.tab = WorkspaceTab::Simulation;
-                    }
-
-                    ui.separator();
-
+                    // Primary Simulation Transport Controls
                     match self.phase {
                         SimPhase::Staging => {
                             let start_btn = egui::Button::new(
-                                egui::RichText::new("▶ Start Simulation")
+                                egui::RichText::new("▶ Launch")
                                     .strong()
-                                    .color(Color32::from_rgb(20, 28, 22)),
+                                    .size(12.0)
+                                    .color(Color32::from_rgb(10, 22, 16)),
                             )
-                            .fill(Color32::from_rgb(95, 225, 145));
+                            .fill(ACCENT_EMERALD)
+                            .corner_radius(CornerRadius::same(7));
                             if ui
                                 .add_enabled(self.world.len() > 0, start_btn)
-                                .on_hover_text("Start physics simulation (Key: Space)")
+                                .on_hover_text("Start continuum physics simulation (Space)")
                                 .clicked()
                             {
                                 self.start_simulation();
                             }
                         }
                         SimPhase::Running => {
-                            let play_label = if self.paused { "▶ Resume" } else { "⏸ Pause" };
+                            let (play_label, play_bg, play_fg) = if self.paused {
+                                ("▶ Resume", ACCENT_EMERALD, Color32::from_rgb(10, 22, 16))
+                            } else {
+                                ("⏸ Pause", ACCENT_AMBER, Color32::from_rgb(22, 16, 8))
+                            };
                             if ui
-                                .button(egui::RichText::new(play_label).strong())
-                                .on_hover_text("Spacebar")
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(play_label)
+                                            .strong()
+                                            .size(12.0)
+                                            .color(play_fg),
+                                    )
+                                    .fill(play_bg)
+                                    .corner_radius(CornerRadius::same(7)),
+                                )
+                                .on_hover_text("Pause / Resume simulation (Space)")
                                 .clicked()
                             {
                                 self.paused = !self.paused;
                             }
                             if ui
-                                .button("⏭ Substep")
+                                .button("⏭ Step")
                                 .on_hover_text("Advance 1 CFL shock substep (Key: S)")
                                 .clicked()
                             {
@@ -1430,8 +1475,8 @@ impl eframe::App for RustedSpaceSimApp {
                                 self.paused = true;
                             }
                             if ui
-                                .button("↺ Edit Scene")
-                                .on_hover_text("Reset back to editable scene setup (Key: R)")
+                                .button("↺ Edit")
+                                .on_hover_text("Reset back to editable staging scene (Key: R)")
                                 .clicked()
                             {
                                 self.reset_to_staging();
@@ -1441,14 +1486,14 @@ impl eframe::App for RustedSpaceSimApp {
 
                     if self.phase == SimPhase::Staging || self.is_in_blueprint_cad() {
                         if ui
-                            .add_enabled(self.can_undo_active(), egui::Button::new("↶ Undo"))
+                            .add_enabled(self.can_undo_active(), egui::Button::new("↩"))
                             .on_hover_text("Undo last edit (Ctrl+Z)")
                             .clicked()
                         {
                             self.undo_active();
                         }
                         if ui
-                            .add_enabled(self.can_redo_active(), egui::Button::new("↷ Redo"))
+                            .add_enabled(self.can_redo_active(), egui::Button::new("↪"))
                             .on_hover_text("Redo edit (Ctrl+Y / Ctrl+Shift+Z)")
                             .clicked()
                         {
@@ -1457,13 +1502,12 @@ impl eframe::App for RustedSpaceSimApp {
                     }
 
                     if ui
-                        .button("⌫ Clear")
+                        .button("🗑 Clear")
                         .on_hover_text("Clear scene to empty space (Key: C)")
                         .clicked()
                     {
                         self.clear_scene();
                     }
-
                     if ui
                         .button("⌖ Fit")
                         .on_hover_text("Auto-frame camera on active bodies (Key: F)")
@@ -1488,15 +1532,22 @@ impl eframe::App for RustedSpaceSimApp {
 
                     ui.separator();
                     if ui
-                        .button("📂 Scenarios")
-                        .on_hover_text("Open Categorized Scenario & Astrophysics Browser")
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("📂 Scenarios").strong().color(ACCENT_CYAN),
+                            )
+                            .fill(Color32::from_rgb(18, 32, 48))
+                            .stroke(Stroke::new(1.0_f32, BORDER_GLASS)),
+                        )
+                        .on_hover_text("Open Categorized Scenario & Astrophysics Library")
                         .clicked()
                     {
                         self.show_scenario_browser = !self.show_scenario_browser;
                     }
                     let mut chosen_preset = self.preset;
                     egui::ComboBox::from_id_salt("scenario_combo")
-                        .width(235.0)
+                        .width(165.0)
+                        .truncate()
                         .selected_text(chosen_preset.title())
                         .show_ui(ui, |ui| {
                             for p in ScenarioPreset::ALL {
@@ -1506,62 +1557,57 @@ impl eframe::App for RustedSpaceSimApp {
                     if chosen_preset != self.preset {
                         self.load_preset(chosen_preset);
                     }
-                    if ui
-                        .button("❓ Help")
-                        .on_hover_text("Controls & Continuum Reference (F1 / ?)")
-                        .clicked()
-                    {
-                        self.show_help_modal = !self.show_help_modal;
-                    }
-
-                    ui.separator();
-                    for res in [
-                        SimResolution::Fast,
-                        SimResolution::Balanced,
-                        SimResolution::HighDetail,
-                        SimResolution::ExtremeGpu,
-                    ] {
-                        if ui
-                            .selectable_label(self.resolution == res, res.label())
-                            .clicked()
-                            && self.resolution != res
-                        {
-                            self.resolution = res;
-                            if self.phase == SimPhase::Staging {
-                                self.rebuild_staging_world();
-                            } else {
-                                self.reset_to_staging();
-                            }
-                        }
-                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let status_tag = if self.phase == SimPhase::Staging {
-                            "STAGING"
-                        } else if self.paused {
-                            "PAUSED"
+                        if ui
+                            .button("?")
+                            .on_hover_text("Controls & Continuum Solver Reference (F1)")
+                            .clicked()
+                        {
+                            self.show_help_modal = !self.show_help_modal;
+                        }
+                        if self.use_vulkan_gpu && self.vulkan_engine.is_some() {
+                            pill_badge(
+                                ui,
+                                "⚡ VK-GPU",
+                                ACCENT_EMERALD,
+                                Color32::from_rgb(14, 38, 30),
+                            );
                         } else {
-                            "RUNNING"
-                        };
-                        let backend_tag = if self.use_vulkan_gpu && self.vulkan_engine.is_some() {
-                            "VK-GPU"
-                        } else {
-                            "CPU"
-                        };
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "[{}|{}] {:.0} FPS | {:.2}ms | t={:.1}µs | {} pts",
-                                status_tag,
-                                backend_tag,
-                                self.fps_smooth,
-                                self.physics_ms,
-                                self.world.time_us,
-                                self.world.len(),
-                            ))
-                            .monospace()
-                            .size(11.0)
-                            .color(Color32::from_rgb(185, 200, 220)),
-                        );
+                            pill_badge(
+                                ui,
+                                "CPU",
+                                ACCENT_AMBER,
+                                Color32::from_rgb(42, 32, 14),
+                            );
+                        }
+                        Frame::new()
+                            .fill(Color32::from_rgb(9, 13, 20))
+                            .stroke(Stroke::new(1.0_f32, BORDER_HAIRLINE))
+                            .corner_radius(CornerRadius::same(7))
+                            .inner_margin(Margin::symmetric(4, 2))
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                for res in [
+                                    SimResolution::Fast,
+                                    SimResolution::Balanced,
+                                    SimResolution::HighDetail,
+                                    SimResolution::ExtremeGpu,
+                                ] {
+                                    if ui
+                                        .selectable_label(self.resolution == res, res.label())
+                                        .clicked()
+                                        && self.resolution != res
+                                    {
+                                        self.resolution = res;
+                                        if self.phase == SimPhase::Staging {
+                                            self.rebuild_staging_world();
+                                        } else {
+                                            self.reset_to_staging();
+                                        }
+                                    }
+                                }
+                            });
                     });
                 });
             });
@@ -1569,12 +1615,18 @@ impl eframe::App for RustedSpaceSimApp {
         // --- LEFT TABBED WORKBENCH PANEL ---
         let pre_ui_snap = (self.phase == SimPhase::Staging).then(|| self.snapshot());
         egui::SidePanel::left("left_controls")
+            .frame(
+                Frame::new()
+                    .fill(BG_PANEL)
+                    .stroke(Stroke::new(1.0_f32, BORDER_HAIRLINE))
+                    .inner_margin(Margin::symmetric(10, 8)),
+            )
             .resizable(true)
-            .default_width(345.0)
-            .min_width(305.0)
+            .default_width(358.0)
+            .min_width(316.0)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add_space(4.0);
+                    ui.add_space(2.0);
                     match self.tab {
                         WorkspaceTab::Targets => self.draw_targets_tab(ui),
                         WorkspaceTab::Projectiles => self.draw_projectiles_tab(ui),
@@ -1598,52 +1650,58 @@ impl eframe::App for RustedSpaceSimApp {
 
         // --- RICH STUDIO BOTTOM STATUS STRIP ---
         egui::TopBottomPanel::bottom("studio_status_strip")
-            .exact_height(22.0)
+            .frame(
+                Frame::new()
+                    .fill(Color32::from_rgb(10, 14, 22))
+                    .stroke(Stroke::new(1.0_f32, BORDER_HAIRLINE))
+                    .inner_margin(Margin::symmetric(12, 3)),
+            )
+            .exact_height(26.0)
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    let (phase_txt, phase_col) = if self.phase == SimPhase::Staging {
-                        ("STAGING", Color32::from_rgb(135, 230, 175))
+                    let (phase_txt, phase_fg, phase_bg) = if self.phase == SimPhase::Staging {
+                        ("• STAGING", ACCENT_EMERALD, Color32::from_rgb(14, 36, 28))
                     } else if self.paused {
-                        ("PAUSED", Color32::from_rgb(255, 205, 110))
+                        ("⏸ PAUSED", ACCENT_AMBER, Color32::from_rgb(40, 30, 14))
                     } else {
-                        ("RUNNING", Color32::from_rgb(110, 215, 255))
+                        ("▶ RUNNING", ACCENT_CYAN, Color32::from_rgb(14, 34, 52))
                     };
-                    ui.label(
-                        egui::RichText::new(phase_txt)
-                            .strong()
-                            .monospace()
-                            .size(10.5)
-                            .color(phase_col),
+                    pill_badge(ui, phase_txt, phase_fg, phase_bg);
+                    pill_badge(
+                        ui,
+                        self.active_tool.short_label(),
+                        TEXT_PRIMARY,
+                        BG_CARD,
                     );
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(format!("Tool: {}", self.active_tool.short_label()))
-                            .monospace()
-                            .size(10.5)
-                            .color(Color32::from_rgb(200, 215, 230)),
-                    );
-                    ui.separator();
+                    if self.gif_recording {
+                        pill_badge(
+                            ui,
+                            &format!("• REC GIF {}f", self.gif_frames.len()),
+                            ACCENT_ROSE,
+                            Color32::from_rgb(46, 16, 20),
+                        );
+                    }
                     let cursor_txt = if let Some(wp) = self.hover_world_pos {
-                        format!("Pos: ({:+.1}, {:+.1}) cm", wp.x, wp.y)
+                        format!("Cursor ({:+.1}, {:+.1}) cm", wp.x, wp.y)
                     } else {
-                        "Pos: (--, --) cm".to_string()
+                        "Cursor (--, --) cm".to_string()
                     };
                     ui.label(
                         egui::RichText::new(cursor_txt)
                             .monospace()
                             .size(10.5)
-                            .color(Color32::from_rgb(165, 190, 215)),
+                            .color(TEXT_SECONDARY),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let backend_tag = if self.use_vulkan_gpu && self.vulkan_engine.is_some() {
-                            "VK-GPU"
+                            "Vulkan GPU"
                         } else {
-                            "CPU"
+                            "Rayon CPU"
                         };
                         let dt_ns = self.world.last_dt * 1000.0;
                         ui.label(
                             egui::RichText::new(format!(
-                                "{} | {} pts | t={:.1}µs | dt={:.0}ns | {:.0} FPS | phys {:.1}ms | ren {:.1}ms",
+                                "{}  |  {} pts  |  t {:.1} µs  |  dt {:.0} ns  |  {:.0} FPS  |  phys {:.1} ms  |  ren {:.1} ms",
                                 backend_tag,
                                 self.world.len(),
                                 self.world.time_us,
@@ -1654,7 +1712,7 @@ impl eframe::App for RustedSpaceSimApp {
                             ))
                             .monospace()
                             .size(10.5)
-                            .color(Color32::from_rgb(175, 200, 220)),
+                            .color(TEXT_SECONDARY),
                         );
                     });
                 });
@@ -1663,7 +1721,13 @@ impl eframe::App for RustedSpaceSimApp {
         // --- BOTTOM TIMELINE SCRUBBER & REPLAY BAR (Active in Running / Paused) ---
         if self.phase == SimPhase::Running && self.timeline.keyframes.len() > 1 {
             egui::TopBottomPanel::bottom("timeline_scrubber")
-                .exact_height(34.0)
+                .frame(
+                    Frame::new()
+                        .fill(Color32::from_rgb(13, 18, 28))
+                        .stroke(Stroke::new(1.0_f32, BORDER_HAIRLINE))
+                        .inner_margin(Margin::symmetric(12, 5)),
+                )
+                .exact_height(36.0)
                 .show(ctx, |ui| {
                     ui.horizontal_centered(|ui| {
                         ui.label(
@@ -1749,7 +1813,7 @@ impl eframe::App for RustedSpaceSimApp {
 
         // --- CENTRAL CONTINUUM OR BLUEPRINT CAD VIEWPORT ---
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(Color32::from_rgb(11, 14, 20)))
+            .frame(Frame::NONE.fill(BG_CANVAS))
             .show(ctx, |ui| {
                 let sim_dx = self.resolution.dx();
                 if self.tab == WorkspaceTab::Targets
@@ -1870,8 +1934,12 @@ impl RustedSpaceSimApp {
         }
 
         // --- Parametric Target Designer ---
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("Build Shape (Canvas Drag or Add):").strong());
+        studio_card(ui, "PARAMETRIC TARGET DESIGNER", ACCENT_CYAN, |ui| {
+            ui.label(
+                egui::RichText::new("Select shape (Left-Drag canvas or click Add):")
+                    .size(11.0)
+                    .color(TEXT_SECONDARY),
+            );
             egui::Grid::new("target_shape_grid")
                 .num_columns(4)
                 .spacing([4.0, 4.0])
@@ -1964,64 +2032,64 @@ impl RustedSpaceSimApp {
 
         // --- Scene Targets List & Selected Target Editor ---
         if self.phase == SimPhase::Staging {
-            ui.group(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("Targets in Scene ({})", self.scene.targets.len()))
-                        .strong(),
-                );
-                if self.scene.targets.is_empty() {
-                    ui.label(
-                        egui::RichText::new(
-                            "No targets yet. Paint in Pixel Blueprint CAD or Left-Drag on empty canvas to draw a slab.",
-                        )
-                        .size(11.0)
-                        .color(Color32::from_rgb(145, 160, 180)),
-                    );
-                } else {
-                    for idx in 0..self.scene.targets.len() {
-                        let is_sel = self.selection == Some(SceneSelection::Target(idx));
-                        let label = format!(
-                            "{}. {}  @ ({:.1}, {:.1})",
-                            idx + 1,
-                            self.scene.targets[idx].name,
-                            self.scene.targets[idx].pos.x,
-                            self.scene.targets[idx].pos.y
+            studio_card(
+                ui,
+                &format!("TARGETS IN SCENE ({})", self.scene.targets.len()),
+                ACCENT_CYAN,
+                |ui| {
+                    if self.scene.targets.is_empty() {
+                        ui.label(
+                            egui::RichText::new(
+                                "No targets yet. Paint in Pixel Blueprint CAD or Left-Drag on canvas.",
+                            )
+                            .size(11.0)
+                            .color(TEXT_MUTED),
                         );
-                        if ui.selectable_label(is_sel, label).clicked() {
-                            self.selection = Some(SceneSelection::Target(idx));
+                    } else {
+                        for idx in 0..self.scene.targets.len() {
+                            let is_sel = self.selection == Some(SceneSelection::Target(idx));
+                            let label = format!(
+                                "{}. {}  @ ({:.1}, {:.1})",
+                                idx + 1,
+                                self.scene.targets[idx].name,
+                                self.scene.targets[idx].pos.x,
+                                self.scene.targets[idx].pos.y
+                            );
+                            if ui.selectable_label(is_sel, label).clicked() {
+                                self.selection = Some(SceneSelection::Target(idx));
+                            }
                         }
                     }
-                }
-            });
+                },
+            );
 
             if let Some(SceneSelection::Target(idx)) = self.selection {
                 if idx < self.scene.targets.len() {
-                    ui.add_space(6.0);
                     let mut changed = false;
                     let mut dup = false;
                     let mut del = false;
                     let mut edit_in_cad = None;
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("Selected Target #{}", idx + 1))
-                                    .strong()
-                                    .color(Color32::from_rgb(110, 225, 255)),
-                            );
-                            if ui.small_button("Duplicate").clicked() {
-                                dup = true;
+                    studio_card(
+                        ui,
+                        &format!("SELECTED TARGET #{}", idx + 1),
+                        ACCENT_CYAN,
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("Duplicate").clicked() {
+                                    dup = true;
+                                }
+                                if ui.small_button("Delete").clicked() {
+                                    del = true;
+                                }
+                            });
+                            if let TargetKind::Blueprint { bp } = &self.scene.targets[idx].kind {
+                                if ui.button("✏ Edit Pixels in Blueprint CAD").clicked() {
+                                    edit_in_cad = Some(bp.clone());
+                                }
                             }
-                            if ui.small_button("Delete").clicked() {
-                                del = true;
-                            }
-                        });
-                        if let TargetKind::Blueprint { bp } = &self.scene.targets[idx].kind {
-                            if ui.button("✎ Edit Pixels in Blueprint CAD").clicked() {
-                                edit_in_cad = Some(bp.clone());
-                            }
-                        }
-                        edit_target_spec(ui, ("sel_target", idx), &mut self.scene.targets[idx], &mut changed);
-                    });
+                            edit_target_spec(ui, ("sel_target", idx), &mut self.scene.targets[idx], &mut changed);
+                        },
+                    );
                     if let Some(bp) = edit_in_cad {
                         self.target_bp_editor.spawn_pos = self.scene.targets[idx].pos;
                         self.target_bp_editor.spawn_angle_deg = self.scene.targets[idx].angle_deg;
@@ -2157,8 +2225,7 @@ impl RustedSpaceSimApp {
         }
 
         // --- Parametric Projectile Designer ---
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("New Projectile Designer").strong());
+        studio_card(ui, "NEW PROJECTILE & WARHEAD DESIGNER", ACCENT_AMBER, |ui| {
             let mut dummy_changed = false;
             edit_projectile_spec(
                 ui,
@@ -2189,105 +2256,102 @@ impl RustedSpaceSimApp {
         ui.add_space(6.0);
 
         if self.phase == SimPhase::Staging {
-            ui.group(|ui| {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Projectiles in Scene ({})",
-                        self.scene.projectiles.len()
-                    ))
-                    .strong(),
-                );
-                if self.scene.projectiles.is_empty() {
-                    ui.label(
-                        egui::RichText::new(
-                            "No projectiles yet. Design a warhead in Blueprint CAD or Right-Click / Drag on canvas.",
-                        )
-                        .size(11.0)
-                        .color(Color32::from_rgb(145, 160, 180)),
-                    );
-                } else {
-                    for idx in 0..self.scene.projectiles.len() {
-                        let is_sel = self.selection == Some(SceneSelection::Projectile(idx));
-                        let p = &self.scene.projectiles[idx];
-                        let label = format!(
-                            "{}. {}  ({:.2} km/s @ {:.0}°)",
-                            idx + 1,
-                            p.name,
-                            p.speed_kms,
-                            p.angle_deg
+            studio_card(
+                ui,
+                &format!("PROJECTILES IN SCENE ({})", self.scene.projectiles.len()),
+                ACCENT_AMBER,
+                |ui| {
+                    if self.scene.projectiles.is_empty() {
+                        ui.label(
+                            egui::RichText::new(
+                                "No projectiles yet. Design a warhead in Blueprint CAD or Right-Drag on canvas.",
+                            )
+                            .size(11.0)
+                            .color(TEXT_MUTED),
                         );
-                        if ui.selectable_label(is_sel, label).clicked() {
-                            self.selection = Some(SceneSelection::Projectile(idx));
+                    } else {
+                        for idx in 0..self.scene.projectiles.len() {
+                            let is_sel = self.selection == Some(SceneSelection::Projectile(idx));
+                            let p = &self.scene.projectiles[idx];
+                            let label = format!(
+                                "{}. {}  ({:.2} km/s @ {:.0}°)",
+                                idx + 1,
+                                p.name,
+                                p.speed_kms,
+                                p.angle_deg
+                            );
+                            if ui.selectable_label(is_sel, label).clicked() {
+                                self.selection = Some(SceneSelection::Projectile(idx));
+                            }
                         }
                     }
-                }
-            });
+                },
+            );
 
             if let Some(SceneSelection::Projectile(idx)) = self.selection {
                 if idx < self.scene.projectiles.len() {
-                    ui.add_space(6.0);
                     let mut changed = false;
                     let mut dup = false;
                     let mut del = false;
                     let mut edit_in_cad = None;
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("Selected Projectile #{}", idx + 1))
-                                    .strong()
-                                    .color(Color32::from_rgb(255, 200, 95)),
-                            );
-                            if ui.small_button("Duplicate").clicked() {
-                                dup = true;
-                            }
-                            if ui.small_button("Delete").clicked() {
-                                del = true;
-                            }
-                        });
-                        if let Some(bp) = &self.scene.projectiles[idx].blueprint {
-                            if ui.button("✎ Edit Warhead Pixels in Blueprint CAD").clicked() {
-                                edit_in_cad = Some(bp.clone());
-                            }
-                        }
-                        edit_projectile_spec(
-                            ui,
-                            ("sel_proj", idx),
-                            &mut self.scene.projectiles[idx],
-                            &self.scene.targets,
-                            &mut changed,
-                        );
-                        if self.scene.self_gravity && !self.scene.targets.is_empty() {
+                    studio_card(
+                        ui,
+                        &format!("SELECTED PROJECTILE #{}", idx + 1),
+                        ACCENT_AMBER,
+                        |ui| {
                             ui.horizontal(|ui| {
-                                if ui.small_button("🪐 Orbit +").clicked() {
-                                    if let Some((os, oa)) =
-                                        self.scene.compute_orbit_velocity(idx, false, 1.0)
-                                    {
-                                        self.scene.projectiles[idx].speed_kms = os;
-                                        self.scene.projectiles[idx].angle_deg = oa;
-                                        changed = true;
-                                    }
+                                if ui.small_button("Duplicate").clicked() {
+                                    dup = true;
                                 }
-                                if ui.small_button("Orbit −").clicked() {
-                                    if let Some((os, oa)) =
-                                        self.scene.compute_orbit_velocity(idx, true, 1.0)
-                                    {
-                                        self.scene.projectiles[idx].speed_kms = os;
-                                        self.scene.projectiles[idx].angle_deg = oa;
-                                        changed = true;
-                                    }
-                                }
-                                if ui.small_button("Flyby").clicked() {
-                                    if let Some((os, oa)) =
-                                        self.scene.compute_orbit_velocity(idx, false, 0.84)
-                                    {
-                                        self.scene.projectiles[idx].speed_kms = os;
-                                        self.scene.projectiles[idx].angle_deg = oa;
-                                        changed = true;
-                                    }
+                                if ui.small_button("Delete").clicked() {
+                                    del = true;
                                 }
                             });
-                        }
-                    });
+                            if let Some(bp) = &self.scene.projectiles[idx].blueprint {
+                                if ui.button("✏ Edit Warhead Pixels in Blueprint CAD").clicked() {
+                                    edit_in_cad = Some(bp.clone());
+                                }
+                            }
+                            edit_projectile_spec(
+                                ui,
+                                ("sel_proj", idx),
+                                &mut self.scene.projectiles[idx],
+                                &self.scene.targets,
+                                &mut changed,
+                            );
+                            if self.scene.self_gravity && !self.scene.targets.is_empty() {
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("🌐 Orbit +").clicked() {
+                                        if let Some((os, oa)) =
+                                            self.scene.compute_orbit_velocity(idx, false, 1.0)
+                                        {
+                                            self.scene.projectiles[idx].speed_kms = os;
+                                            self.scene.projectiles[idx].angle_deg = oa;
+                                            changed = true;
+                                        }
+                                    }
+                                    if ui.small_button("Orbit −").clicked() {
+                                        if let Some((os, oa)) =
+                                            self.scene.compute_orbit_velocity(idx, true, 1.0)
+                                        {
+                                            self.scene.projectiles[idx].speed_kms = os;
+                                            self.scene.projectiles[idx].angle_deg = oa;
+                                            changed = true;
+                                        }
+                                    }
+                                    if ui.small_button("Flyby").clicked() {
+                                        if let Some((os, oa)) =
+                                            self.scene.compute_orbit_velocity(idx, false, 0.84)
+                                        {
+                                            self.scene.projectiles[idx].speed_kms = os;
+                                            self.scene.projectiles[idx].angle_deg = oa;
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                            }
+                        },
+                    );
                     if let Some(bp) = edit_in_cad {
                         self.proj_bp_editor.spawn_pos = self.scene.projectiles[idx].pos;
                         self.proj_bp_editor.spawn_angle_deg = self.scene.projectiles[idx].angle_deg;
@@ -2319,13 +2383,7 @@ impl RustedSpaceSimApp {
     fn draw_simulation_tab(&mut self, ui: &mut egui::Ui) {
         // --- Pre-Start Scene Staging Overview & Quick Editor ---
         if self.phase == SimPhase::Staging {
-            ui.group(|ui| {
-                ui.label(
-                    egui::RichText::new("PRE-START SCENE EDITOR")
-                        .strong()
-                        .size(12.5)
-                        .color(Color32::from_rgb(105, 225, 155)),
-                );
+            studio_card(ui, "SCENE STAGING & PERSISTENCE", ACCENT_EMERALD, |ui| {
                 let mut changed = false;
                 let mut open_target_editor = None;
                 let mut open_proj_editor = None;
@@ -2333,10 +2391,10 @@ impl RustedSpaceSimApp {
                 if self.scene.targets.is_empty() && self.scene.projectiles.is_empty() {
                     ui.label(
                         egui::RichText::new(
-                            "Scene is empty. Design warheads & targets in Projectiles Builder & Targets Builder, or pick a Ballistic / Space Scenario above!",
+                            "Space is empty. Browse Scenarios above, open Targets/Projectiles CAD, or select Brush (B).",
                         )
-                        .size(11.5)
-                        .color(Color32::from_rgb(175, 190, 210)),
+                        .size(11.0)
+                        .color(TEXT_SECONDARY),
                     );
                 } else {
                     for i in 0..self.scene.targets.len() {
@@ -2351,7 +2409,7 @@ impl RustedSpaceSimApp {
                             {
                                 self.selection = Some(SceneSelection::Target(i));
                             }
-                            if ui.small_button("✎ Edit").clicked() {
+                            if ui.small_button("✏ Edit").clicked() {
                                 open_target_editor = Some(i);
                             }
                         });
@@ -2364,7 +2422,7 @@ impl RustedSpaceSimApp {
                             changed |= ui
                                 .add(egui::DragValue::new(&mut t.pos.y).speed(0.3).suffix(" cm"))
                                 .changed();
-                            ui.label("∠:");
+                            ui.label("Deg:");
                             changed |= ui
                                 .add(egui::DragValue::new(&mut t.angle_deg).speed(1.0).suffix("°"))
                                 .changed();
@@ -2386,7 +2444,7 @@ impl RustedSpaceSimApp {
                             {
                                 self.selection = Some(SceneSelection::Projectile(i));
                             }
-                            if ui.small_button("✎ Edit").clicked() {
+                            if ui.small_button("✏ Edit").clicked() {
                                 open_proj_editor = Some(i);
                             }
                         });
@@ -2425,7 +2483,7 @@ impl RustedSpaceSimApp {
                         self.scene.projectiles[i].angle_deg = ang;
                         if self.scene.self_gravity && !self.scene.targets.is_empty() {
                             ui.horizontal(|ui| {
-                                if ui.small_button("🪐 Orbit +").clicked() {
+                                if ui.small_button("🌐 Orbit +").clicked() {
                                     if let Some((os, oa)) =
                                         self.scene.compute_orbit_velocity(i, false, 1.0)
                                     {
@@ -2492,11 +2550,12 @@ impl RustedSpaceSimApp {
                 let start_btn = egui::Button::new(
                     egui::RichText::new("▶ Start Simulation")
                         .strong()
-                        .size(14.0)
-                        .color(Color32::from_rgb(18, 26, 20)),
+                        .size(13.5)
+                        .color(Color32::from_rgb(10, 22, 16)),
                 )
-                .fill(Color32::from_rgb(95, 225, 145))
-                .min_size(EguiVec2::new(ui.available_width(), 30.0));
+                .fill(ACCENT_EMERALD)
+                .corner_radius(CornerRadius::same(7))
+                .min_size(EguiVec2::new(ui.available_width(), 32.0));
                 if ui.add_enabled(self.world.len() > 0, start_btn).clicked() {
                     self.start_simulation();
                 }
@@ -2506,8 +2565,8 @@ impl RustedSpaceSimApp {
                 ui.label(
                     egui::RichText::new("Scene Persistence (.rscene)")
                         .strong()
-                        .size(11.5)
-                        .color(Color32::from_rgb(155, 205, 240)),
+                        .size(11.0)
+                        .color(TEXT_SECONDARY),
                 );
                 ui.horizontal(|ui| {
                     ui.add(
@@ -2515,7 +2574,7 @@ impl RustedSpaceSimApp {
                             .desired_width(145.0)
                             .hint_text("Scene name..."),
                     );
-                    if ui.button("💾 Save Scene").clicked() {
+                    if ui.button("💾 Save").clicked() {
                         match save_scene_to_disk(&self.scene_save_name, &self.scene) {
                             Ok(path) => {
                                 self.saved_scenes = list_saved_scenes();
@@ -2550,292 +2609,276 @@ impl RustedSpaceSimApp {
                     }
                 }
             });
-            ui.add_space(6.0);
         }
-
-        ui.add_space(4.0);
-        ui.separator();
 
         // --- Interactive Live Physics Tools (Q/B/E/L/G/X) ---
-        ui.label(
-            egui::RichText::new("LIVE INTERACTIVE TOOLS (Q/B/E/L/G/X)")
-                .strong()
-                .size(12.0)
-                .color(Color32::from_rgb(255, 200, 115)),
-        );
-        ui.horizontal_wrapped(|ui| {
-            for tool in ActiveTool::ALL {
-                ui.selectable_value(&mut self.active_tool, tool, tool.short_label());
+        studio_card(ui, "LIVE INTERACTIVE TOOLS (Q/B/E/L/G/X)", ACCENT_AMBER, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for tool in ActiveTool::ALL {
+                    ui.selectable_value(&mut self.active_tool, tool, tool.short_label());
+                }
+            });
+            match self.active_tool {
+                ActiveTool::Interact => {
+                    ui.label(
+                        egui::RichText::new("Move/aim staging bodies or pan canvas; Right-drag slings projectile.")
+                            .size(10.5)
+                            .color(TEXT_MUTED),
+                    );
+                }
+                ActiveTool::BrushMatter => {
+                    ui.add(egui::Slider::new(&mut self.tool_radius, 0.8..=20.0).text("Brush R (cm) [ / ]"));
+                    material_combo(ui, "live_brush_mat", "Matter:", &mut self.brush_mat);
+                    ui.add(
+                        egui::Slider::new(&mut self.brush_temp_k, 100.0..=3500.0)
+                            .logarithmic(true)
+                            .text("Init Temp (K)"),
+                    );
+                }
+                ActiveTool::EraseMatter => {
+                    ui.add(egui::Slider::new(&mut self.tool_radius, 0.8..=22.0).text("Eraser R (cm) [ / ]"));
+                }
+                ActiveTool::ThermalLaser => {
+                    ui.add(egui::Slider::new(&mut self.tool_radius, 0.8..=14.0).text("Beam Waist (cm)"));
+                    ui.add(egui::Slider::new(&mut self.laser_power, 0.4..=8.0).text("Power ×"));
+                    ui.add(egui::Slider::new(&mut self.laser_angle_deg, -180.0..=180.0).text("Incidence °"));
+                }
+                ActiveTool::GravityVortex => {
+                    ui.add(egui::Slider::new(&mut self.gravity_strength, 0.04..=1.2).text("Pull G-Force"));
+                    ui.add(egui::Slider::new(&mut self.gravity_swirl, -0.6..=0.6).text("Vortex Swirl"));
+                    ui.label(
+                        egui::RichText::new("Hold Shift + LMB to Repel (White Hole).")
+                            .size(10.5)
+                            .color(ACCENT_CYAN),
+                    );
+                }
+                ActiveTool::ShockBlast => {
+                    ui.add(egui::Slider::new(&mut self.blast_radius, 1.5..=24.0).text("Blast R (cm)"));
+                    ui.add(egui::Slider::new(&mut self.blast_vel, 0.08..=1.2).text("Impulse cm/µs"));
+                }
             }
         });
-        match self.active_tool {
-            ActiveTool::Interact => {
-                ui.label(
-                    egui::RichText::new("Move/aim staging bodies or pan running canvas; Right-drag quick-fires projectile.")
-                        .size(10.5)
-                        .color(Color32::from_rgb(155, 175, 198)),
-                );
-            }
-            ActiveTool::BrushMatter => {
-                ui.add(egui::Slider::new(&mut self.tool_radius, 0.8..=20.0).text("Brush R (cm) [ / ]"));
-                material_combo(ui, "live_brush_mat", "Matter", &mut self.brush_mat);
-                ui.add(
-                    egui::Slider::new(&mut self.brush_temp_k, 100.0..=3500.0)
-                        .logarithmic(true)
-                        .text("Init Temp (K)"),
-                );
-            }
-            ActiveTool::EraseMatter => {
-                ui.add(egui::Slider::new(&mut self.tool_radius, 0.8..=22.0).text("Eraser R (cm) [ / ]"));
-            }
-            ActiveTool::ThermalLaser => {
-                ui.add(egui::Slider::new(&mut self.tool_radius, 0.8..=14.0).text("Beam Waist (cm)"));
-                ui.add(egui::Slider::new(&mut self.laser_power, 0.4..=8.0).text("Power ×"));
-                ui.add(egui::Slider::new(&mut self.laser_angle_deg, -180.0..=180.0).text("Incidence °"));
-            }
-            ActiveTool::GravityVortex => {
-                ui.add(egui::Slider::new(&mut self.gravity_strength, 0.04..=1.2).text("Pull G-Force"));
-                ui.add(egui::Slider::new(&mut self.gravity_swirl, -0.6..=0.6).text("Vortex Swirl"));
-                ui.label(
-                    egui::RichText::new("Hold Shift + LMB to Repel (White Hole).")
-                        .size(10.5)
-                        .color(Color32::from_rgb(145, 210, 240)),
-                );
-            }
-            ActiveTool::ShockBlast => {
-                ui.add(egui::Slider::new(&mut self.blast_radius, 1.5..=24.0).text("Blast R (cm)"));
-                ui.add(egui::Slider::new(&mut self.blast_vel, 0.08..=1.2).text("Impulse cm/µs"));
-            }
-        }
-
-        ui.add_space(6.0);
-        ui.separator();
 
         // --- Visualization Modes ---
-        ui.label(
-            egui::RichText::new("VISUALIZATION MODE (Keys 1–8)")
-                .strong()
-                .size(12.0)
-                .color(Color32::from_rgb(140, 185, 230)),
-        );
-        egui::Grid::new("vis_mode_grid")
-            .num_columns(2)
-            .spacing([4.0, 4.0])
-            .show(ui, |ui| {
-                for (idx, mode) in VisMode::ALL.iter().enumerate() {
-                    if ui
-                        .selectable_label(self.vis_mode == *mode, mode.label())
-                        .clicked()
-                    {
-                        self.vis_mode = *mode;
+        studio_card(ui, "VISUALIZATION CHANNELS (KEYS 1–8)", ACCENT_CYAN, |ui| {
+            egui::Grid::new("vis_mode_grid")
+                .num_columns(2)
+                .spacing([5.0, 5.0])
+                .show(ui, |ui| {
+                    for (idx, mode) in VisMode::ALL.iter().enumerate() {
+                        if ui
+                            .selectable_label(self.vis_mode == *mode, mode.label())
+                            .clicked()
+                        {
+                            self.vis_mode = *mode;
+                        }
+                        if idx % 2 == 1 {
+                            ui.end_row();
+                        }
                     }
-                    if idx % 2 == 1 {
-                        ui.end_row();
-                    }
-                }
-            });
-        draw_mode_legend(ui, self.vis_mode);
-
-        ui.add_space(6.0);
-        ui.separator();
+                });
+            ui.add_space(2.0);
+            draw_mode_legend(ui, self.vis_mode);
+        });
 
         // --- Vulkan GPU Compute & Continuum Solver ---
-        ui.label(
-            egui::RichText::new("VULKAN GPU & CONTINUUM SOLVER")
-                .strong()
-                .size(12.0)
-                .color(Color32::from_rgb(140, 185, 230)),
-        );
-        if let Some(vk) = &self.vulkan_engine {
-            ui.checkbox(
-                &mut self.use_vulkan_gpu,
-                egui::RichText::new("⚡ Vulkan GPU Compute Acceleration")
-                    .strong()
-                    .color(Color32::from_rgb(125, 235, 165)),
-            );
-            ui.label(
-                egui::RichText::new(format!(
-                    "GPU: {} ({} | {:.2} ms/frame)",
-                    vk.device_name,
-                    if vk.is_unified_mem { "UMA Zero-Copy" } else { "VRAM" },
-                    self.physics_ms
-                ))
-                .monospace()
-                .size(10.0)
-                .color(Color32::from_rgb(155, 205, 185)),
-            );
-        } else {
-            ui.colored_label(
-                Color32::from_rgb(255, 175, 95),
-                format!(
-                    "Vulkan unavailable ({}) — using Rayon CPU",
-                    self.vulkan_init_err.as_deref().unwrap_or("no device")
-                ),
-            );
-        }
-        ui.add(
-            egui::Slider::new(&mut self.time_scale, 0.05..=3.0)
-                .logarithmic(true)
-                .text("Slow-Mo / Speed"),
-        );
-        ui.add(egui::Slider::new(&mut self.substeps_per_frame, 1..=32).text("Substeps / Frame"));
-
-        let mut grav_changed = false;
-        if self.phase == SimPhase::Staging {
-            grav_changed |= ui
-                .checkbox(&mut self.scene.self_gravity, "Planetary Self-Gravity")
-                .changed();
-            if self.scene.self_gravity {
-                if self.scene.grav_g <= 0.0 {
-                    self.scene.grav_g = 7.0e-5;
-                }
-                grav_changed |= ui
-                    .add(
-                        egui::Slider::new(&mut self.scene.grav_g, 5.0e-6..=4.0e-4)
-                            .logarithmic(true)
-                            .text("Gravity G"),
-                    )
-                    .changed();
-            }
-            if grav_changed {
-                self.rebuild_staging_world();
-            }
-        } else {
-            ui.checkbox(&mut self.world.self_gravity, "Planetary Self-Gravity");
-            if self.world.self_gravity {
-                if self.world.grav_g <= 0.0 {
-                    self.world.grav_g = 7.0e-5;
-                }
-                ui.add(
-                    egui::Slider::new(&mut self.world.grav_g, 5.0e-6..=4.0e-4)
-                        .logarithmic(true)
-                        .text("Gravity G"),
+        studio_card(ui, "VULKAN GPU & CONTINUUM SOLVER", ACCENT_VIOLET, |ui| {
+            if let Some(vk) = &self.vulkan_engine {
+                ui.checkbox(
+                    &mut self.use_vulkan_gpu,
+                    egui::RichText::new("⚡ Vulkan GPU Compute Acceleration")
+                        .strong()
+                        .color(ACCENT_EMERALD),
+                );
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} ({} | {:.2} ms/frame)",
+                        vk.device_name,
+                        if vk.is_unified_mem { "UMA Zero-Copy" } else { "VRAM" },
+                        self.physics_ms
+                    ))
+                    .monospace()
+                    .size(10.0)
+                    .color(TEXT_SECONDARY),
+                );
+            } else {
+                ui.colored_label(
+                    ACCENT_AMBER,
+                    format!(
+                        "Vulkan unavailable ({}) — Rayon CPU fallback",
+                        self.vulkan_init_err.as_deref().unwrap_or("no device")
+                    ),
                 );
             }
-        }
+            ui.add(
+                egui::Slider::new(&mut self.time_scale, 0.05..=3.0)
+                    .logarithmic(true)
+                    .text("Slow-Mo / Speed"),
+            );
+            ui.add(egui::Slider::new(&mut self.substeps_per_frame, 1..=32).text("Substeps / Frame"));
 
-        ui.add(
-            egui::Slider::new(&mut self.live_fire_speed_mult, 0.2..=10.0)
-                .text("Right-Drag Fire Speed ×"),
-        );
-        ui.checkbox(&mut self.motion_trails, "High-Speed Camera Trails");
-        ui.checkbox(&mut self.show_starfield, "Deep-Space Parallax Starfield");
-        ui.checkbox(
-            &mut self.show_vel_vectors,
-            "Flow Velocity Vectors (Key: V)",
-        );
-        ui.checkbox(&mut self.show_hud_graphs, "Show Shock & Energy Graphs");
-
-        ui.horizontal(|ui| {
-            ui.label("Cam Track:");
-            for mode in CameraTrackMode::ALL {
-                ui.selectable_value(&mut self.camera_track, mode, mode.label());
+            let mut grav_changed = false;
+            if self.phase == SimPhase::Staging {
+                grav_changed |= ui
+                    .checkbox(&mut self.scene.self_gravity, "Planetary Self-Gravity")
+                    .changed();
+                if self.scene.self_gravity {
+                    if self.scene.grav_g <= 0.0 {
+                        self.scene.grav_g = 7.0e-5;
+                    }
+                    grav_changed |= ui
+                        .add(
+                            egui::Slider::new(&mut self.scene.grav_g, 5.0e-6..=4.0e-4)
+                                .logarithmic(true)
+                                .text("Gravity G"),
+                        )
+                        .changed();
+                }
+                if grav_changed {
+                    self.rebuild_staging_world();
+                }
+            } else {
+                ui.checkbox(&mut self.world.self_gravity, "Planetary Self-Gravity");
+                if self.world.self_gravity {
+                    if self.world.grav_g <= 0.0 {
+                        self.world.grav_g = 7.0e-5;
+                    }
+                    ui.add(
+                        egui::Slider::new(&mut self.world.grav_g, 5.0e-6..=4.0e-4)
+                            .logarithmic(true)
+                            .text("Gravity G"),
+                    );
+                }
             }
-        });
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.auto_slowmo, "Auto Bullet-Time");
-            ui.checkbox(&mut self.camera_shake_enabled, "Impact Shake");
-        });
 
-        ui.add_space(6.0);
-        ui.separator();
+            ui.add(
+                egui::Slider::new(&mut self.live_fire_speed_mult, 0.2..=10.0)
+                    .text("Right-Drag Fire Speed ×"),
+            );
+            egui::Grid::new("sim_view_toggles")
+                .num_columns(2)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.checkbox(&mut self.motion_trails, "Motion Trails");
+                    ui.checkbox(&mut self.show_starfield, "Parallax Stars");
+                    ui.end_row();
+                    ui.checkbox(&mut self.show_vel_vectors, "Vectors (V)");
+                    ui.checkbox(&mut self.show_hud_graphs, "HUD Graphs");
+                    ui.end_row();
+                    ui.checkbox(&mut self.auto_slowmo, "Bullet-Time");
+                    ui.checkbox(&mut self.camera_shake_enabled, "Impact Shake");
+                    ui.end_row();
+                });
 
-        // --- Laboratory Instrumentation, Gauges & Data Export ---
-        ui.label(
-            egui::RichText::new("LAB INSTRUMENTATION & EXPORTS")
-                .strong()
-                .size(12.0)
-                .color(Color32::from_rgb(140, 185, 230)),
-        );
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.caliper_mode, "📏 Caliper & RHAe (M)");
-            if self.caliper_line.is_some() && ui.small_button("Clear Ray").clicked() {
-                self.caliper_line = None;
-            }
-        });
-        ui.label(
-            egui::RichText::new("Alt + Left-Click any armor/body particle to pin a Lagrangian Witness Gauge (up to 8).")
-                .size(10.5)
-                .color(Color32::from_rgb(150, 175, 198)),
-        );
-        if !self.gauges.gauges.is_empty() {
             ui.horizontal(|ui| {
-                for ch in GaugeChannel::ALL {
-                    ui.selectable_value(&mut self.gauges.channel, ch, ch.short_label());
+                ui.label(egui::RichText::new("Cam Track:").size(11.0).color(TEXT_SECONDARY));
+                for mode in CameraTrackMode::ALL {
+                    ui.selectable_value(&mut self.camera_track, mode, mode.label());
                 }
             });
-            if ui
-                .small_button(format!(
-                    "✕ Clear {} Witness Gauge(s)",
-                    self.gauges.gauges.len()
-                ))
-                .clicked()
-            {
-                self.gauges.clear();
-            }
-        }
-        ui.horizontal(|ui| {
-            if ui.button("📊 Export CSV").clicked() {
-                self.export_csv_now();
-            }
-            if ui.button("📷 Save PNG (F12)").clicked() {
-                self.export_png_now();
-            }
         });
-        ui.horizontal(|ui| {
-            let gif_label = if self.gif_recording {
-                format!("⏹ Save GIF ({}f)", self.gif_frames.len())
-            } else {
-                "🔴 Record GIF".to_string()
-            };
-            if ui.button(gif_label).clicked() {
-                self.toggle_or_save_gif_now();
-            }
-            if ui.button("🎞 Replay GIF").clicked() {
-                self.export_replay_gif_now();
-            }
-            if ui.button("🪐 Analyze Remnants").clicked() {
-                self.remnant_report = Some(analyze_remnant_clusters(&self.world));
-            }
-        });
-        if let Some(rep) = &self.remnant_report {
-            ui.label(
-                egui::RichText::new(format!(
-                    "Clusters: {} | Largest: {:.1}% | 2nd: {:.1}%\nBound: {:.1}% | Escaped: {:.1}% | Peak Ejecta: {:.2} km/s",
-                    rep.cluster_count,
-                    rep.largest_mass_frac * 100.0,
-                    rep.second_mass_frac * 100.0,
-                    rep.bound_mass_frac * 100.0,
-                    rep.escaped_mass_frac * 100.0,
-                    rep.peak_ejecta_kms
-                ))
-                .monospace()
-                .size(10.0)
-                .color(Color32::from_rgb(155, 225, 200)),
-            );
-        }
 
-        ui.add_space(6.0);
-        ui.separator();
-        ui.label(
-            egui::RichText::new("SCENARIO NOTES")
-                .strong()
-                .size(12.0)
-                .color(Color32::from_rgb(140, 185, 230)),
-        );
-        ui.label(
-            egui::RichText::new(self.preset.description())
-                .size(11.5)
-                .color(Color32::from_rgb(190, 200, 215)),
-        );
-        ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new(
-                "Controls:\n• Drag objects or velocity arrows before Start\n• Alt+Click: Pin/Remove Witness Sensor Gauge\n• M: Ballistic Caliper & LOS RHAe | V: Flow Vectors\n• Left/Right Arrows: Scrub Replay Keyframes\n• Right-Click Drag: Add/fire projectile | F12: PNG\n• Space: Start/Pause | R: Edit Scene | C: Clear",
-            )
-            .size(11.0)
-            .color(Color32::from_rgb(140, 155, 175)),
-        );
+        // --- Laboratory Instrumentation, Gauges & Data Export ---
+        studio_card(ui, "LAB INSTRUMENTATION & CAPTURES", ACCENT_EMERALD, |ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.caliper_mode, "📏 Caliper & RHAe (M)");
+                if self.caliper_line.is_some() && ui.small_button("Clear Ray").clicked() {
+                    self.caliper_line = None;
+                }
+            });
+            ui.label(
+                egui::RichText::new("Alt+Click particles to pin up to 8 Lagrangian Witness Gauges.")
+                    .size(10.5)
+                    .color(TEXT_MUTED),
+            );
+            if !self.gauges.gauges.is_empty() {
+                ui.horizontal(|ui| {
+                    for ch in GaugeChannel::ALL {
+                        ui.selectable_value(&mut self.gauges.channel, ch, ch.short_label());
+                    }
+                });
+                if ui
+                    .small_button(format!(
+                        "✖ Clear {} Witness Gauge(s)",
+                        self.gauges.gauges.len()
+                    ))
+                    .clicked()
+                {
+                    self.gauges.clear();
+                }
+            }
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("📊 CSV").clicked() {
+                    self.export_csv_now();
+                }
+                if ui.button("📷 PNG (F12)").clicked() {
+                    self.export_png_now();
+                }
+                let gif_label = if self.gif_recording {
+                    format!("⏹ Save GIF ({}f)", self.gif_frames.len())
+                } else {
+                    "🔴 Record GIF".to_string()
+                };
+                if ui.button(gif_label).clicked() {
+                    self.toggle_or_save_gif_now();
+                }
+                if ui.button("🎞 Replay GIF").clicked() {
+                    self.export_replay_gif_now();
+                }
+                if ui.button("🌐 Remnants").clicked() {
+                    self.remnant_report = Some(analyze_remnant_clusters(&self.world));
+                }
+            });
+            if let Some(rep) = &self.remnant_report {
+                Frame::new()
+                    .fill(Color32::from_rgb(12, 18, 28))
+                    .stroke(Stroke::new(1.0_f32, BORDER_HAIRLINE))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::symmetric(8, 6))
+                    .show(ui, |ui| {
+                        egui::Grid::new("remnant_metrics_grid")
+                            .num_columns(2)
+                            .spacing([12.0, 2.0])
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("Clusters").size(10.5).color(TEXT_MUTED));
+                                ui.label(egui::RichText::new(format!("{}", rep.cluster_count)).monospace().strong().size(10.5).color(ACCENT_CYAN));
+                                ui.end_row();
+                                ui.label(egui::RichText::new("Largest / 2nd").size(10.5).color(TEXT_MUTED));
+                                ui.label(egui::RichText::new(format!("{:.1}% / {:.1}%", rep.largest_mass_frac * 100.0, rep.second_mass_frac * 100.0)).monospace().size(10.5).color(ACCENT_EMERALD));
+                                ui.end_row();
+                                ui.label(egui::RichText::new("Bound / Escaped").size(10.5).color(TEXT_MUTED));
+                                ui.label(egui::RichText::new(format!("{:.1}% / {:.1}%", rep.bound_mass_frac * 100.0, rep.escaped_mass_frac * 100.0)).monospace().size(10.5).color(TEXT_PRIMARY));
+                                ui.end_row();
+                                ui.label(egui::RichText::new("Peak Ejecta").size(10.5).color(TEXT_MUTED));
+                                ui.label(egui::RichText::new(format!("{:.2} km/s", rep.peak_ejecta_kms)).monospace().size(10.5).color(ACCENT_AMBER));
+                                ui.end_row();
+                            });
+                    });
+            }
+        });
+
+        // --- Scenario Brief ---
+        studio_card(ui, "SCENARIO BRIEF & REFERENCE", TEXT_SECONDARY, |ui| {
+            ui.label(
+                egui::RichText::new(self.preset.description())
+                    .size(11.0)
+                    .color(TEXT_SECONDARY),
+            );
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Press")
+                        .size(10.5)
+                        .color(TEXT_MUTED),
+                );
+                keycap_badge(ui, "F1");
+                ui.label(
+                    egui::RichText::new("for Hotkeys & Solver Reference")
+                        .size(10.5)
+                        .color(TEXT_MUTED),
+                );
+            });
+        });
     }
 
     fn draw_viewport(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
@@ -3381,45 +3424,114 @@ impl RustedSpaceSimApp {
         // Scale bar overlay
         draw_scale_bar(&painter, rect, self.cam.zoom);
 
-        // Staging banner or Empty space prompt
-        if self.world.len() == 0 && self.canvas_drag.is_none() {
-            let center = rect.center();
-            painter.text(
-                Pos2::new(center.x, center.y - 14.0),
-                Align2::CENTER_CENTER,
-                "Empty Borderless Continuum Space",
-                FontId::proportional(18.0),
-                Color32::from_rgba_unmultiplied(150, 175, 205, 195),
-            );
-            painter.text(
-                Pos2::new(center.x, center.y + 14.0),
-                Align2::CENTER_CENTER,
-                "Use Targets Builder & Projectiles Builder tabs (or pick a Scenario), edit positions/speeds, then click ▶ Start Simulation",
-                FontId::proportional(13.0),
-                Color32::from_rgba_unmultiplied(115, 138, 168, 180),
-            );
+        // Staging banner or Interactive Empty Space Welcome Card
+        if self.world.len() == 0
+            && self.canvas_drag.is_none()
+            && !self.show_scenario_browser
+            && !self.show_help_modal
+        {
+            egui::Area::new(egui::Id::new("empty_space_welcome_card"))
+                .order(egui::Order::Middle)
+                .fixed_pos(rect.center())
+                .pivot(Align2::CENTER_CENTER)
+                .show(ctx, |ui| {
+                    Frame::new()
+                        .fill(bg_glass())
+                        .stroke(Stroke::new(1.0_f32, BORDER_GLASS))
+                        .corner_radius(CornerRadius::same(12))
+                        .inner_margin(Margin::symmetric(24, 20))
+                        .show(ui, |ui| {
+                            ui.set_max_width(470.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    egui::RichText::new("RUSTED SPACE SIMULATION")
+                                        .strong()
+                                        .size(18.0)
+                                        .color(ACCENT_CYAN),
+                                );
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Borderless Vulkan 1.2 Continuum Impact, Detonation & Planetary Hydrocode",
+                                    )
+                                    .size(12.0)
+                                    .color(TEXT_SECONDARY),
+                                );
+                                ui.add_space(12.0);
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("📂 Browse 17 Scenarios")
+                                                    .strong()
+                                                    .color(Color32::from_rgb(10, 22, 30)),
+                                            )
+                                            .fill(ACCENT_CYAN)
+                                            .corner_radius(CornerRadius::same(7)),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.show_scenario_browser = true;
+                                    }
+                                    if ui
+                                        .add(
+                                            egui::Button::new("🎯 Targets CAD")
+                                                .corner_radius(CornerRadius::same(7)),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.tab = WorkspaceTab::Targets;
+                                        self.target_submode = BuilderSubMode::BlueprintCad;
+                                    }
+                                    if ui
+                                        .add(
+                                            egui::Button::new("🚀 Warhead CAD")
+                                                .corner_radius(CornerRadius::same(7)),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.tab = WorkspaceTab::Projectiles;
+                                        self.proj_submode = BuilderSubMode::BlueprintCad;
+                                    }
+                                    if ui
+                                        .add(
+                                            egui::Button::new("✏ Paint (B)")
+                                                .corner_radius(CornerRadius::same(7)),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.active_tool = ActiveTool::BrushMatter;
+                                    }
+                                });
+                                ui.add_space(10.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Right-Drag: Sling projectile  ·  Scroll: Zoom  ·  Middle-Drag: Pan  ·  F1: Help",
+                                    )
+                                    .size(10.5)
+                                    .color(TEXT_MUTED),
+                                );
+                            });
+                        });
+                });
         } else if self.phase == SimPhase::Staging {
-            let banner = "SCENE STAGING (t = 0.0 µs) — Drag bodies to move, drag arrow tips to aim/set speed, then ▶ Start Simulation";
+            let banner = "SCENE STAGING (t = 0.0 µs)  ·  Drag bodies or arrow tips  ·  Space to Launch";
             let banner_y = if self.active_tool == ActiveTool::Interact {
-                54.0
+                56.0
             } else {
-                80.0
+                86.0
             };
             let b_rect = Rect::from_center_size(
                 Pos2::new(rect.center().x, rect.min.y + banner_y),
-                EguiVec2::new(660.0, 24.0),
+                EguiVec2::new(560.0, 24.0),
             );
-            painter.rect_filled(
-                b_rect,
-                CornerRadius::same(4),
-                Color32::from_rgba_unmultiplied(14, 24, 34, 205),
-            );
+            draw_glass_panel(&painter, b_rect, BORDER_GLASS, 12);
             painter.text(
                 b_rect.center(),
                 Align2::CENTER_CENTER,
                 banner,
-                FontId::proportional(11.5),
-                Color32::from_rgb(135, 230, 175),
+                FontId::monospace(10.8),
+                ACCENT_EMERALD,
             );
         }
 
@@ -3496,44 +3608,58 @@ impl RustedSpaceSimApp {
             }
         }
         if self.auto_slowmo && self.slowmo_timer > 0.0 && !self.paused {
+            let pill_y = if self.active_tool == ActiveTool::Interact {
+                58.0
+            } else {
+                90.0
+            };
             let pill = Rect::from_center_size(
-                Pos2::new(rect.center().x, rect.min.y + 78.0),
-                EguiVec2::new(180.0, 22.0),
+                Pos2::new(rect.center().x, rect.min.y + pill_y),
+                EguiVec2::new(190.0, 24.0),
             );
-            painter.rect_filled(
-                pill,
-                CornerRadius::same(11),
-                Color32::from_rgba_unmultiplied(18, 42, 65, 220),
-            );
+            draw_glass_panel(&painter, pill, ACCENT_CYAN, 12);
             painter.text(
                 pill.center(),
                 Align2::CENTER_CENTER,
-                "⏱ BULLET-TIME 0.22×",
-                FontId::monospace(11.0),
-                Color32::from_rgb(125, 235, 255),
+                "⏱ BULLET-TIME · 0.22×",
+                FontId::monospace(10.8),
+                ACCENT_CYAN,
             );
         }
 
-        // Transient status toast notification (PNG/CSV/Scene/Gauge actions)
+        // Transient status toast notification (PNG/CSV/GIF/Scene/Gauge actions)
         if let Some((msg, ts)) = &self.status_toast {
             let age = ts.elapsed().as_secs_f32();
             if age < 4.0 {
                 let alpha = ((4.0 - age) / 0.8).clamp(0.0, 1.0);
                 let toast_r = Rect::from_center_size(
                     Pos2::new(rect.center().x, rect.max.y - 26.0),
-                    EguiVec2::new(480.0, 26.0),
+                    EguiVec2::new(500.0, 28.0),
+                );
+                let mut a_border = ACCENT_EMERALD;
+                a_border = Color32::from_rgba_unmultiplied(
+                    a_border.r(),
+                    a_border.g(),
+                    a_border.b(),
+                    (200.0 * alpha) as u8,
                 );
                 painter.rect_filled(
                     toast_r,
-                    CornerRadius::same(5),
-                    Color32::from_rgba_unmultiplied(16, 30, 44, (225.0 * alpha) as u8),
+                    CornerRadius::same(14),
+                    Color32::from_rgba_unmultiplied(12, 22, 32, (232.0 * alpha) as u8),
+                );
+                painter.rect_stroke(
+                    toast_r,
+                    CornerRadius::same(14),
+                    Stroke::new(1.0_f32, a_border),
+                    StrokeKind::Outside,
                 );
                 painter.text(
                     toast_r.center(),
                     Align2::CENTER_CENTER,
-                    msg,
+                    format!("✔ {msg}"),
                     FontId::monospace(11.0),
-                    Color32::from_rgba_unmultiplied(150, 240, 195, (255.0 * alpha) as u8),
+                    Color32::from_rgba_unmultiplied(165, 245, 205, (255.0 * alpha) as u8),
                 );
             } else {
                 self.status_toast = None;
@@ -3545,27 +3671,36 @@ impl RustedSpaceSimApp {
     }
 
     fn draw_viewport_pill_dock(&mut self, ctx: &egui::Context, rect: Rect) {
+        if self.show_scenario_browser || self.show_help_modal {
+            return;
+        }
         egui::Area::new(egui::Id::new("viewport_pill_dock"))
-            .order(egui::Order::Foreground)
+            .order(egui::Order::Middle)
             .fixed_pos(Pos2::new(rect.center().x, rect.min.y + 8.0))
             .pivot(Align2::CENTER_TOP)
             .show(ctx, |ui| {
-                egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(13, 18, 28, 222))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(56, 78, 108)))
-                    .corner_radius(CornerRadius::same(10))
-                    .inner_margin(egui::Margin::symmetric(10, 5))
+                Frame::new()
+                    .fill(bg_glass())
+                    .stroke(Stroke::new(1.0_f32, BORDER_GLASS))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(Margin::symmetric(10, 5))
                     .show(ui, |ui| {
                         ui.vertical_centered(|ui| {
                             ui.horizontal(|ui| {
-                                let play_txt = if self.phase == SimPhase::Staging {
-                                    "▶ Start"
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                let (play_txt, play_bg, play_fg) = if self.phase == SimPhase::Staging {
+                                    ("▶ Start", ACCENT_EMERALD, Color32::from_rgb(10, 22, 16))
                                 } else if self.paused {
-                                    "▶ Resume"
+                                    ("▶ Resume", ACCENT_EMERALD, Color32::from_rgb(10, 22, 16))
                                 } else {
-                                    "⏸ Pause"
+                                    ("⏸ Pause", ACCENT_AMBER, Color32::from_rgb(22, 16, 8))
                                 };
-                                if ui.small_button(play_txt).clicked() {
+                                let play_btn = egui::Button::new(
+                                    egui::RichText::new(play_txt).strong().size(11.0).color(play_fg),
+                                )
+                                .fill(play_bg)
+                                .corner_radius(CornerRadius::same(8));
+                                if ui.add(play_btn).clicked() {
                                     self.start_simulation();
                                 }
                                 if ui.small_button("⏭ Step").clicked() {
@@ -3583,17 +3718,44 @@ impl RustedSpaceSimApp {
                                 }
                                 ui.separator();
                                 for tool in ActiveTool::ALL {
-                                    if ui
-                                        .selectable_label(
-                                            self.active_tool == tool,
-                                            tool.short_label(),
-                                        )
-                                        .clicked()
-                                    {
+                                    let active = self.active_tool == tool;
+                                    let chip = egui::Button::new(
+                                        egui::RichText::new(tool.short_label())
+                                            .size(11.0)
+                                            .strong()
+                                            .color(if active { Color32::WHITE } else { TEXT_SECONDARY }),
+                                    )
+                                    .fill(if active { ACCENT_SKY_DIM } else { Color32::TRANSPARENT })
+                                    .stroke(if active {
+                                        Stroke::new(1.0_f32, ACCENT_CYAN)
+                                    } else {
+                                        Stroke::NONE
+                                    })
+                                    .corner_radius(CornerRadius::same(7));
+                                    if ui.add(chip).clicked() {
                                         self.active_tool = tool;
                                     }
                                 }
                                 ui.separator();
+                                let rec_txt = if self.gif_recording {
+                                    format!("⏹ {}f", self.gif_frames.len())
+                                } else {
+                                    "🔴 GIF".to_string()
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new(rec_txt).size(11.0).color(
+                                                if self.gif_recording { ACCENT_ROSE } else { TEXT_PRIMARY },
+                                            ),
+                                        )
+                                        .corner_radius(CornerRadius::same(7)),
+                                    )
+                                    .on_hover_text("Toggle live viewport GIF89a recording")
+                                    .clicked()
+                                {
+                                    self.toggle_or_save_gif_now();
+                                }
                                 ui.toggle_value(&mut self.show_starfield, "⭐ Stars")
                                     .on_hover_text("Toggle deep-space parallax starfield");
                                 if ui
@@ -3605,6 +3767,7 @@ impl RustedSpaceSimApp {
                                 }
                             });
                             if self.active_tool != ActiveTool::Interact {
+                                ui.add_space(2.0);
                                 ui.horizontal(|ui| {
                                     match self.active_tool {
                                         ActiveTool::BrushMatter => {
@@ -3635,7 +3798,7 @@ impl RustedSpaceSimApp {
                                                     &mut self.laser_angle_deg,
                                                     -180.0..=180.0,
                                                 )
-                                                .text("∠°"),
+                                                .text("Deg °"),
                                             );
                                         }
                                         ActiveTool::GravityVortex => {
@@ -3669,7 +3832,7 @@ impl RustedSpaceSimApp {
                                     ui.label(
                                         egui::RichText::new("[ / ]: Radius")
                                             .size(10.0)
-                                            .color(Color32::from_rgb(155, 175, 200)),
+                                            .color(TEXT_MUTED),
                                     );
                                 });
                             }
@@ -3686,52 +3849,129 @@ impl RustedSpaceSimApp {
         let mut pick: Option<ScenarioPreset> = None;
         egui::Window::new("📂 Scenario & Astrophysics Library")
             .open(&mut open)
+            .collapsible(false)
+            .constrain(true)
             .resizable(true)
-            .default_size([740.0, 500.0])
+            .default_size([860.0, 560.0])
+            .max_width(880.0)
             .anchor(Align2::CENTER_CENTER, EguiVec2::ZERO)
             .show(ctx, |ui| {
+                ui.set_max_width(840.0);
                 ui.horizontal_wrapped(|ui| {
                     for cat in ScenarioCategory::ALL {
-                        ui.selectable_value(&mut self.scenario_filter, cat, cat.label());
+                        let active = self.scenario_filter == cat;
+                        let pill = egui::Button::new(
+                            egui::RichText::new(cat.label())
+                                .strong()
+                                .size(11.5)
+                                .color(if active { Color32::WHITE } else { TEXT_SECONDARY }),
+                        )
+                        .fill(if active { ACCENT_SKY_DIM } else { BG_CARD })
+                        .stroke(Stroke::new(
+                            1.0_f32,
+                            if active { ACCENT_CYAN } else { BORDER_HAIRLINE },
+                        ))
+                        .corner_radius(CornerRadius::same(14));
+                        if ui.add(pill).clicked() {
+                            self.scenario_filter = cat;
+                        }
                     }
                 });
+                ui.add_space(4.0);
                 ui.separator();
-                egui::ScrollArea::vertical().max_height(410.0).show(ui, |ui| {
-                    for p in ScenarioPreset::ALL {
-                        if self.scenario_filter != ScenarioCategory::All
-                            && p.category() != self.scenario_filter
-                        {
-                            continue;
-                        }
-                        ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(p.title())
-                                        .strong()
-                                        .size(13.0)
-                                        .color(Color32::from_rgb(130, 220, 255)),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui.button("Load Scenario").clicked() {
-                                            pick = Some(p);
-                                        }
-                                        ui.label(
-                                            egui::RichText::new(p.category().label())
-                                                .size(10.5)
-                                                .color(Color32::from_rgb(160, 185, 210)),
+                egui::ScrollArea::vertical().max_height(460.0).show(ui, |ui| {
+                    let filtered: Vec<ScenarioPreset> = ScenarioPreset::ALL
+                        .iter()
+                        .copied()
+                        .filter(|p| {
+                            self.scenario_filter == ScenarioCategory::All
+                                || p.category() == self.scenario_filter
+                        })
+                        .collect();
+                    for chunk in filtered.chunks(2) {
+                        ui.columns(2, |cols| {
+                            for (ci, p) in chunk.iter().enumerate() {
+                                let col = &mut cols[ci];
+                                col.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                                let is_cur = *p == self.preset;
+                                let (badge_fg, badge_bg) = match p.category() {
+                                    ScenarioCategory::ArmorShapedCharges => {
+                                        (ACCENT_AMBER, Color32::from_rgb(42, 30, 14))
+                                    }
+                                    ScenarioCategory::NavalBunker => {
+                                        (ACCENT_EMERALD, Color32::from_rgb(14, 38, 28))
+                                    }
+                                    ScenarioCategory::PlanetaryOrbital => {
+                                        (ACCENT_CYAN, Color32::from_rgb(14, 34, 52))
+                                    }
+                                    ScenarioCategory::All => {
+                                        (ACCENT_VIOLET, Color32::from_rgb(32, 24, 52))
+                                    }
+                                };
+                                Frame::new()
+                                    .fill(BG_CARD)
+                                    .stroke(Stroke::new(
+                                        if is_cur { 1.5_f32 } else { 1.0_f32 },
+                                        if is_cur { ACCENT_CYAN } else { BORDER_HAIRLINE },
+                                    ))
+                                    .corner_radius(CornerRadius::same(8))
+                                    .inner_margin(Margin::symmetric(12, 10))
+                                    .show(col, |ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                                        ui.horizontal(|ui| {
+                                            pill_badge(ui, p.category().label(), badge_fg, badge_bg);
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    let load_btn = egui::Button::new(
+                                                        egui::RichText::new(if is_cur {
+                                                            "Loaded ✔"
+                                                        } else {
+                                                            "▶ Load"
+                                                        })
+                                                        .strong()
+                                                        .size(11.0)
+                                                        .color(if is_cur {
+                                                            Color32::from_rgb(10, 22, 16)
+                                                        } else {
+                                                            Color32::WHITE
+                                                        }),
+                                                    )
+                                                    .fill(if is_cur {
+                                                        ACCENT_EMERALD
+                                                    } else {
+                                                        ACCENT_SKY_DIM
+                                                    })
+                                                    .corner_radius(CornerRadius::same(6));
+                                                    if ui.add(load_btn).clicked() {
+                                                        pick = Some(*p);
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(4.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(p.title())
+                                                    .strong()
+                                                    .size(13.0)
+                                                    .color(TEXT_PRIMARY),
+                                            )
+                                            .wrap(),
                                         );
-                                    },
-                                );
-                            });
-                            ui.label(
-                                egui::RichText::new(p.description())
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(195, 205, 218)),
-                            );
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(p.description())
+                                                    .size(11.0)
+                                                    .color(TEXT_SECONDARY),
+                                            )
+                                            .wrap(),
+                                        );
+                                    });
+                            }
                         });
-                        ui.add_space(4.0);
+                        ui.add_space(6.0);
                     }
                 });
             });
@@ -3747,50 +3987,61 @@ impl RustedSpaceSimApp {
             return;
         }
         let mut open = self.show_help_modal;
-        egui::Window::new("⌨ Controls & Continuum Hydrocode Reference (F1)")
+        egui::Window::new("⌨ Controls & Continuum Hydrocode Reference")
             .open(&mut open)
+            .collapsible(false)
+            .constrain(true)
             .resizable(true)
-            .default_size([620.0, 460.0])
+            .default_size([700.0, 560.0])
+            .max_width(720.0)
             .anchor(Align2::CENTER_CENTER, EguiVec2::ZERO)
             .show(ctx, |ui| {
-                ui.label(
-                    egui::RichText::new("Interactive Simulation & Tool Hotkeys")
-                        .strong()
-                        .size(13.0)
-                        .color(Color32::from_rgb(110, 215, 255)),
-                );
-                egui::Grid::new("help_hotkeys_grid")
-                    .num_columns(2)
-                    .spacing([18.0, 4.0])
-                    .show(ui, |ui| {
-                        for (k, d) in [
-                            ("Space", "Start simulation / Pause / Resume"),
-                            ("S / R / C", "Single CFL step / Reset to Staging / Clear Space"),
-                            ("Q / B / E", "Interact / Matter Brush / Void Eraser"),
-                            ("L / G / X", "Thermal Laser / Gravity Vortex (Shift=Repel) / Shock Blast"),
-                            ("[  /  ]", "Decrease / Increase active tool brush radius"),
-                            ("Right-Drag", "Quick-fire projectile anywhere with velocity sling"),
-                            ("Middle-Drag / Wheel", "Pan camera / Cursor-centered exponential zoom"),
-                            ("M / V / F", "Ballistic Caliper & RHAe / Flow Vectors / Fit Camera"),
-                            ("Alt + Left-Click", "Pin or remove Lagrangian Witness Sensor Gauge"),
-                            ("Left / Right Arrows", "Scrub recorded timeline replay keyframes"),
-                            ("1–8 / F12 / F1", "Switch Visualization Mode / Export PNG / Toggle Help"),
+                ui.set_max_width(680.0);
+                egui::ScrollArea::vertical().max_height(520.0).show(ui, |ui| {
+                    studio_card(ui, "KEYBOARD & CANVAS SHORTCUTS", ACCENT_CYAN, |ui| {
+                        egui::Grid::new("help_hotkeys_grid")
+                            .num_columns(2)
+                            .spacing([14.0, 6.0])
+                            .show(ui, |ui| {
+                                for (k, d) in [
+                                    ("Space", "Start simulation / Pause / Resume"),
+                                    ("S / R / C", "Single CFL step / Reset to Staging / Clear Space"),
+                                    ("Q / B / E", "Interact / Matter Brush / Void Eraser"),
+                                    ("L / G / X", "Thermal Laser / Gravity Vortex (Shift=Repel) / Shock Blast"),
+                                    ("[  /  ]", "Decrease / Increase active tool brush radius"),
+                                    ("Right-Drag", "Quick-fire projectile anywhere with velocity sling"),
+                                    ("Middle-Drag", "Pan camera smoothly; Scroll wheel zooms on cursor"),
+                                    ("M / V / F", "Ballistic Caliper & RHAe / Flow Vectors / Fit Camera"),
+                                    ("Alt + Click", "Pin or remove Lagrangian Witness Sensor Gauge"),
+                                    ("◀ / ▶ Arrows", "Scrub recorded timeline replay keyframes"),
+                                    ("1–8 / F12 / F1", "Switch Visualization Channel / Save PNG / Toggle Help"),
+                                ] {
+                                    keycap_badge(ui, k);
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(d).size(11.5).color(TEXT_PRIMARY),
+                                        )
+                                        .wrap(),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                    studio_card(ui, "VULKAN COMPUTE & CONTINUUM ARCHITECTURE", ACCENT_EMERALD, |ui| {
+                        for bullet in [
+                            "• GPU Compute: Vulkan 1.2 SPIR-V (131K spatial hash + 32x32 LDS N-body self-gravity + HOST_CACHED UMA DMA).",
+                            "• 32 Calibrated Materials: Mie-Grüneisen & Tillotson vaporization EOS, CSPM kernel gradients, Johnson-Cook rate/thermal plasticity, Drucker-Prager brittle confinement & tensile spall.",
+                            "• Energetics & Thermal Physics: Programmed-burn JWL EOS detonation waves, condensed-phase Thermite reaction, Fourier thermal conduction, Stefan-Boltzmann radiative cooling & molten droplet capillary tension.",
                         ] {
-                            ui.label(egui::RichText::new(k).monospace().strong().color(Color32::from_rgb(255, 210, 125)));
-                            ui.label(d);
-                            ui.end_row();
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(bullet).size(11.5).color(TEXT_SECONDARY),
+                                )
+                                .wrap(),
+                            );
                         }
                     });
-                ui.separator();
-                ui.label(
-                    egui::RichText::new("Solver & Physics Architecture")
-                        .strong()
-                        .size(13.0)
-                        .color(Color32::from_rgb(135, 230, 175)),
-                );
-                ui.label("• GPU Compute: Vulkan 1.2 SPIR-V (131K spatial hash + 32x32 LDS N-body self-gravity + HOST_CACHED UMA DMA).");
-                ui.label("• Solids & Shock: Mie-Grüneisen + Tillotson vaporization EOS, CSPM corrected kernel gradients, Johnson-Cook rate/thermal plasticity, Drucker-Prager brittle confinement & tensile spall.");
-                ui.label("• Energetics: Programmed-burn JWL EOS detonation waves, piezoelectric contact & post-penetration delay fuzes, Fourier thermal conduction, Stefan-Boltzmann radiative cooling & molten droplet capillary cohesion.");
+                });
             });
         self.show_help_modal = open;
     }
@@ -4617,12 +4868,13 @@ fn draw_scale_bar(painter: &egui::Painter, rect: Rect, zoom: f32) {
         500.0
     };
     let px_len = cm_len * zoom;
-    let x0 = rect.min.x + 16.0;
-    let y0 = rect.min.y + 22.0;
-    painter.rect_filled(
-        Rect::from_min_size(Pos2::new(x0 - 8.0, y0 - 12.0), EguiVec2::new(px_len + 74.0, 26.0)),
-        CornerRadius::same(4),
-        Color32::from_rgba_unmultiplied(12, 16, 24, 195),
+    let x0 = rect.min.x + 24.0;
+    let y0 = rect.max.y - 24.0;
+    draw_glass_panel(
+        painter,
+        Rect::from_min_size(Pos2::new(x0 - 10.0, y0 - 13.0), EguiVec2::new(px_len + 80.0, 28.0)),
+        BORDER_GLASS,
+        8,
     );
     let c = Color32::from_rgb(185, 210, 235);
     painter.line_segment([Pos2::new(x0, y0), Pos2::new(x0 + px_len, y0)], Stroke::new(2.0_f32, c));
@@ -4702,47 +4954,27 @@ fn draw_particle_probe(
     );
 
     let box_rect = Rect::from_min_size(
-        Pos2::new(rect.min.x + 14.0, rect.max.y - 68.0),
-        EguiVec2::new(435.0, 56.0),
+        Pos2::new(rect.min.x + 14.0, rect.max.y - 104.0),
+        EguiVec2::new(445.0, 58.0),
     );
-    painter.rect_filled(
-        box_rect,
-        CornerRadius::same(6),
-        Color32::from_rgba_unmultiplied(12, 16, 26, 215),
-    );
-    painter.rect_stroke(
-        box_rect,
-        CornerRadius::same(6),
-        Stroke::new(1.0_f32, Color32::from_rgb(55, 80, 115)),
-        egui::StrokeKind::Outside,
-    );
+    draw_glass_panel(painter, box_rect, BORDER_GLASS, 8);
     painter.text(
         Pos2::new(box_rect.min.x + 10.0, box_rect.min.y + 8.0),
         Align2::LEFT_TOP,
         info,
-        FontId::monospace(11.0),
-        Color32::from_rgb(215, 228, 245),
+        FontId::monospace(10.8),
+        TEXT_PRIMARY,
     );
 }
 
 fn draw_telemetry_hud(painter: &egui::Painter, rect: Rect, world: &ContinuumWorld) {
-    let w = 310.0;
-    let h = 118.0;
+    let w = 316.0;
+    let h = 122.0;
     let panel = Rect::from_min_size(
         Pos2::new(rect.max.x - w - 14.0, rect.max.y - h - 12.0),
         EguiVec2::new(w, h),
     );
-    painter.rect_filled(
-        panel,
-        CornerRadius::same(6),
-        Color32::from_rgba_unmultiplied(12, 16, 26, 215),
-    );
-    painter.rect_stroke(
-        panel,
-        CornerRadius::same(6),
-        Stroke::new(1.0_f32, Color32::from_rgb(55, 80, 115)),
-        egui::StrokeKind::Outside,
-    );
+    draw_glass_panel(painter, panel, BORDER_GLASS, 8);
 
     let hist = &world.history;
     let latest = hist.last().copied().unwrap_or_default();
@@ -4829,11 +5061,7 @@ fn draw_telemetry_hud(painter: &egui::Painter, rect: Rect, world: &ContinuumWorl
 }
 
 fn configure_dark_theme(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = Color32::from_rgb(16, 20, 28);
-    visuals.window_fill = Color32::from_rgb(18, 22, 32);
-    visuals.extreme_bg_color = Color32::from_rgb(10, 13, 19);
-    ctx.set_visuals(visuals);
+    configure_modern_theme(ctx);
 }
 
 fn run_headless_benchmark() {
@@ -4931,7 +5159,7 @@ fn run_headless_benchmark() {
 
 fn print_help() {
     println!(
-        "Rusted Space Simulation (rssim) v0.0.7
+        "Rusted Space Simulation (rssim) v0.1.0
 Vulkan GPU-Accelerated Continuum Elasto-Plastic, Reactive Detonation & Planetary Hydrocode
 (Mie-Gruneisen + JWL EOS + CSPM Renormalization + Johnson-Cook Viscoplasticity + 32x32 LDS Self-Gravity)
 

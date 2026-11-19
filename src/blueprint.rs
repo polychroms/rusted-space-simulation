@@ -26,9 +26,9 @@ impl SymmetryMode {
     pub fn label(self) -> &'static str {
         match self {
             SymmetryMode::None => "Off",
-            SymmetryMode::HorizontalAxis => "Horiz ─",
-            SymmetryMode::VerticalAxis => "Vert │",
-            SymmetryMode::QuadAxes => "4-Way ┼",
+            SymmetryMode::HorizontalAxis => "Horiz ↔",
+            SymmetryMode::VerticalAxis => "Vert ↕",
+            SymmetryMode::QuadAxes => "4-Way +",
         }
     }
 }

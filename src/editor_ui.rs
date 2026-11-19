@@ -11,6 +11,10 @@ use crate::blueprint::{
     PixelBlueprint, SymmetryMode,
 };
 use crate::materials::{MaterialCategory, MaterialId};
+use crate::ui_theme::{
+    draw_glass_panel, studio_card, ACCENT_AMBER, ACCENT_CYAN, ACCENT_EMERALD, BORDER_GLASS,
+    TEXT_SECONDARY,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BpTool {
@@ -36,13 +40,13 @@ impl BpTool {
 
     pub fn label(self) -> &'static str {
         match self {
-            BpTool::Brush => "🖌 Brush",
+            BpTool::Brush => "✏ Brush",
             BpTool::Line => "📏 Line",
-            BpTool::Rect => "▭ Rect",
-            BpTool::Ellipse => "⬭ Ellipse",
+            BpTool::Rect => "■ Rect",
+            BpTool::Ellipse => "▫ Ellipse",
             BpTool::Wedge => "▶ Cone/Wedge",
-            BpTool::FloodFill => "🪣 Fill",
-            BpTool::Eraser => "⌫ Erase",
+            BpTool::FloodFill => "💧 Fill",
+            BpTool::Eraser => "✖ Erase",
         }
     }
 
@@ -335,7 +339,7 @@ impl BlueprintEditor {
         let mut action = BlueprintEditorAction::None;
 
         // 1. Blueprint Name + Preset Cutaways + Disk Save/Load
-        ui.group(|ui| {
+        studio_card(ui, "BLUEPRINT PRESET & GRID", ACCENT_CYAN, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Name:").strong());
                 ui.text_edit_singleline(&mut self.bp.name);
@@ -425,13 +429,13 @@ impl BlueprintEditor {
                 }
             });
             ui.horizontal(|ui| {
-                if ui.small_button("⇄ Flip H").on_hover_text("Flip horizontally").clicked() {
+                if ui.small_button("↔ Flip H").on_hover_text("Flip horizontally").clicked() {
                     let prev = self.bp.clone();
                     self.push_undo(prev);
                     self.bp.flip_horizontal();
                     self.bp_epoch = self.bp_epoch.wrapping_add(1);
                 }
-                if ui.small_button("⇅ Flip V").on_hover_text("Flip vertically").clicked() {
+                if ui.small_button("↕ Flip V").on_hover_text("Flip vertically").clicked() {
                     let prev = self.bp.clone();
                     self.push_undo(prev);
                     self.bp.flip_vertical();
@@ -464,7 +468,7 @@ impl BlueprintEditor {
                         self.bp_epoch = self.bp_epoch.wrapping_add(1);
                     }
                 }
-                if ui.small_button("⌫ Clear").clicked() && self.bp.filled_count() > 0 {
+                if ui.small_button("🗑 Clear").clicked() && self.bp.filled_count() > 0 {
                     let prev = self.bp.clone();
                     self.push_undo(prev);
                     self.bp.clear();
@@ -476,9 +480,9 @@ impl BlueprintEditor {
         ui.add_space(5.0);
 
         // 2. Drawing Tools, Symmetry & Shape Options
-        ui.group(|ui| {
+        studio_card(ui, "CAD TOOLS & SYMMETRY", ACCENT_AMBER, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("CAD Drawing Tool:").strong());
+                ui.label(egui::RichText::new("Active Tool:").color(TEXT_SECONDARY));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("⌖ Fit View").clicked() {
                         self.pan_cells = Vec2::ZERO;
@@ -561,9 +565,12 @@ impl BlueprintEditor {
 
         ui.add_space(5.0);
 
-        // 3. 24-Material Categorized Continuum Material Palette
-        ui.group(|ui| {
-            ui.label(egui::RichText::new("Material Palette (24 Continuum Materials):").strong());
+        // 3. Categorized Continuum Material Palette
+        studio_card(
+            ui,
+            &format!("MATERIAL PALETTE ({} CONTINUUM MATERIALS)", MaterialId::ALL.len()),
+            ACCENT_EMERALD,
+            |ui| {
 
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = EguiVec2::new(3.0, 3.0);
@@ -674,7 +681,8 @@ impl BlueprintEditor {
         ui.add_space(6.0);
 
         // 4. Spawn Placement / Launch Velocity & Send to Simulation Range!
-        ui.group(|ui| {
+        let place_accent = if self.is_projectile { ACCENT_AMBER } else { ACCENT_CYAN };
+        studio_card(ui, "PLACEMENT & LAUNCH PARAMETERS", place_accent, |ui| {
             let filled = self.bp.filled_count();
             let area_per_cell = 0.866_025_4 * sim_dx * sim_dx;
             let mass_g: f32 = self
@@ -702,7 +710,7 @@ impl BlueprintEditor {
                 ui.add(egui::DragValue::new(&mut self.spawn_pos.x).speed(0.4).suffix(" cm"));
                 ui.label("Y:");
                 ui.add(egui::DragValue::new(&mut self.spawn_pos.y).speed(0.4).suffix(" cm"));
-                ui.label("∠:");
+                ui.label("Deg:");
                 ui.add(
                     egui::DragValue::new(&mut self.spawn_angle_deg)
                         .range(-180.0..=180.0)
@@ -738,9 +746,9 @@ impl BlueprintEditor {
             }
 
             let primary_label = if self.is_projectile {
-                "🚀 Place Warhead in Simulation Range ➔"
+                "🚀 Place Warhead in Simulation Range ➡"
             } else {
-                "🎯 Place Target in Simulation Range ➔"
+                "🎯 Place Target in Simulation Range ➡"
             };
             let send_btn = egui::Button::new(
                 egui::RichText::new(primary_label)
@@ -1103,28 +1111,24 @@ impl BlueprintEditor {
 
         // Top CAD Orientation Banner
         let header_text = if self.is_projectile {
-            "WARHEAD BLUEPRINT CAD  —  Rear (-X)  ◀═══════  NOSE / FLIGHT DIRECTION (+X) ➔"
+            "WARHEAD BLUEPRINT CAD  —  Rear (-X)  ◀----  NOSE / FLIGHT DIRECTION (+X) ➡"
         } else {
-            "TARGET STRUCTURE CAD  —  ➔ Incoming Threat (+X) Strikes Left Strike-Face First"
+            "TARGET STRUCTURE CAD  —  ➡ Incoming Threat (+X) Strikes Left Strike-Face First"
         };
         let b_rect = Rect::from_center_size(
             Pos2::new(rect.center().x, rect.min.y + 20.0),
-            EguiVec2::new(650.0, 24.0),
+            EguiVec2::new(660.0, 26.0),
         );
-        painter.rect_filled(
-            b_rect,
-            CornerRadius::same(4),
-            Color32::from_rgba_unmultiplied(14, 22, 34, 215),
-        );
+        draw_glass_panel(&painter, b_rect, BORDER_GLASS, 8);
         painter.text(
             b_rect.center(),
             Align2::CENTER_CENTER,
             header_text,
-            FontId::monospace(11.5),
+            FontId::monospace(11.0),
             if self.is_projectile {
-                Color32::from_rgb(255, 205, 105)
+                ACCENT_AMBER
             } else {
-                Color32::from_rgb(125, 220, 255)
+                ACCENT_CYAN
             },
         );
 
@@ -1159,15 +1163,14 @@ impl BlueprintEditor {
             )
         };
 
+        let pill_w = (cell_info.len() as f32 * 6.85 + 28.0)
+            .max(520.0)
+            .min((rect.width() - 28.0).max(320.0));
         let f_rect = Rect::from_min_size(
-            Pos2::new(rect.min.x + 14.0, rect.max.y - 34.0),
-            EguiVec2::new(620.0, 24.0),
+            Pos2::new(rect.min.x + 14.0, rect.max.y - 36.0),
+            EguiVec2::new(pill_w, 26.0),
         );
-        painter.rect_filled(
-            f_rect,
-            CornerRadius::same(4),
-            Color32::from_rgba_unmultiplied(12, 16, 26, 210),
-        );
+        draw_glass_panel(&painter, f_rect, BORDER_GLASS, 8);
         painter.text(
             Pos2::new(f_rect.min.x + 10.0, f_rect.center().y),
             Align2::LEFT_CENTER,

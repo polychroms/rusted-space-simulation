@@ -317,22 +317,17 @@ impl GaugeBank {
         if self.gauges.is_empty() {
             return;
         }
-        let w = 325.0;
-        let h = 128.0;
+        let w = 330.0;
+        let h = 132.0;
         let panel = Rect::from_min_size(
-            Pos2::new(rect.min.x + 14.0, rect.min.y + 56.0),
+            Pos2::new(rect.min.x + 14.0, rect.min.y + 52.0),
             EguiVec2::new(w, h),
         );
-        painter.rect_filled(
+        crate::ui_theme::draw_glass_panel(
+            painter,
             panel,
-            CornerRadius::same(6),
-            Color32::from_rgba_unmultiplied(11, 15, 24, 222),
-        );
-        painter.rect_stroke(
-            panel,
-            CornerRadius::same(6),
-            Stroke::new(1.0_f32, Color32::from_rgb(65, 95, 135)),
-            egui::StrokeKind::Outside,
+            Color32::from_rgb(56, 84, 122),
+            8,
         );
 
         painter.text(
@@ -576,22 +571,12 @@ pub fn draw_caliper_overlay(
     let mid = Pos2::new(0.5 * (pa.x + pb.x), 0.5 * (pa.y + pb.y) - 34.0);
     let card = Rect::from_center_size(
         Pos2::new(
-            mid.x.clamp(rect.min.x + 170.0, rect.max.x - 170.0),
-            mid.y.clamp(rect.min.y + 42.0, rect.max.y - 42.0),
+            mid.x.clamp(rect.min.x + 174.0, rect.max.x - 174.0),
+            mid.y.clamp(rect.min.y + 44.0, rect.max.y - 44.0),
         ),
-        EguiVec2::new(336.0, 52.0),
+        EguiVec2::new(340.0, 54.0),
     );
-    painter.rect_filled(
-        card,
-        CornerRadius::same(5),
-        Color32::from_rgba_unmultiplied(10, 18, 24, 228),
-    );
-    painter.rect_stroke(
-        card,
-        CornerRadius::same(5),
-        Stroke::new(1.2_f32, col),
-        egui::StrokeKind::Outside,
-    );
+    crate::ui_theme::draw_glass_panel(painter, card, col.gamma_multiply(0.65), 8);
     painter.text(
         Pos2::new(card.min.x + 8.0, card.min.y + 6.0),
         Align2::LEFT_TOP,
@@ -681,23 +666,13 @@ pub fn draw_quantitative_colorbar(painter: &egui::Painter, rect: Rect, mode: Vis
         ),
     };
 
-    let w = 212.0;
-    let h = 46.0;
+    let w = 216.0;
+    let h = 48.0;
     let box_r = Rect::from_min_size(
         Pos2::new(rect.max.x - w - 14.0, rect.min.y + 12.0),
         EguiVec2::new(w, h),
     );
-    painter.rect_filled(
-        box_r,
-        CornerRadius::same(5),
-        Color32::from_rgba_unmultiplied(12, 16, 26, 215),
-    );
-    painter.rect_stroke(
-        box_r,
-        CornerRadius::same(5),
-        Stroke::new(1.0_f32, Color32::from_rgb(58, 82, 118)),
-        egui::StrokeKind::Outside,
-    );
+    crate::ui_theme::draw_glass_panel(painter, box_r, Color32::from_rgb(56, 78, 114), 8);
     painter.text(
         Pos2::new(box_r.center().x, box_r.min.y + 8.0),
         Align2::CENTER_CENTER,

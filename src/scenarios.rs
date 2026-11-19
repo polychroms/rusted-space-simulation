@@ -217,12 +217,12 @@ impl ProjectileShape {
     pub fn short_label(self) -> &'static str {
         match self {
             ProjectileShape::CustomBlueprint => "🎨 Blueprint",
-            ProjectileShape::Sphere => "● Circle",
-            ProjectileShape::Ellipse => "⬭ Ellipse",
-            ProjectileShape::HollowRing => "◯ Ring",
-            ProjectileShape::BluntSlug => "▭ Rect",
+            ProjectileShape::Sphere => "⚪ Circle",
+            ProjectileShape::Ellipse => "▫ Ellipse",
+            ProjectileShape::HollowRing => "⭕ Ring",
+            ProjectileShape::BluntSlug => "■ Rect",
             ProjectileShape::Wedge => "▶ Wedge",
-            ProjectileShape::LongRodDart => "➵ Rod",
+            ProjectileShape::LongRodDart => "➡ Rod",
             ProjectileShape::DifferentiatedAsteroid => "☄ Asteroid",
             ProjectileShape::ShapedJet => "⚡ Jet",
         }

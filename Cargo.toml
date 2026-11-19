@@ -1,6 +1,6 @@
 [package]
 name = "rssim"
-version = "0.0.7"
+version = "0.1.0"
 edition = "2021"
 description = "Rusted Space Simulation — Vulkan GPU Continuum Elasto-Plastic & Reactive Shock Physics Simulator"
 
