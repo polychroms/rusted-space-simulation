@@ -171,6 +171,7 @@ impl VisMode {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Camera2D {
     /// World coordinates (cm) at center of viewport
     pub center: Vec2,

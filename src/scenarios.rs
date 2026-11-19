@@ -1703,4 +1703,116 @@ mod tests {
         canvas.render_with_opts(&w_gpu, &cam, 320, 240, crate::render::VisMode::MaterialThermal, false, true);
         assert_eq!(first, canvas.pixels, "Parallel starfield render must be deterministic");
     }
+
+    #[test]
+    fn live_interactive_tools_paint_erase_laser_gravity_and_blast_invariants() {
+        let mut world = crate::physics::ContinuumWorld::new(0.45);
+
+        // 1. Matter Brush non-overlapping honeycomb + second-pass idempotency
+        let n1 = world.paint_matter_disc(
+            Vec2::new(0.0, 0.0),
+            2.6,
+            MaterialId::RhaSteel,
+            Vec2::ZERO,
+            Some(293.0),
+            1,
+        );
+        let n2 = world.paint_matter_disc(
+            Vec2::new(0.0, 0.0),
+            2.6,
+            MaterialId::RhaSteel,
+            Vec2::ZERO,
+            Some(293.0),
+            1,
+        );
+        assert!(n1 >= 60, "Brush disc should populate honeycomb grains (got {n1})");
+        assert_eq!(n2, 0, "Brush disc must not double-stack overlapping grains");
+
+        let n_he = world.paint_matter_disc(
+            Vec2::new(9.0, 0.0),
+            2.2,
+            MaterialId::CompB,
+            Vec2::ZERO,
+            Some(293.0),
+            2,
+        );
+        assert!(n_he >= 40);
+
+        // 2. Witness Gauge pin + Erase Matter + Index Remapping
+        let mut gauges = crate::analysis::GaugeBank::new();
+        gauges.toggle_or_pin_at(&world, Vec2::new(0.0, 0.0));
+        gauges.toggle_or_pin_at(&world, Vec2::new(9.0, 0.0));
+        assert_eq!(gauges.gauges.len(), 2);
+
+        let (removed, remap) = world.erase_matter_disc(Vec2::new(0.0, 0.0), 1.3);
+        assert!(removed > 5, "Eraser must remove center grains");
+        gauges.remap_indices(&remap);
+        assert_eq!(
+            gauges.gauges.len(),
+            1,
+            "Erased gauge must drop while downstream gauge survives"
+        );
+        let survived_idx = gauges.gauges[0].particle_idx;
+        assert!(survived_idx < world.len());
+        assert_eq!(world.mat[survived_idx], MaterialId::CompB);
+
+        // 3. Front-surface stopping Thermal Laser: heats steel without penetrating behind to CompB
+        let initial_he_max_t = world
+            .mat
+            .iter()
+            .zip(world.temp.iter())
+            .filter(|(m, _)| **m == MaterialId::CompB)
+            .map(|(_, t)| *t)
+            .fold(0.0f32, f32::max);
+        for _ in 0..15 {
+            let hit = world.apply_thermal_laser(
+                Vec2::new(-12.0, 0.0),
+                Vec2::X,
+                1.2,
+                6.0,
+                0.25,
+            );
+            assert!(hit.is_some());
+            assert!(hit.unwrap().x < 4.0, "Laser must stop on front steel shield");
+        }
+        let post_shield_he_t = world
+            .mat
+            .iter()
+            .zip(world.temp.iter())
+            .filter(|(m, _)| **m == MaterialId::CompB)
+            .map(|(_, t)| *t)
+            .fold(0.0f32, f32::max);
+        assert!(
+            (post_shield_he_t - initial_he_max_t).abs() < 1e-3,
+            "Front steel must shield downstream CompB from thermal laser"
+        );
+
+        // Now shoot directly at CompB (+Y down or erase front steel) to verify laser cook-off!
+        let (rem_all_steel, remap2) = world.erase_matter_disc(Vec2::new(0.0, 0.0), 5.0);
+        assert!(rem_all_steel > 0);
+        gauges.remap_indices(&remap2);
+        for _ in 0..45 {
+            world.apply_thermal_laser(Vec2::new(-5.0, 0.0), Vec2::X, 1.4, 8.0, 0.30);
+        }
+        let cooked = world.det_state.iter().filter(|&&d| d != 0).count();
+        assert!(cooked > 0, "Thermal laser must cook off directly irradiated CompB");
+
+        // 4. Gravity Vortex pull + Tangential Swirl
+        world.apply_gravity_well(Vec2::new(24.0, 0.0), 0.35, 0.15, 0.12);
+        let avg_vx: f32 = world.vel.iter().map(|v| v.x).sum::<f32>() / world.len().max(1) as f32;
+        assert!(avg_vx > 1e-4, "Gravity well at +X must accelerate matter +X");
+
+        // 5. Shock Blast impulse & damage + clean CPU continuum integration steps
+        let blast_hits = world.trigger_shock_blast(Vec2::new(9.0, 0.0), 5.0, 0.35, 3600.0);
+        assert!(blast_hits > 10);
+        for _ in 0..5 {
+            world.step(0.04);
+        }
+        for i in 0..world.len() {
+            assert!(
+                world.pos[i].is_finite() && world.vel[i].is_finite(),
+                "Live tool mutations must remain numerically finite after integration"
+            );
+        }
+    }
 }

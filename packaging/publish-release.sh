@@ -36,7 +36,9 @@ fi
 cargo clippy --release --all-targets -- -D warnings
 cargo test --release
 cargo build --release
-cp target/release/rssim /home/radu/bin/rssim
+cp -f target/release/rssim /home/radu/bin/rssim.new
+chmod +x /home/radu/bin/rssim.new
+mv -f /home/radu/bin/rssim.new /home/radu/bin/rssim
 /home/radu/bin/rssim --bench
 
 bash packaging/build-appimage.sh "$VER"

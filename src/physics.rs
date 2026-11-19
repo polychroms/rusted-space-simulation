@@ -538,6 +538,8 @@ impl ContinuumWorld {
         self.acc.clone_from(&snap.acc);
         self.xsph_dv.clone_from(&snap.xsph_dv);
         self.grav_acc.resize(n, Vec2::ZERO);
+        self.step_scratch.resize(n, ContinuumStepOut::default());
+        self.grid_next.resize(n, -1);
         self.mass.clone_from(&snap.mass);
         self.rho0.clone_from(&snap.rho0);
         self.rho.clone_from(&snap.rho);
@@ -1935,5 +1937,359 @@ impl ContinuumWorld {
             fractured_frac: frac_ratio,
             momentum: mom,
         });
+    }
+
+    /// Recompute summary counters after direct live-canvas mutations.
+    pub fn recount_status(&mut self) {
+        let mut melted = 0usize;
+        let mut detonated = 0usize;
+        let mut fractured = 0usize;
+        for i in 0..self.pos.len() {
+            let m = self.mat[i].props();
+            if self.temp[i] >= m.melt_temp {
+                melted += 1;
+            }
+            if self.det_state[i] == 2 {
+                detonated += 1;
+            } else if self.damage[i] >= 0.70 {
+                fractured += 1;
+            }
+        }
+        self.melted_count = melted;
+        self.detonated_count = detonated;
+        self.fractured_count = fractured;
+    }
+
+    /// Compact all 28 per-particle SoA buffers using `keep(old_idx)` and return old->new index map.
+    pub fn retain_particles<F>(&mut self, mut keep: F) -> (usize, Vec<Option<usize>>)
+    where
+        F: FnMut(usize) -> bool,
+    {
+        let n = self.pos.len();
+        self.grav_acc.resize(n, Vec2::ZERO);
+        self.step_scratch.resize(n, ContinuumStepOut::default());
+        self.grid_next.resize(n, -1);
+        let mut map = vec![None; n];
+        let mut w = 0usize;
+        for (i, slot) in map.iter_mut().enumerate().take(n) {
+            if keep(i) {
+                *slot = Some(w);
+                if w != i {
+                    self.pos[w] = self.pos[i];
+                    self.vel[w] = self.vel[i];
+                    self.acc[w] = self.acc[i];
+                    self.grav_acc[w] = self.grav_acc[i];
+                    self.xsph_dv[w] = self.xsph_dv[i];
+                    self.mass[w] = self.mass[i];
+                    self.rho0[w] = self.rho0[i];
+                    self.rho[w] = self.rho[i];
+                    self.s_xx[w] = self.s_xx[i];
+                    self.s_yy[w] = self.s_yy[i];
+                    self.s_xy[w] = self.s_xy[i];
+                    self.sph_pressure[w] = self.sph_pressure[i];
+                    self.net_pressure[w] = self.net_pressure[i];
+                    self.energy[w] = self.energy[i];
+                    self.temp[w] = self.temp[i];
+                    self.plastic_strain[w] = self.plastic_strain[i];
+                    self.damage[w] = self.damage[i];
+                    self.shock_rate[w] = self.shock_rate[i];
+                    self.mat[w] = self.mat[i];
+                    self.body_id[w] = self.body_id[i];
+                    self.det_state[w] = self.det_state[i];
+                    self.det_timer[w] = self.det_timer[i];
+                    self.det_age[w] = self.det_age[i];
+                    self.crumb_angle[w] = self.crumb_angle[i];
+                    self.crumb_spin[w] = self.crumb_spin[i];
+                    self.crumb_seed[w] = self.crumb_seed[i];
+                    self.step_scratch[w] = self.step_scratch[i];
+                    self.grid_next[w] = self.grid_next[i];
+                }
+                w += 1;
+            }
+        }
+        let removed = n - w;
+        if removed > 0 {
+            self.pos.truncate(w);
+            self.vel.truncate(w);
+            self.acc.truncate(w);
+            self.grav_acc.truncate(w);
+            self.xsph_dv.truncate(w);
+            self.mass.truncate(w);
+            self.rho0.truncate(w);
+            self.rho.truncate(w);
+            self.s_xx.truncate(w);
+            self.s_yy.truncate(w);
+            self.s_xy.truncate(w);
+            self.sph_pressure.truncate(w);
+            self.net_pressure.truncate(w);
+            self.energy.truncate(w);
+            self.temp.truncate(w);
+            self.plastic_strain.truncate(w);
+            self.damage.truncate(w);
+            self.shock_rate.truncate(w);
+            self.mat.truncate(w);
+            self.body_id.truncate(w);
+            self.det_state.truncate(w);
+            self.det_timer.truncate(w);
+            self.det_age.truncate(w);
+            self.crumb_angle.truncate(w);
+            self.crumb_spin.truncate(w);
+            self.crumb_seed.truncate(w);
+            self.step_scratch.truncate(w);
+            self.grid_next.truncate(w);
+            self.recount_status();
+            self.gpu_dirty = true;
+            self.state_epoch = self.state_epoch.wrapping_add(1);
+        }
+        (removed, map)
+    }
+
+    /// Paint non-overlapping honeycomb continuum particles inside a disc.
+    pub fn paint_matter_disc(
+        &mut self,
+        center: Vec2,
+        radius: f32,
+        mat: MaterialId,
+        vel: Vec2,
+        temp_override: Option<f32>,
+        body_id: u16,
+    ) -> usize {
+        const MAX_PAINT_TOTAL: usize = 190_000;
+        let r = radius.max(0.5 * self.dx);
+        let dx = self.dx.max(0.05);
+        let row_dy = dx * 0.866_025_4;
+        let min_sep2 = (0.76 * dx) * (0.76 * dx);
+        let r2 = r * r;
+
+        self.rebuild_spatial_grid();
+        let inv_cell = 1.0 / self.grid_cell_size.max(1e-4);
+        let mask = self.grid_mask;
+
+        let nx = (r / dx).ceil() as i32;
+        let ny = (r / row_dy).ceil() as i32;
+        let base_gx = (center.x / dx).round();
+        let base_gy = (center.y / row_dy).round();
+        let mut added = 0usize;
+
+        'outer: for iy in -ny..=ny {
+            let gy_idx = base_gy as i32 + iy;
+            let py = gy_idx as f32 * row_dy;
+            let row_shift = if gy_idx & 1 != 0 { 0.5 * dx } else { 0.0 };
+            for ix in -nx..=nx {
+                if self.pos.len() >= MAX_PAINT_TOTAL {
+                    break 'outer;
+                }
+                let px = (base_gx as i32 + ix) as f32 * dx + row_shift;
+                let candidate = Vec2::new(px, py);
+                if (candidate - center).length_squared() > r2 {
+                    continue;
+                }
+
+                // Check existing particles + newly painted particles via spatial hash
+                let cx = (candidate.x * inv_cell).floor() as i32;
+                let cy = (candidate.y * inv_cell).floor() as i32;
+                let mut overlap = false;
+                'cell_check: for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        let bucket = Self::hash_cell(cx + ox, cy + oy, mask);
+                        let mut cur = self.grid_head[bucket];
+                        while cur >= 0 {
+                            let j = cur as usize;
+                            if (self.pos[j] - candidate).length_squared() < min_sep2 {
+                                overlap = true;
+                                break 'cell_check;
+                            }
+                            cur = self.grid_next[j];
+                        }
+                    }
+                }
+                if overlap {
+                    continue;
+                }
+
+                let idx = self.push_particle(candidate, vel, mat, body_id, temp_override);
+                let bucket = Self::hash_cell(cx, cy, mask);
+                if idx >= self.grid_next.len() {
+                    self.grid_next.resize(idx + 1, -1);
+                }
+                self.grid_next[idx] = self.grid_head[bucket];
+                self.grid_head[bucket] = idx as i32;
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.recount_status();
+            self.gpu_dirty = true;
+            self.state_epoch = self.state_epoch.wrapping_add(1);
+        }
+        added
+    }
+
+    /// Erase particles inside a circular void brush and return `(removed, old_to_new)`.
+    pub fn erase_matter_disc(&mut self, center: Vec2, radius: f32) -> (usize, Vec<Option<usize>>) {
+        let r2 = (radius.max(0.25 * self.dx)).powi(2);
+        let keep: Vec<bool> = self
+            .pos
+            .iter()
+            .map(|&p| (p - center).length_squared() > r2)
+            .collect();
+        self.retain_particles(|i| keep[i])
+    }
+
+    /// Raycast an ablation thermal laser from `origin` along `dir`, halting at the front solid surface.
+    pub fn apply_thermal_laser(
+        &mut self,
+        origin: Vec2,
+        dir: Vec2,
+        beam_radius: f32,
+        power_mult: f32,
+        dt_eff: f32,
+    ) -> Option<Vec2> {
+        let n = self.pos.len();
+        if n == 0 {
+            return None;
+        }
+        let d_hat = dir.normalize_or(Vec2::X);
+        let perp_hat = Vec2::new(-d_hat.y, d_hat.x);
+        let rad = beam_radius.max(0.75 * self.dx);
+        let hit_slab = rad + 0.55 * self.dx;
+
+        let mut min_t = f32::INFINITY;
+        for i in 0..n {
+            if self.det_state[i] == 2 {
+                continue;
+            }
+            let rel = self.pos[i] - origin;
+            let t = rel.dot(d_hat);
+            if t < 0.0 {
+                continue;
+            }
+            let perp = rel.dot(perp_hat).abs();
+            if perp <= hit_slab && t < min_t {
+                min_t = t;
+            }
+        }
+        if !min_t.is_finite() {
+            return None;
+        }
+
+        let depth_cap = min_t + 1.65 * rad;
+        let step_scale = power_mult.max(0.1) * dt_eff.max(0.02);
+        let mut hit_sum = Vec2::ZERO;
+        let mut hit_w = 0.0f32;
+
+        for i in 0..n {
+            if self.det_state[i] == 2 {
+                continue;
+            }
+            let rel = self.pos[i] - origin;
+            let t = rel.dot(d_hat);
+            if t < min_t - 0.65 * self.dx || t > depth_cap {
+                continue;
+            }
+            let perp = rel.dot(perp_hat).abs();
+            if perp > hit_slab {
+                continue;
+            }
+            let radial_falloff = (1.0 - (perp / hit_slab).powi(2)).clamp(0.12, 1.0);
+            let depth_falloff =
+                (1.0 - ((t - min_t).max(0.0) / (depth_cap - min_t).max(0.1))).clamp(0.15, 1.0);
+            let w = radial_falloff * depth_falloff;
+
+            let m = self.mat[i].props();
+            let e_add = 0.055 * step_scale * w;
+            self.energy[i] += e_add;
+            self.temp[i] = (self.temp[i] + e_add / m.cv.max(1e-7)).clamp(50.0, 24_000.0);
+            self.damage[i] = (self.damage[i] + 0.14 * step_scale * w).min(1.0);
+            self.shock_rate[i] += 0.25 * w;
+            self.vel[i] += d_hat * (0.006 * step_scale * w / m.rho0.max(0.4));
+
+            if m.category == crate::materials::MaterialCategory::ExplosivesFuzes
+                && m.detonation_vel > 0.0
+                && self.det_state[i] == 0
+                && self.temp[i] >= m.melt_temp.max(460.0)
+            {
+                self.det_state[i] = 1;
+                self.det_timer[i] = 0.015;
+            }
+            hit_sum += self.pos[i] * w;
+            hit_w += w;
+        }
+
+        if hit_w > 0.0 {
+            self.recount_status();
+            self.gpu_dirty = true;
+            self.state_epoch = self.state_epoch.wrapping_add(1);
+            Some(hit_sum / hit_w)
+        } else {
+            None
+        }
+    }
+
+    /// Apply a softened 2D gravity-well or repulsor vortex centered at `center`.
+    pub fn apply_gravity_well(&mut self, center: Vec2, strength: f32, swirl: f32, dt_eff: f32) {
+        let n = self.pos.len();
+        if n == 0 {
+            return;
+        }
+        let soft = 2.8 * self.dx.max(0.1);
+        let scale = dt_eff.max(0.015);
+        let pos_ref = &self.pos;
+        self.vel.par_iter_mut().enumerate().for_each(|(i, vel)| {
+            let d = center - pos_ref[i];
+            let r = (d.length_squared() + soft * soft).sqrt();
+            let n_hat = d / r;
+            let t_hat = Vec2::new(-n_hat.y, n_hat.x);
+            let a = n_hat * (strength / (r + soft)) + t_hat * (swirl / (r + 1.25 * soft));
+            let dv = (a * scale).clamp_length_max(1.25);
+            *vel += dv;
+        });
+        self.gpu_dirty = true;
+        self.state_epoch = self.state_epoch.wrapping_add(1);
+    }
+
+    /// Detonate an instantaneous radial shockwave + thermal flash over `radius`.
+    pub fn trigger_shock_blast(
+        &mut self,
+        center: Vec2,
+        radius: f32,
+        peak_vel: f32,
+        peak_temp_k: f32,
+    ) -> usize {
+        let r_max = radius.max(self.dx);
+        let r2_max = r_max * r_max;
+        let mut hit = 0usize;
+        for i in 0..self.pos.len() {
+            let d = self.pos[i] - center;
+            let r2 = d.length_squared();
+            if r2 > r2_max {
+                continue;
+            }
+            let r = r2.sqrt();
+            let f = (1.0 - r / r_max).clamp(0.0, 1.0).powf(1.25);
+            let dir = if r > 1e-4 { d / r } else { Vec2::X };
+            let m = self.mat[i].props();
+
+            self.vel[i] += dir * (peak_vel * f / m.rho0.sqrt().max(0.55));
+            let d_temp = (peak_temp_k - self.temp[i]).max(0.0) * f;
+            self.energy[i] += d_temp * m.cv;
+            self.temp[i] = (self.temp[i] + d_temp).clamp(50.0, 24_000.0);
+            self.shock_rate[i] += 1.4 * f;
+            self.damage[i] = (self.damage[i] + 0.90 * f * f).min(1.0);
+            if m.category == crate::materials::MaterialCategory::ExplosivesFuzes
+                && m.detonation_vel > 0.0
+                && self.det_state[i] == 0
+            {
+                self.det_state[i] = 1;
+                self.det_timer[i] = 0.01;
+            }
+            hit += 1;
+        }
+        if hit > 0 {
+            self.recount_status();
+            self.gpu_dirty = true;
+            self.state_epoch = self.state_epoch.wrapping_add(1);
+        }
+        hit
     }
 }

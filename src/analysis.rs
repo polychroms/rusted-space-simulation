@@ -185,6 +185,17 @@ impl GaugeBank {
         self.record_now(world);
     }
 
+    pub fn remap_indices(&mut self, old_to_new: &[Option<usize>]) {
+        self.gauges.retain_mut(|g| {
+            if let Some(&Some(new_idx)) = old_to_new.get(g.particle_idx) {
+                g.particle_idx = new_idx;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
     pub fn toggle_or_pin_at(&mut self, world: &ContinuumWorld, world_p: Vec2) -> Option<String> {
         if world.len() == 0 {
             return None;

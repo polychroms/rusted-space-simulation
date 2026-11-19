@@ -52,6 +52,61 @@ enum SimPhase {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActiveTool {
+    Interact,
+    BrushMatter,
+    EraseMatter,
+    ThermalLaser,
+    GravityVortex,
+    ShockBlast,
+}
+
+impl ActiveTool {
+    const ALL: [ActiveTool; 6] = [
+        ActiveTool::Interact,
+        ActiveTool::BrushMatter,
+        ActiveTool::EraseMatter,
+        ActiveTool::ThermalLaser,
+        ActiveTool::GravityVortex,
+        ActiveTool::ShockBlast,
+    ];
+
+    fn short_label(self) -> &'static str {
+        match self {
+            Self::Interact => "⌖ Interact (Q)",
+            Self::BrushMatter => "🖌 Brush (B)",
+            Self::EraseMatter => "🧹 Erase (E)",
+            Self::ThermalLaser => "🔥 Laser (L)",
+            Self::GravityVortex => "🌀 Gravity (G)",
+            Self::ShockBlast => "💥 Blast (X)",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CameraTrackMode {
+    Free,
+    FollowFastest,
+    FollowCom,
+}
+
+impl CameraTrackMode {
+    const ALL: [CameraTrackMode; 3] = [
+        CameraTrackMode::Free,
+        CameraTrackMode::FollowFastest,
+        CameraTrackMode::FollowCom,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Free => "Free",
+            Self::FollowFastest => "Fastest Core",
+            Self::FollowCom => "System CoM",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TargetBuildShape {
     Line,
     Rectangle,
@@ -150,6 +205,14 @@ enum CanvasDrag {
         start: Vec2,
     },
     PanCamera,
+    UseToolBrush {
+        body_id: u16,
+    },
+    UseToolErase,
+    UseToolLaser,
+    UseToolGravity {
+        repel: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -224,8 +287,28 @@ struct RustedSpaceSimApp {
     proj_template: ProjectileSpec,
     live_fire_speed_mult: f32,
 
-    // Active canvas drag
+    // Active canvas drag & live interactive physics tools
     canvas_drag: Option<CanvasDrag>,
+    active_tool: ActiveTool,
+    tool_radius: f32,
+    brush_mat: MaterialId,
+    brush_temp_k: f32,
+    laser_power: f32,
+    laser_angle_deg: f32,
+    gravity_strength: f32,
+    gravity_swirl: f32,
+    blast_radius: f32,
+    blast_vel: f32,
+    last_laser_beam: Option<(Vec2, Vec2)>,
+    last_gravity_well: Option<(Vec2, bool)>,
+
+    // Cinematic Camera & Bullet-Time
+    camera_track: CameraTrackMode,
+    auto_slowmo: bool,
+    slowmo_timer: f32,
+    camera_shake_enabled: bool,
+    camera_shake: f32,
+    prev_detonated_count: usize,
 
     // Vulkan GPU Compute Accelerator
     vulkan_engine: Option<VulkanPhysicsEngine>,
@@ -319,6 +402,24 @@ impl RustedSpaceSimApp {
             ),
             live_fire_speed_mult: 1.0,
             canvas_drag: None,
+            active_tool: ActiveTool::Interact,
+            tool_radius: 3.5,
+            brush_mat: MaterialId::RhaSteel,
+            brush_temp_k: 293.0,
+            laser_power: 2.5,
+            laser_angle_deg: -25.0,
+            gravity_strength: 0.22,
+            gravity_swirl: 0.14,
+            blast_radius: 6.0,
+            blast_vel: 0.38,
+            last_laser_beam: None,
+            last_gravity_well: None,
+            camera_track: CameraTrackMode::Free,
+            auto_slowmo: false,
+            slowmo_timer: 0.0,
+            camera_shake_enabled: true,
+            camera_shake: 0.0,
+            prev_detonated_count: 0,
             vulkan_engine,
             vulkan_init_err,
             use_vulkan_gpu,
@@ -326,6 +427,113 @@ impl RustedSpaceSimApp {
             fps_smooth: 60.0,
             physics_ms: 0.0,
             render_ms: 0.0,
+        }
+    }
+
+    fn update_camera_tracking(&mut self, wall_dt: f32) {
+        if self.phase != SimPhase::Running
+            || self.paused
+            || matches!(self.canvas_drag, Some(CanvasDrag::PanCamera))
+            || self.camera_track == CameraTrackMode::Free
+            || self.world.len() == 0
+        {
+            return;
+        }
+        let target = match self.camera_track {
+            CameraTrackMode::Free => return,
+            CameraTrackMode::FollowCom => {
+                let mut tot_m = 0.0f32;
+                let mut com = Vec2::ZERO;
+                for i in 0..self.world.len() {
+                    if self.world.det_state[i] == 2 {
+                        continue;
+                    }
+                    let p = self.world.pos[i];
+                    if p.is_finite() {
+                        let m = self.world.mass[i];
+                        tot_m += m;
+                        com += p * m;
+                    }
+                }
+                if tot_m > 0.0 { Some(com / tot_m) } else { None }
+            }
+            CameraTrackMode::FollowFastest => {
+                let mut max_v2 = 0.0f32;
+                for i in 0..self.world.len() {
+                    if self.world.det_state[i] != 2 && self.world.pos[i].is_finite() {
+                        max_v2 = max_v2.max(self.world.vel[i].length_squared());
+                    }
+                }
+                let thresh2 = 0.25 * max_v2;
+                if max_v2 > 1e-6 {
+                    let mut tot_m = 0.0f32;
+                    let mut com = Vec2::ZERO;
+                    for i in 0..self.world.len() {
+                        if self.world.det_state[i] != 2
+                            && self.world.pos[i].is_finite()
+                            && self.world.vel[i].length_squared() >= thresh2
+                        {
+                            let m = self.world.mass[i];
+                            tot_m += m;
+                            com += self.world.pos[i] * m;
+                        }
+                    }
+                    if tot_m > 0.0 { Some(com / tot_m) } else { None }
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(tgt) = target {
+            let alpha = (wall_dt * 7.5).clamp(0.02, 0.55);
+            self.cam.center = self.cam.center.lerp(tgt, alpha);
+        }
+    }
+
+    fn apply_live_tool_continuous(&mut self, world_p: Vec2) {
+        let dt_eff = self.world.compute_cfl_dt().max(0.02) * 2.5;
+        match self.canvas_drag {
+            Some(CanvasDrag::UseToolBrush { body_id }) => {
+                self.timeline.commit_branch(&mut self.world);
+                self.world.paint_matter_disc(
+                    world_p,
+                    self.tool_radius,
+                    self.brush_mat,
+                    Vec2::ZERO,
+                    Some(self.brush_temp_k),
+                    body_id,
+                );
+            }
+            Some(CanvasDrag::UseToolErase) => {
+                self.timeline.commit_branch(&mut self.world);
+                let (removed, remap) = self.world.erase_matter_disc(world_p, self.tool_radius);
+                if removed > 0 {
+                    self.gauges.remap_indices(&remap);
+                }
+            }
+            Some(CanvasDrag::UseToolLaser) => {
+                self.timeline.commit_branch(&mut self.world);
+                let dir = Vec2::from_angle(self.laser_angle_deg.to_radians());
+                let origin = world_p - dir * 160.0;
+                let beam_r = (0.45 * self.tool_radius).max(0.55);
+                let hit = self
+                    .world
+                    .apply_thermal_laser(origin, dir, beam_r, self.laser_power, dt_eff);
+                let end = hit.unwrap_or_else(|| world_p + dir * 180.0);
+                self.last_laser_beam = Some((origin, end));
+            }
+            Some(CanvasDrag::UseToolGravity { repel }) => {
+                self.timeline.commit_branch(&mut self.world);
+                let strength = if repel {
+                    -self.gravity_strength
+                } else {
+                    self.gravity_strength
+                };
+                self.world
+                    .apply_gravity_well(world_p, strength, self.gravity_swirl, dt_eff);
+                self.last_gravity_well = Some((world_p, repel));
+            }
+            _ => {}
         }
     }
 
@@ -339,6 +547,7 @@ impl RustedSpaceSimApp {
                 vk.step_batch(&mut self.world, steps, dt);
                 self.gauges.record_now(&self.world);
                 self.timeline.maybe_record(&self.world);
+                self.check_cinematic_triggers();
                 return;
             }
         }
@@ -348,6 +557,26 @@ impl RustedSpaceSimApp {
         }
         self.gauges.record_now(&self.world);
         self.timeline.maybe_record(&self.world);
+        self.check_cinematic_triggers();
+    }
+
+    fn check_cinematic_triggers(&mut self) {
+        let new_det = self.world.detonated_count > self.prev_detonated_count + 3;
+        self.prev_detonated_count = self.world.detonated_count;
+        let peak_p = self
+            .world
+            .history
+            .last()
+            .map(|s| s.peak_pressure_gpa)
+            .unwrap_or(0.0);
+        if new_det || peak_p > 18.0 {
+            if self.auto_slowmo && self.slowmo_timer <= 0.05 {
+                self.slowmo_timer = 0.45;
+            }
+            if self.camera_shake_enabled && new_det {
+                self.camera_shake = (self.camera_shake + 0.35).min(0.85);
+            }
+        }
     }
 
     fn set_toast(&mut self, msg: impl Into<String>) {
@@ -596,6 +825,9 @@ impl RustedSpaceSimApp {
             self.rebuild_staging_world();
             self.phase = SimPhase::Running;
             self.paused = false;
+            self.prev_detonated_count = self.world.detonated_count;
+            self.slowmo_timer = 0.0;
+            self.camera_shake = 0.0;
             self.tab = WorkspaceTab::Simulation;
         } else {
             self.paused = !self.paused;
@@ -606,6 +838,11 @@ impl RustedSpaceSimApp {
         self.phase = SimPhase::Staging;
         self.paused = false;
         self.canvas_drag = None;
+        self.last_laser_beam = None;
+        self.last_gravity_well = None;
+        self.slowmo_timer = 0.0;
+        self.camera_shake = 0.0;
+        self.prev_detonated_count = 0;
         self.rebuild_staging_world();
     }
 
@@ -621,6 +858,11 @@ impl RustedSpaceSimApp {
         self.phase = SimPhase::Staging;
         self.paused = false;
         self.canvas_drag = None;
+        self.last_laser_beam = None;
+        self.last_gravity_well = None;
+        self.slowmo_timer = 0.0;
+        self.camera_shake = 0.0;
+        self.prev_detonated_count = 0;
         self.pending_drag_undo = None;
         self.ui_edit_baseline = None;
         self.gauges.clear();
@@ -843,6 +1085,30 @@ impl RustedSpaceSimApp {
                 self.delete_selected();
             }
             if !in_cad {
+                if inp.key_pressed(Key::Q) && !cmd {
+                    self.active_tool = ActiveTool::Interact;
+                }
+                if inp.key_pressed(Key::B) && !cmd {
+                    self.active_tool = ActiveTool::BrushMatter;
+                }
+                if inp.key_pressed(Key::E) && !cmd {
+                    self.active_tool = ActiveTool::EraseMatter;
+                }
+                if inp.key_pressed(Key::L) && !cmd {
+                    self.active_tool = ActiveTool::ThermalLaser;
+                }
+                if inp.key_pressed(Key::G) && !cmd {
+                    self.active_tool = ActiveTool::GravityVortex;
+                }
+                if inp.key_pressed(Key::X) && !cmd {
+                    self.active_tool = ActiveTool::ShockBlast;
+                }
+                if inp.key_pressed(Key::OpenBracket) {
+                    self.tool_radius = (self.tool_radius - 0.6).clamp(0.8, 22.0);
+                }
+                if inp.key_pressed(Key::CloseBracket) {
+                    self.tool_radius = (self.tool_radius + 0.6).clamp(0.8, 22.0);
+                }
                 if inp.key_pressed(Key::Num1) {
                     self.vis_mode = VisMode::MaterialThermal;
                 }
@@ -951,15 +1217,38 @@ impl eframe::App for RustedSpaceSimApp {
             self.fps_smooth = 0.90 * self.fps_smooth + 0.10 * (1.0 / wall_dt).min(240.0);
         }
 
+        self.last_laser_beam = None;
+        if !matches!(self.canvas_drag, Some(CanvasDrag::UseToolGravity { .. })) {
+            self.last_gravity_well = None;
+        }
+        if !self.paused {
+            if self.slowmo_timer > 0.0 {
+                self.slowmo_timer = (self.slowmo_timer - wall_dt).max(0.0);
+            }
+            if self.camera_shake > 0.015 {
+                self.camera_shake *= (-wall_dt * 11.0).exp();
+            } else {
+                self.camera_shake = 0.0;
+            }
+        } else {
+            self.camera_shake = 0.0;
+        }
+
         self.handle_hotkeys(ctx);
 
         // Advance continuum physics only in Running phase
         if self.phase == SimPhase::Running && !self.paused && self.world.len() > 0 {
             let t0 = Instant::now();
+            let slowmo_mult = if self.auto_slowmo && self.slowmo_timer > 0.0 {
+                0.22
+            } else {
+                1.0
+            };
+            let eff_scale = self.time_scale * slowmo_mult;
             let target_steps =
-                ((self.substeps_per_frame as f32 * self.time_scale).round() as usize).max(1);
-            let scale_rem = if self.substeps_per_frame as f32 * self.time_scale < 1.0 {
-                (self.substeps_per_frame as f32 * self.time_scale).clamp(0.05, 1.0)
+                ((self.substeps_per_frame as f32 * eff_scale).round() as usize).max(1);
+            let scale_rem = if self.substeps_per_frame as f32 * eff_scale < 1.0 {
+                (self.substeps_per_frame as f32 * eff_scale).clamp(0.05, 1.0)
             } else {
                 1.0
             };
@@ -970,6 +1259,7 @@ impl eframe::App for RustedSpaceSimApp {
         } else {
             self.physics_ms *= 0.9;
         }
+        self.update_camera_tracking(wall_dt.min(0.1));
 
         // --- TOP COMMAND & TABS BAR ---
         egui::TopBottomPanel::top("top_bar")
@@ -2017,6 +2307,64 @@ impl RustedSpaceSimApp {
             ui.add_space(6.0);
         }
 
+        ui.add_space(4.0);
+        ui.separator();
+
+        // --- Interactive Live Physics Tools (Q/B/E/L/G/X) ---
+        ui.label(
+            egui::RichText::new("LIVE INTERACTIVE TOOLS (Q/B/E/L/G/X)")
+                .strong()
+                .size(12.0)
+                .color(Color32::from_rgb(255, 200, 115)),
+        );
+        ui.horizontal_wrapped(|ui| {
+            for tool in ActiveTool::ALL {
+                ui.selectable_value(&mut self.active_tool, tool, tool.short_label());
+            }
+        });
+        match self.active_tool {
+            ActiveTool::Interact => {
+                ui.label(
+                    egui::RichText::new("Move/aim staging bodies or pan running canvas; Right-drag quick-fires projectile.")
+                        .size(10.5)
+                        .color(Color32::from_rgb(155, 175, 198)),
+                );
+            }
+            ActiveTool::BrushMatter => {
+                ui.add(egui::Slider::new(&mut self.tool_radius, 0.8..=20.0).text("Brush R (cm) [ / ]"));
+                material_combo(ui, "live_brush_mat", "Matter", &mut self.brush_mat);
+                ui.add(
+                    egui::Slider::new(&mut self.brush_temp_k, 100.0..=3500.0)
+                        .logarithmic(true)
+                        .text("Init Temp (K)"),
+                );
+            }
+            ActiveTool::EraseMatter => {
+                ui.add(egui::Slider::new(&mut self.tool_radius, 0.8..=22.0).text("Eraser R (cm) [ / ]"));
+            }
+            ActiveTool::ThermalLaser => {
+                ui.add(egui::Slider::new(&mut self.tool_radius, 0.8..=14.0).text("Beam Waist (cm)"));
+                ui.add(egui::Slider::new(&mut self.laser_power, 0.4..=8.0).text("Power ×"));
+                ui.add(egui::Slider::new(&mut self.laser_angle_deg, -180.0..=180.0).text("Incidence °"));
+            }
+            ActiveTool::GravityVortex => {
+                ui.add(egui::Slider::new(&mut self.gravity_strength, 0.04..=1.2).text("Pull G-Force"));
+                ui.add(egui::Slider::new(&mut self.gravity_swirl, -0.6..=0.6).text("Vortex Swirl"));
+                ui.label(
+                    egui::RichText::new("Hold Shift + LMB to Repel (White Hole).")
+                        .size(10.5)
+                        .color(Color32::from_rgb(145, 210, 240)),
+                );
+            }
+            ActiveTool::ShockBlast => {
+                ui.add(egui::Slider::new(&mut self.blast_radius, 1.5..=24.0).text("Blast R (cm)"));
+                ui.add(egui::Slider::new(&mut self.blast_vel, 0.08..=1.2).text("Impulse cm/µs"));
+            }
+        }
+
+        ui.add_space(6.0);
+        ui.separator();
+
         // --- Visualization Modes ---
         ui.label(
             egui::RichText::new("VISUALIZATION MODE (Keys 1–8)")
@@ -2118,6 +2466,17 @@ impl RustedSpaceSimApp {
             "Flow Velocity Vectors (Key: V)",
         );
         ui.checkbox(&mut self.show_hud_graphs, "Show Shock & Energy Graphs");
+
+        ui.horizontal(|ui| {
+            ui.label("Cam Track:");
+            for mode in CameraTrackMode::ALL {
+                ui.selectable_value(&mut self.camera_track, mode, mode.label());
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.auto_slowmo, "Auto Bullet-Time");
+            ui.checkbox(&mut self.camera_shake_enabled, "Impact Shake");
+        });
 
         ui.add_space(6.0);
         ui.separator();
@@ -2252,6 +2611,54 @@ impl RustedSpaceSimApp {
             } else if left_pressed && self.caliper_mode {
                 self.caliper_line = Some((world_p, world_p));
                 self.canvas_drag = Some(CanvasDrag::MeasureCaliper { start: world_p });
+            } else if left_pressed && self.active_tool != ActiveTool::Interact {
+                if self.phase == SimPhase::Staging {
+                    self.phase = SimPhase::Running;
+                    self.paused = matches!(
+                        self.active_tool,
+                        ActiveTool::BrushMatter | ActiveTool::EraseMatter
+                    );
+                    self.prev_detonated_count = self.world.detonated_count;
+                }
+                match self.active_tool {
+                    ActiveTool::BrushMatter => {
+                        let bid = self.world.alloc_body_id();
+                        self.canvas_drag = Some(CanvasDrag::UseToolBrush { body_id: bid });
+                        self.apply_live_tool_continuous(world_p);
+                    }
+                    ActiveTool::EraseMatter => {
+                        self.canvas_drag = Some(CanvasDrag::UseToolErase);
+                        self.apply_live_tool_continuous(world_p);
+                    }
+                    ActiveTool::ThermalLaser => {
+                        self.canvas_drag = Some(CanvasDrag::UseToolLaser);
+                        self.apply_live_tool_continuous(world_p);
+                    }
+                    ActiveTool::GravityVortex => {
+                        let repel = ctx.input(|i| i.modifiers.shift);
+                        self.canvas_drag = Some(CanvasDrag::UseToolGravity { repel });
+                        self.apply_live_tool_continuous(world_p);
+                    }
+                    ActiveTool::ShockBlast => {
+                        self.timeline.commit_branch(&mut self.world);
+                        let hit = self.world.trigger_shock_blast(
+                            world_p,
+                            self.blast_radius,
+                            self.blast_vel,
+                            4800.0,
+                        );
+                        if hit > 0 {
+                            if self.camera_shake_enabled && !self.paused {
+                                self.camera_shake = (self.camera_shake + 0.45).min(0.90);
+                            }
+                            if self.auto_slowmo {
+                                self.slowmo_timer = 0.45;
+                            }
+                            self.gauges.record_now(&self.world);
+                        }
+                    }
+                    ActiveTool::Interact => {}
+                }
             } else if left_pressed && self.phase == SimPhase::Staging {
                 let handle_tol = (14.0 / self.cam.zoom).max(2.2);
                 let mut picked_handle = None;
@@ -2450,6 +2857,23 @@ impl RustedSpaceSimApp {
                         self.canvas_drag = None;
                     }
                 }
+                Some(CanvasDrag::UseToolBrush { .. })
+                | Some(CanvasDrag::UseToolErase)
+                | Some(CanvasDrag::UseToolLaser)
+                | Some(CanvasDrag::UseToolGravity { .. }) => {
+                    if let CanvasDrag::UseToolGravity { .. } =
+                        self.canvas_drag.expect("checked match")
+                    {
+                        let repel = ctx.input(|i| i.modifiers.shift);
+                        self.canvas_drag = Some(CanvasDrag::UseToolGravity { repel });
+                    }
+                    if left_released {
+                        self.canvas_drag = None;
+                        self.last_gravity_well = None;
+                    } else if ctx.input(|i| i.pointer.button_down(PointerButton::Primary)) {
+                        self.apply_live_tool_continuous(world_p);
+                    }
+                }
                 Some(CanvasDrag::PanCamera) if left_released || right_released => {
                     self.canvas_drag = None;
                 }
@@ -2462,15 +2886,24 @@ impl RustedSpaceSimApp {
         let rw = (vp_w.round() as usize).clamp(64, 4096);
         let rh = (vp_h.round() as usize).clamp(64, 2560);
         let trails_active = self.motion_trails && self.phase == SimPhase::Running && !self.paused;
+        let mut render_cam = self.cam;
+        if !self.paused && self.camera_shake > 0.015 {
+            let phase = (self.world.time_us * 1.37 + self.world.step_count as f32 * 0.71) % 62.83;
+            let amp = (self.camera_shake * 10.0 / self.cam.zoom.max(0.25)).min(3.5);
+            render_cam.center += Vec2::new(
+                (phase * 1.7).sin() * amp,
+                (phase * 2.3 + 1.1).cos() * amp,
+            );
+        }
         let render_key = ViewportRenderKey {
             world_id: self.world.world_id,
             state_epoch: self.world.state_epoch,
             world_len: self.world.len(),
             width: rw,
             height: rh,
-            center_x_bits: self.cam.center.x.to_bits(),
-            center_y_bits: self.cam.center.y.to_bits(),
-            zoom_bits: self.cam.zoom.to_bits(),
+            center_x_bits: render_cam.center.x.to_bits(),
+            center_y_bits: render_cam.center.y.to_bits(),
+            zoom_bits: render_cam.zoom.to_bits(),
             vis_mode: self.vis_mode,
             trails_active,
             show_starfield: self.show_starfield,
@@ -2480,7 +2913,7 @@ impl RustedSpaceSimApp {
             let t_ren = Instant::now();
             self.canvas.render_with_opts(
                 &self.world,
-                &self.cam,
+                &render_cam,
                 rw,
                 rh,
                 self.vis_mode,
@@ -2690,6 +3123,85 @@ impl RustedSpaceSimApp {
         // Live Telemetry Charts
         if self.show_hud_graphs && self.world.history.len() >= 2 {
             draw_telemetry_hud(&painter, rect, &self.world);
+        }
+
+        // Interactive live-tool canvas gizmos (laser beam, gravity vortex rings, brush/erase/blast radius)
+        if let Some((a, b)) = self.last_laser_beam {
+            let sa = self.cam.world_to_screen(a, vp_w, vp_h);
+            let sb = self.cam.world_to_screen(b, vp_w, vp_h);
+            let p0 = Pos2::new(rect.min.x + sa.x, rect.min.y + sa.y);
+            let p1 = Pos2::new(rect.min.x + sb.x, rect.min.y + sb.y);
+            let core_w = (0.35 * self.tool_radius * self.cam.zoom).clamp(1.6, 12.0);
+            painter.line_segment(
+                [p0, p1],
+                Stroke::new(core_w * 2.4, Color32::from_rgba_unmultiplied(255, 75, 28, 90)),
+            );
+            painter.line_segment(
+                [p0, p1],
+                Stroke::new(core_w * 1.15, Color32::from_rgba_unmultiplied(255, 195, 80, 195)),
+            );
+            painter.line_segment([p0, p1], Stroke::new((core_w * 0.45).max(1.2), Color32::WHITE));
+            painter.circle_filled(p1, core_w * 1.6, Color32::from_rgba_unmultiplied(255, 160, 60, 160));
+            painter.circle_filled(p1, (core_w * 0.7).max(2.0), Color32::WHITE);
+        }
+        if let Some((gc, repel)) = self.last_gravity_well {
+            let gs = self.cam.world_to_screen(gc, vp_w, vp_h);
+            let gp = Pos2::new(rect.min.x + gs.x, rect.min.y + gs.y);
+            let col = if repel {
+                Color32::from_rgba_unmultiplied(120, 235, 255, 185)
+            } else {
+                Color32::from_rgba_unmultiplied(200, 120, 255, 185)
+            };
+            for ring in [18.0, 34.0, 52.0] {
+                painter.circle_stroke(gp, ring, Stroke::new(1.5_f32, col));
+            }
+            painter.circle_filled(gp, 4.5, Color32::WHITE);
+        }
+        if self.active_tool != ActiveTool::Interact && !self.caliper_mode {
+            if let Some(hp) = response.hover_pos() {
+                let (rad_w, ring_col) = match self.active_tool {
+                    ActiveTool::BrushMatter => (
+                        self.tool_radius,
+                        Color32::from_rgba_unmultiplied(110, 235, 165, 200),
+                    ),
+                    ActiveTool::EraseMatter => (
+                        self.tool_radius,
+                        Color32::from_rgba_unmultiplied(255, 110, 110, 210),
+                    ),
+                    ActiveTool::ThermalLaser => (
+                        0.45 * self.tool_radius,
+                        Color32::from_rgba_unmultiplied(255, 170, 65, 210),
+                    ),
+                    ActiveTool::GravityVortex => (
+                        3.5,
+                        Color32::from_rgba_unmultiplied(185, 130, 255, 200),
+                    ),
+                    ActiveTool::ShockBlast => (
+                        self.blast_radius,
+                        Color32::from_rgba_unmultiplied(255, 95, 45, 215),
+                    ),
+                    ActiveTool::Interact => (1.0, Color32::TRANSPARENT),
+                };
+                painter.circle_stroke(hp, (rad_w * self.cam.zoom).max(4.0), Stroke::new(1.5_f32, ring_col));
+            }
+        }
+        if self.auto_slowmo && self.slowmo_timer > 0.0 && !self.paused {
+            let pill = Rect::from_center_size(
+                Pos2::new(rect.center().x, rect.min.y + 48.0),
+                EguiVec2::new(180.0, 22.0),
+            );
+            painter.rect_filled(
+                pill,
+                CornerRadius::same(11),
+                Color32::from_rgba_unmultiplied(18, 42, 65, 220),
+            );
+            painter.text(
+                pill.center(),
+                Align2::CENTER_CENTER,
+                "⏱ BULLET-TIME 0.22×",
+                FontId::monospace(11.0),
+                Color32::from_rgb(125, 235, 255),
+            );
         }
 
         // Transient status toast notification (PNG/CSV/Scene/Gauge actions)
@@ -3799,7 +4311,7 @@ fn run_headless_benchmark() {
 
 fn print_help() {
     println!(
-        "Rusted Space Simulation (rssim) v0.0.4
+        "Rusted Space Simulation (rssim) v0.0.5
 Vulkan GPU-Accelerated Continuum Elasto-Plastic, Reactive Detonation & Planetary Hydrocode
 (Mie-Gruneisen + JWL EOS + CSPM Renormalization + Johnson-Cook Viscoplasticity + 32x32 LDS Self-Gravity)
 
