@@ -1,0 +1,65 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+struct Particle {
+    vec4 pos_vel;
+    vec4 acc_xsph;
+    vec4 thermo;
+    vec4 stress;
+    vec4 mech;
+    vec4 det_aux;
+    vec4 grav_pad;
+    uvec4 meta;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer ParticleBuf {
+    Particle particles[];
+};
+
+layout(std430, set = 0, binding = 5) buffer GravGridBuf {
+    ivec4 grav_cells[];
+};
+
+layout(push_constant) uniform PushConsts {
+    uint num_particles;
+    uint step_index;
+    float dt;
+    float dx;
+    float h;
+    float cutoff;
+    float grid_cell_size;
+    float down_gravity;
+    vec4 grav_domain; // x: min_x, y: min_y, z: span, w: grav_g
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.num_particles) {
+        return;
+    }
+
+    vec2 pos = particles[i].pos_vel.xy;
+    float mass = particles[i].mech.w;
+    if (mass <= 0.0) {
+        return;
+    }
+
+    float span = max(pc.grav_domain.z, 1.0);
+    vec2 u = clamp((pos - pc.grav_domain.xy) / span, vec2(0.0), vec2(0.999999));
+    float gx_f = u.x * 32.0;
+    float gy_f = u.y * 32.0;
+    int gx = clamp(int(floor(gx_f)), 0, 31);
+    int gy = clamp(int(floor(gy_f)), 0, 31);
+    uint cid = uint(gy * 32 + gx);
+
+    float fx = clamp(gx_f - float(gx), 0.0, 1.0);
+    float fy = clamp(gy_f - float(gy), 0.0, 1.0);
+
+    int m_fp = int(round(mass * 2048.0));
+    if (m_fp > 0) {
+        atomicAdd(grav_cells[cid].x, m_fp);
+        atomicAdd(grav_cells[cid].y, int(round(float(m_fp) * fx)));
+        atomicAdd(grav_cells[cid].z, int(round(float(m_fp) * fy)));
+    }
+}

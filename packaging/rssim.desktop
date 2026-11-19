@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Rusted Space Simulation
+GenericName=Shock & Continuum Physics Simulator
+Comment=Vulkan GPU Continuum Elasto-Plastic & Reactive Shock Physics Simulator
+Exec=rssim
+Icon=rssim
+Categories=Science;Physics;Simulation;
+Terminal=false

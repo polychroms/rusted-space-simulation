@@ -1,0 +1,22 @@
+[package]
+name = "rssim"
+version = "0.3.0"
+edition = "2021"
+description = "Rusted Space Simulation — Vulkan GPU Continuum Elasto-Plastic & Reactive Shock Physics Simulator"
+
+[[bin]]
+name = "rssim"
+path = "src/main.rs"
+
+[dependencies]
+ash = "0.38"
+eframe = "0.31.1"
+glam = "0.30.10"
+rayon = "1.12.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = false

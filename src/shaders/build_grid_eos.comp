@@ -1,0 +1,135 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+struct Particle {
+    vec4 pos_vel;   // x, y, vx, vy
+    vec4 acc_xsph;  // ax, ay, xsph_x, xsph_y
+    vec4 thermo;    // rho, rho0, energy, temp
+    vec4 stress;    // s_xx, s_yy, s_xy, sph_pressure
+    vec4 mech;      // plastic_strain, damage, net_pressure, mass
+    vec4 det_aux;   // det_timer, det_age, shock_rate, crumb_angle
+    vec4 grav_pad;  // grav_x, grav_y, crumb_spin, pad
+    uvec4 meta;     // mat_id, body_id, det_state, crumb_seed
+};
+
+struct Material {
+    vec4 eos;       // rho0, c0, hugoniot_s, gamma0
+    vec4 strength;  // shear_mod, yield_strength, hardening, pressure_hardening
+    vec4 fracture;  // spall_strength, fracture_strain, melt_temp, cv
+    vec4 energetic; // detonation_vel, detonation_energy, initiation_pressure, delay_us
+    vec4 flags;     // friction, is_energetic, is_ductile, youngs_mod
+    vec4 jwl_ab;    // jwl_a, jwl_b, jwl_r1, jwl_r2
+    vec4 jc_jwl;    // jwl_omega, jc_rate_c, thermal_m, poisson_nu
+};
+
+layout(std430, set = 0, binding = 0) buffer ParticleBuf {
+    Particle particles[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer MaterialBuf {
+    Material materials[24];
+};
+
+layout(std430, set = 0, binding = 3) buffer GridHeadBuf {
+    int grid_head[];
+};
+
+layout(std430, set = 0, binding = 4) buffer GridNextBuf {
+    int grid_next[];
+};
+
+layout(push_constant) uniform PushConsts {
+    uint num_particles;
+    uint step_index;
+    float dt;
+    float dx;
+    float h;
+    float cutoff;
+    float grid_cell_size;
+    float down_gravity;
+    vec4 grav_domain;
+} pc;
+
+uint hash_cell(int cx, int cy) {
+    uint ux = uint(cx) * 0x9E3779B1u;
+    uint uy = uint(cy) * 0x85EBCA77u;
+    uint hv = ux ^ (uy + 0xC2B2AE3Du + (ux << 6) + (ux >> 2));
+    return hv & 131071u;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.num_particles) {
+        return;
+    }
+
+    Particle p = particles[i];
+    vec2 pos = p.pos_vel.xy;
+    vec2 vel = p.pos_vel.zw;
+
+    // Velocity-Verlet first half-kick + XSPH drift
+    if (pc.step_index > 0u) {
+        vel += 0.5 * pc.dt * p.acc_xsph.xy;
+        pos += pc.dt * (vel + p.acc_xsph.zw);
+        p.pos_vel = vec4(pos, vel);
+    }
+
+    // Lock-free 131K-bucket spatial hash grid insertion
+    int cx = int(floor(pos.x / pc.grid_cell_size));
+    int cy = int(floor(pos.y / pc.grid_cell_size));
+    uint bucket = hash_cell(cx, cy);
+    grid_next[i] = atomicExchange(grid_head[bucket], int(i));
+
+    // Equation of State: Polynomial Mie-Gruneisen Solid or Programmed-Burn JWL Detonation Gas
+    uint mat_id = min(p.meta.x, 23u);
+    Material m = materials[mat_id];
+    float rho = p.thermo.x;
+    float rho0 = max(p.thermo.y, 1e-4);
+    float e = p.thermo.z;
+    float temp = p.thermo.w;
+    uint det_state = p.meta.z;
+
+    float sph_p = 0.0;
+    if (det_state == 2u) {
+        // Jones-Wilkins-Lee (JWL) Detonation Products EOS:
+        // P(V, e) = A*(1 - w/(R1*V))*exp(-R1*V) + B*(1 - w/(R2*V))*exp(-R2*V) + w*rho*e
+        float v_rel = clamp(rho0 / max(rho, 1e-4), 0.52, 16.0);
+        float a = m.jwl_ab.x;
+        float b = m.jwl_ab.y;
+        float r1 = max(m.jwl_ab.z, 0.5);
+        float r2 = max(m.jwl_ab.w, 0.2);
+        float omega = m.jc_jwl.x;
+        float p_jwl = a * (1.0 - omega / (r1 * v_rel)) * exp(-r1 * v_rel)
+                    + b * (1.0 - omega / (r2 * v_rel)) * exp(-r2 * v_rel)
+                    + omega * rho * e;
+        sph_p = clamp(p_jwl, 0.0, 0.95);
+    } else {
+        float mu = clamp(rho / rho0 - 1.0, -0.16, 0.72);
+        float k1 = rho0 * m.eos.y * m.eos.y;
+        float p_cold;
+        if (mu >= 0.0) {
+            float s = m.eos.z;
+            float k2 = k1 * (2.0 * s - 1.0);
+            float k3 = k1 * s * (3.0 * s - 1.0);
+            p_cold = k1 * mu + k2 * mu * mu + k3 * mu * mu * mu;
+        } else {
+            p_cold = k1 * mu;
+        }
+        // Tillotson condensed-to-vapor Gruneisen transition:
+        // Condensed solids/liquids (e < e_vap) remain cohesive under free vacuum expansion (no fake vapor explosion at rho < rho0)
+        // while compressed shocks (rho >= rho0) & true vapor plumes (e >= e_vap) exert full thermal EOS pressure.
+        float e_vap = max(12.0 * m.fracture.w * max(m.fracture.z - 300.0, 200.0), 0.05);
+        float gamma_eff = 0.45 + (m.eos.w - 0.45) / (1.0 + max(e, 0.0) / e_vap);
+        float vapor_frac = clamp((e - 0.45 * e_vap) / (0.55 * e_vap), 0.0, 1.0);
+        float cond_expand_gate = (rho >= rho0) ? 1.0 : clamp((rho / rho0 - 0.92) / 0.08, 0.0, 1.0);
+        float p_th = gamma_eff * min(rho, rho0) * e * mix(cond_expand_gate, 1.0, vapor_frac);
+        float dmg = clamp(p.mech.y, 0.0, 1.0);
+        float melt_soft = clamp((temp - 300.0) / max(m.fracture.z - 300.0, 50.0), 0.0, 1.0);
+        float min_tens = -m.fracture.x * (1.0 - dmg) * (1.0 - melt_soft);
+        sph_p = clamp(p_cold + p_th, min_tens, 8.00);
+    }
+
+    p.stress.w = sph_p;
+    particles[i] = p;
+}

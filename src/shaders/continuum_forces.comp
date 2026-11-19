@@ -1,0 +1,430 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+struct Particle {
+    vec4 pos_vel;   // x, y, vx, vy
+    vec4 acc_xsph;  // ax, ay, xsph_x, xsph_y
+    vec4 thermo;    // rho, rho0, energy, temp
+    vec4 stress;    // s_xx, s_yy, s_xy, sph_pressure
+    vec4 mech;      // plastic_strain, damage, net_pressure, mass
+    vec4 det_aux;   // det_timer, det_age, shock_rate, crumb_angle
+    vec4 grav_pad;  // grav_x, grav_y, crumb_spin, pad
+    uvec4 meta;     // mat_id, body_id, det_state, crumb_seed
+};
+
+struct Material {
+    vec4 eos;       // rho0, c0, hugoniot_s, gamma0
+    vec4 strength;  // shear_mod, yield_strength, hardening, pressure_hardening
+    vec4 fracture;  // spall_strength, fracture_strain, melt_temp, cv
+    vec4 energetic; // detonation_vel, detonation_energy, initiation_pressure, delay_us
+    vec4 flags;     // friction, is_energetic, is_ductile, youngs_mod
+    vec4 jwl_ab;    // jwl_a, jwl_b, jwl_r1, jwl_r2
+    vec4 jc_jwl;    // jwl_omega, jc_rate_c, thermal_m, poisson_nu
+};
+
+struct ForceOut {
+    vec4 acc_xsph;  // ax, ay, xsph_x, xsph_y
+    vec4 rates;     // drho_dt, de_dt, shock_comp, symp_burn_dt
+    vec4 grad_v;    // dvx_dx, dvx_dy, dvy_dx, dvy_dy
+    vec4 stats;     // neighbors, fric_alpha, pad, pad
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer ParticleBuf {
+    Particle particles[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer MaterialBuf {
+    Material materials[24];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer ScratchBuf {
+    ForceOut scratch[];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer GridHeadBuf {
+    int grid_head[];
+};
+
+layout(std430, set = 0, binding = 4) readonly buffer GridNextBuf {
+    int grid_next[];
+};
+
+layout(push_constant) uniform PushConsts {
+    uint num_particles;
+    uint step_index;
+    float dt;
+    float dx;
+    float h;
+    float cutoff;
+    float grid_cell_size;
+    float down_gravity;
+    vec4 grav_domain;
+} pc;
+
+uint hash_cell(int cx, int cy) {
+    uint ux = uint(cx) * 0x9E3779B1u;
+    uint uy = uint(cy) * 0x85EBCA77u;
+    uint hv = ux ^ (uy + 0xC2B2AE3Du + (ux << 6) + (ux >> 2));
+    return hv & 131071u;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.num_particles) {
+        return;
+    }
+
+    Particle pi_p = particles[i];
+    vec2 pi = pi_p.pos_vel.xy;
+    vec2 vi = pi_p.pos_vel.zw;
+    float rho_i = pi_p.thermo.x;
+    float rho0_i = pi_p.thermo.y;
+    float temp_i = pi_p.thermo.w;
+    vec3 s_i_raw = pi_p.stress.xyz;
+    float press_i = pi_p.stress.w;
+    float dmg_i = clamp(pi_p.mech.y, 0.0, 1.0);
+    float mass_i = pi_p.mech.w;
+    uint mat_i = min(pi_p.meta.x, 23u);
+    uint body_i = pi_p.meta.y;
+    uint det_i = pi_p.meta.z;
+
+    Material m_i = materials[mat_i];
+    float ci = m_i.eos.y;
+    float z_i = (det_i == 2u) ? (rho_i * 0.22) : (rho_i * ci);
+    float melt_i = clamp((temp_i - 300.0) / max(m_i.fracture.z - 300.0, 50.0), 0.0, 1.0);
+    float intact_i = (det_i == 2u) ? 0.0 : (1.0 - dmg_i) * (1.0 - melt_i * sqrt(melt_i));
+    vec3 s_i = s_i_raw * intact_i;
+    float rho_i2 = max(rho_i * rho_i, 1e-6);
+
+    float cutoff = pc.cutoff;
+    float cutoff_sq = cutoff * cutoff;
+    float h2 = pc.h * pc.h;
+    float pi_c = 3.14159265359;
+    float w_norm = 7.0 / (pi_c * cutoff_sq);
+    float dw_norm = -140.0 / (pi_c * cutoff_sq * cutoff);
+    float q_ref = clamp(pc.dx / cutoff, 0.05, 0.95);
+    float omq_ref = 1.0 - q_ref;
+    float w_ref = max(w_norm * omq_ref * omq_ref * omq_ref * omq_ref * (1.0 + 4.0 * q_ref), 1e-6);
+    float d_contact = 0.88 * pc.dx;
+    // Compact solid contact hitbox: d_hit = 1.04*dx -> radius r_hit = 0.52*dx (smaller than visual crumb ~0.76*dx!).
+    // Cross-body & zero-gravity debris have strictly zero interaction for r >= d_hit;
+    // infalling same-body planetary rubble under active gravity uses d_rubble = 1.10*dx for mantle support.
+    float d_hit = 1.04 * pc.dx;
+    float d_rubble = 1.10 * pc.dx;
+    float d_core = 0.94 * pc.dx;
+    bool grav_active = (dot(pi_p.grav_pad.xy, pi_p.grav_pad.xy) > 1e-12) || (abs(pc.down_gravity) > 1e-6);
+
+    int cx = int(floor(pi.x / pc.grid_cell_size));
+    int cy = int(floor(pi.y / pc.grid_cell_size));
+
+    vec2 acc_i = vec2(0.0, -pc.down_gravity) + pi_p.grav_pad.xy;
+    vec2 xsph = vec2(0.0);
+    float drho = 0.0;
+    float de = 0.0;
+    float shock_comp = 0.0;
+    float symp_burn_dt = 0.0;
+    float fric_alpha = 0.0;
+    vec4 grad_v = vec4(0.0);
+    float c_drho = 0.0;
+    vec4 c_grad_v = vec4(0.0);
+    float c_w_sum = 0.0;
+    // Symmetric CSPM kernel renormalization moment matrix M = sum V_j (x_j - x_i) (x) grad_W
+    float m_xx = 0.0;
+    float m_xy = 0.0;
+    float m_yy = 0.0;
+    uint neighbors = 0u;
+    bool can_symp = (m_i.flags.y > 0.5) && (det_i == 0u);
+
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx_c = -1; dx_c <= 1; ++dx_c) {
+            uint bucket = hash_cell(cx + dx_c, cy + dy);
+            int j_idx = grid_head[bucket];
+            int guard = 0;
+            while (j_idx >= 0 && guard < 512) {
+                guard += 1;
+                uint j = uint(j_idx);
+                j_idx = grid_next[j];
+                if (j == i) {
+                    continue;
+                }
+
+                vec4 pv_j = particles[j].pos_vel;
+                vec2 xij = pi - pv_j.xy;
+                float r2 = dot(xij, xij);
+                if (r2 >= cutoff_sq || r2 < 1e-10) {
+                    continue;
+                }
+
+                float r = sqrt(r2);
+                vec2 nij = xij / r;
+                vec2 vj = pv_j.zw;
+                vec2 vij = vi - vj;
+                vec4 thermo_j = particles[j].thermo;
+                vec4 stress_j = particles[j].stress;
+                vec4 mech_j = particles[j].mech;
+                uvec4 meta_j = particles[j].meta;
+
+                float rho_j = thermo_j.x;
+                float rho0_j = thermo_j.y;
+                float temp_j = thermo_j.w;
+                float press_j = stress_j.w;
+                float dmg_j = clamp(mech_j.y, 0.0, 1.0);
+                float mj = mech_j.w;
+                uint mat_j = min(meta_j.x, 23u);
+                uint body_j = meta_j.y;
+                uint det_j = meta_j.z;
+                Material m_j = materials[mat_j];
+
+                // 1. Huygens sympathetic detonation wave + Direct-Contact Piezo ImpactFuze (mat == 22)
+                if (can_symp) {
+                    if (det_j == 2u && particles[j].det_aux.y < 4.0 && r < 2.25 * pc.dx) {
+                        // ImpactFuze (mat 22) does NOT prematurely jump across to DelayFuze without honoring pyrotechnic delay
+                        float arrival = max(r / max(m_i.energetic.x, 0.25), 0.015);
+                        if (symp_burn_dt == 0.0 || arrival < symp_burn_dt) {
+                            symp_burn_dt = arrival;
+                        }
+                    } else if (mat_i == 22u && body_i != body_j && det_j != 2u && r < 0.98 * pc.dx && length(vij) > 0.015) {
+                        symp_burn_dt = 0.015;
+                    }
+                }
+
+                float melt_j = clamp((temp_j - 300.0) / max(m_j.fracture.z - 300.0, 50.0), 0.0, 1.0);
+                float intact_j = (det_j == 2u) ? 0.0 : (1.0 - dmg_j) * (1.0 - melt_j * sqrt(melt_j));
+                float c_coh = (body_i == body_j && det_i != 2u && det_j != 2u) ? (intact_i * intact_j) : 0.0;
+
+                // REGIME C: Non-bonded solid, shattered debris, or molten-solid contact (c_coh <= 0.03, neither is HE gas)
+                // Cross-body & zero-gravity debris use strict hitbox r < d_hit = 1.00*dx (r_hit = 0.50*dx < visual crumb ~0.76*dx).
+                if (c_coh <= 0.03 && det_i != 2u && det_j != 2u) {
+                    float vn_pre = dot(vij, nij);
+                    float d_pair = d_hit;
+                    if (body_i == body_j) {
+                        if (melt_i > 0.65 && melt_j > 0.65) {
+                            d_pair = 1.22 * pc.dx;
+                        } else if (grav_active && vn_pre < -1e-4) {
+                            d_pair = d_rubble;
+                        }
+                    }
+                    if (r >= d_pair) {
+                        continue;
+                    }
+                    neighbors += 1u;
+                    float z_j = rho_j * m_j.eos.y;
+                    float w_visc_i = z_j / max(z_i + z_j, 1e-5);
+                    float cbar = 0.5 * (ci + m_j.eos.y);
+                    float ramp = clamp((d_pair - r) / (0.09 * pc.dx), 0.0, 1.0);
+                    float vn = vn_pre;
+                    float v_close = max(-vn, 0.0);
+                    float area_c = 0.94 * pc.dx;
+                    float z_sum = max(z_i + z_j, 1e-5);
+                    float z_eff = (z_i * z_j) / z_sum;
+                    float m_red = (mass_i * mj) / max(mass_i + mj, 1e-6);
+
+                    // Exact symmetric Acoustic-Riemann contact pressure P* (inelastic on separation vn > 0!)
+                    float p_i_pos = max(press_i, 0.0);
+                    float p_j_pos = max(press_j, 0.0);
+                    float p_eos_avg = (z_j * p_i_pos + z_i * p_j_pos) / z_sum;
+                    float p_riemann = max((z_j * p_i_pos + z_i * p_j_pos + z_i * z_j * (-vn)) / z_sum, 0.0);
+                    float p_quad = 0.0;
+                    if (v_close > 0.0) {
+                        float rho_red = (rho_i * rho_j) / max(rho_i + rho_j, 1e-5);
+                        float s_bar = 0.5 * (m_i.eos.z + m_j.eos.z);
+                        p_quad = 0.5 * rho_red * s_bar * v_close * v_close;
+                    }
+
+                    float f_eos_part = p_eos_avg * area_c * ramp;
+                    float f_visc_raw = (v_close > 0.0) ? ((z_eff * v_close + p_quad) * area_c * ramp) : 0.0;
+                    float f_visc_cap = 0.45 * m_red * v_close / max(pc.dt, 0.005);
+                    float f_visc = min(f_visc_raw, f_visc_cap);
+                    // On separation (vn > 0), Riemann unloading smoothly drops contact pressure toward zero
+                    float f_eos_used = (vn >= 0.0) ? (p_riemann * area_c * ramp) : f_eos_part;
+
+                    // Gentle non-penetration core ONLY when overlapping deeper than 0.94*dx
+                    float solid_f = min(1.0 - melt_i, 1.0 - melt_j);
+                    float f_core = 0.0;
+                    if (r < d_core) {
+                        float ov_c = (d_core - r) / d_core;
+                        float k_i = rho0_i * ci * ci;
+                        float k_j = rho0_j * m_j.eos.y * m_j.eos.y;
+                        float k_eff = (2.0 * k_i * k_j) / max(k_i + k_j, 1e-5);
+                        f_core = k_eff * (0.28 + 0.50 * solid_f) * ov_c * ov_c * area_c;
+                    }
+
+                    float f_n = f_eos_used + f_visc + f_core;
+                    float a_n = f_n / max(mass_i, 1e-6);
+                    acc_i += nij * a_n;
+
+                    // Under active gravity, acoustic jitter floor (> 220 m/s) stops sub-elastic rubble melting
+                    if (!grav_active || v_close > 0.022 || vn > 0.022) {
+                        de += w_visc_i * (-f_eos_used * vn + 0.5 * f_visc * v_close) / max(mass_i, 1e-6);
+                    }
+
+                    c_w_sum += ramp;
+                    if (grav_active) {
+                        c_drho += rho_i * w_visc_i * (-vn / pc.dx) * ramp;
+                    }
+                    if (v_close > 0.0) {
+                        if (!grav_active) {
+                            c_drho += rho_i * w_visc_i * (v_close / pc.dx) * ramp;
+                        }
+                        shock_comp += (v_close / max(cbar, 0.05)) * ramp;
+                        float g_c = -(w_visc_i * v_close / pc.dx) * ramp;
+                        c_grad_v += vec4(nij.x * nij.x, nij.x * nij.y, nij.y * nij.x, nij.y * nij.y) * g_c;
+                    }
+
+                    vec2 vt = vij - nij * vn;
+                    float vt_len = length(vt);
+                    if (vt_len > 1e-5 && f_n > 0.0 && solid_f > 0.05) {
+                        float mu_f = 0.5 * (m_i.flags.x + m_j.flags.x) * solid_f;
+                        float a_fric = min(mu_f * a_n, 0.30 * (2.0 * mj / max(mass_i + mj, 1e-6)) * vt_len / max(pc.dt, 0.005));
+                        vec2 f_tan = -(vt / vt_len) * a_fric;
+                        acc_i += f_tan;
+                        de += 0.25 * a_fric * vt_len;
+                        float cross_z = (-nij.x) * f_tan.y - (-nij.y) * f_tan.x;
+                        fric_alpha += cross_z / max(pc.dx, 0.05);
+                    }
+
+                    xsph += 0.03 * ramp * (mj / max(mass_i + mj, 1e-6)) * (vj - vi);
+                    continue;
+                }
+
+                // REGIME A (Coherent intact solid, c_coh > 0.03) & REGIME B (Detonation gas fluid, det == 2):
+                neighbors += 1u;
+                float q = r / cutoff;
+                float omq = 1.0 - q;
+                float omq3 = omq * omq * omq;
+                float w = w_norm * omq3 * omq * (1.0 + 4.0 * q);
+                float dw_dr = dw_norm * q * omq3; // <= 0
+                vec2 grad_w = nij * dw_dr;
+
+                float z_j = (det_j == 2u) ? (rho_j * 0.22) : (rho_j * m_j.eos.y);
+                float w_visc_i = z_j / max(z_i + z_j, 1e-5);
+                // Smoothly fade long-range (> d_hit) continuum coupling as cracks sever a solid body
+                float coh_gate = (c_coh > 0.03 && r > d_hit) ? clamp((c_coh - 0.03) / 0.32, 0.0, 1.0) : 1.0;
+
+                float rho_vol_j = (det_j == 2u) ? max(rho_j, 0.52 * rho0_j) : rho_j;
+                float vol_j = (mj / max(rho_vol_j, 1e-5)) * coh_gate;
+                float vij_dot_gradw = dot(vij, grad_w);
+                float gas_solid_comp = (det_i != 2u && det_j == 2u) ? min(2.0 * w_visc_i, 1.0) : 1.0;
+                drho += gas_solid_comp * rho_i * vol_j * vij_dot_gradw;
+
+                float cbar = 0.5 * (ci + m_j.eos.y);
+                if (det_i == det_j) {
+                    float comp_diff = (rho_j / max(rho0_j, 1e-4)) - (rho_i / max(rho0_i, 1e-4));
+                    float pos_kf = (r * (-dw_dr)) / (r2 + 0.01 * h2);
+                    drho += 0.12 * pc.h * cbar * rho0_i * vol_j * 2.0 * comp_diff * pos_kf;
+                }
+
+                // Monaghan artificial shock viscosity + impedance-matched Hugoniot heating partition (w_ij + w_ji = 1)
+                float vij_dot_xij = dot(vij, xij);
+                float pi_visc = 0.0;
+                if (vij_dot_xij < 0.0) {
+                    float mu_v = (pc.h * vij_dot_xij) / (r2 + 0.01 * h2);
+                    float rho_bar = 0.5 * (rho_i + rho_j);
+                    pi_visc = ((-1.05 * cbar * mu_v + 2.00 * mu_v * mu_v) / max(rho_bar, 1e-4)) * coh_gate;
+                    shock_comp += (-mu_v) * vol_j * w * cutoff;
+                }
+
+                float rho_j2 = max(rho_j * rho_j, 1e-6);
+
+                if (c_coh > 0.03) {
+                    // Velocity gradient L = grad(v) + CSPM moment accumulation M = sum V_j (x_j - x_i) (x) grad_W
+                    vec2 vji = vj - vi;
+                    float w_g = vol_j * c_coh;
+                    grad_v += vec4(vji.x * grad_w.x, vji.x * grad_w.y, vji.y * grad_w.x, vji.y * grad_w.y) * w_g;
+                    m_xx += (-xij.x) * grad_w.x * w_g;
+                    m_xy += (-0.5 * (xij.x * grad_w.y + xij.y * grad_w.x)) * w_g;
+                    m_yy += (-xij.y) * grad_w.y * w_g;
+
+                    // --- COHERENT CONTINUUM SOLID INTERACTION (Total Cauchy Stress = -P*I + S) ---
+                    vec3 s_j = stress_j.xyz * intact_j;
+                    float sig_xx_i = -press_i + s_i.x;
+                    float sig_yy_i = -press_i + s_i.y;
+                    float sig_xy_i = s_i.z;
+
+                    float sig_xx_j = -press_j + s_j.x;
+                    float sig_yy_j = -press_j + s_j.y;
+                    float sig_xy_j = s_j.z;
+
+                    // Gray-Monaghan tensile artificial stress prevents SPH pairing/clumping in tension
+                    float tens_i = max(max(sig_xx_i, sig_yy_i), 0.0) / rho_i2;
+                    float tens_j = max(max(sig_xx_j, sig_yy_j), 0.0) / rho_j2;
+                    float fij = clamp(w / w_ref, 0.0, 1.25);
+                    float r_art = 0.30 * (tens_i + tens_j) * (fij * fij * fij * fij);
+
+                    float t_xx = (sig_xx_i / rho_i2 + sig_xx_j / rho_j2 - r_art) * coh_gate - pi_visc;
+                    float t_yy = (sig_yy_i / rho_i2 + sig_yy_j / rho_j2 - r_art) * coh_gate - pi_visc;
+                    float t_xy = (sig_xy_i / rho_i2 + sig_xy_j / rho_j2) * coh_gate;
+
+                    vec2 f_stress = vec2(
+                        t_xx * grad_w.x + t_xy * grad_w.y,
+                        t_xy * grad_w.x + t_yy * grad_w.y
+                    );
+                    acc_i += mj * f_stress;
+                    // Exact 1st-Law Thermodynamics: reversible P_i/rho_i^2 * drho_i + impedance-partitioned shock viscosity!
+                    de += mj * (max(press_i, 0.0) / rho_i2 * coh_gate + w_visc_i * pi_visc) * vij_dot_gradw;
+
+                    // Short-range lattice equilibrium core + ductile metallic cohesion
+                    float m_pair = (2.0 * mj) / max(mass_i + mj, 1e-6);
+                    if (r < d_contact) {
+                        float ov = 1.0 - r / d_contact;
+                        float k_rep = 1.15 * cbar * cbar / d_contact;
+                        acc_i += nij * (k_rep * ov * ov * m_pair);
+                    } else if (m_i.flags.z > 0.5 && m_j.flags.z > 0.5 && r > 1.14 * pc.dx && r < 1.58 * pc.dx) {
+                        // Active ONLY in the hex-lattice tensile stretch band (1.14..1.58*dx), strictly ZERO at rest (1.0*dx & 1.732*dx)!
+                        float y_coh = min(m_i.strength.y, m_j.strength.y) + 0.38 * min(m_i.fracture.x, m_j.fracture.x);
+                        float phase_s = sin(pi_c * (r - 1.14 * pc.dx) / (0.44 * pc.dx));
+                        float a_coh = (1.30 * c_coh * y_coh / (0.5 * (rho0_i + rho0_j) * pc.dx)) * phase_s;
+                        acc_i -= nij * (a_coh * m_pair * coh_gate);
+                    }
+
+                    xsph += (0.075 * c_coh + 0.015) * vol_j * (vj - vi) * w;
+                } else {
+                    // --- DETONATION GAS FLUID INTERACTION (det_i == 2 || det_j == 2) ---
+                    float p_pos_i = max(press_i, 0.0);
+                    float p_pos_j = max(press_j, 0.0);
+                    float rho_eff_i = (det_i == 2u) ? max(rho_i, 0.45 * rho0_i) : rho_i;
+                    float rho_eff_j = (det_j == 2u) ? max(rho_j, 0.45 * rho0_j) : rho_j;
+                    float p_term = p_pos_i / max(rho_eff_i * rho_eff_i, 1e-6)
+                                 + p_pos_j / max(rho_eff_j * rho_eff_j, 1e-6)
+                                 + pi_visc;
+                    acc_i -= mj * p_term * grad_w;
+                    de += mj * (p_pos_i / rho_i2 + w_visc_i * pi_visc) * vij_dot_gradw;
+                    xsph += 0.025 * vol_j * (vj - vi) * w;
+                }
+            }
+        }
+    }
+
+    // Apply regularized Randles-Libersky / CSPM 1st-order renormalization L_corr = grad_v * M^-1
+    float det_m = m_xx * m_yy - m_xy * m_xy;
+    float tr_m = m_xx + m_yy;
+    if (det_m > 0.22 && tr_m > 0.75) {
+        float inv_det = 1.0 / det_m;
+        float b_xx = clamp(m_yy * inv_det, 0.5, 1.85);
+        float b_xy = clamp(-m_xy * inv_det, -0.65, 0.65);
+        float b_yy = clamp(m_xx * inv_det, 0.5, 1.85);
+        grad_v = vec4(
+            grad_v.x * b_xx + grad_v.y * b_xy,
+            grad_v.x * b_xy + grad_v.y * b_yy,
+            grad_v.z * b_xx + grad_v.w * b_xy,
+            grad_v.z * b_xy + grad_v.w * b_yy
+        );
+    } else if (tr_m > 0.25) {
+        // Thin-shell / free-edge fallback so 1-2 cell steel casings register true hoop strain
+        grad_v *= clamp(2.0 / tr_m, 1.0, 2.8);
+    }
+    // Add contact-normalized continuity & strain from touching faces (avoids hex double-counting)
+    if (c_w_sum > 0.0) {
+        float c_norm = 0.95 / max(c_w_sum, 1.0);
+        drho += c_drho * c_norm;
+        grad_v += c_grad_v * c_norm;
+    }
+
+    ForceOut fo;
+    fo.acc_xsph = vec4(acc_i, xsph);
+    fo.rates = vec4(drho, de, shock_comp, symp_burn_dt);
+    fo.grad_v = grad_v;
+    fo.stats = vec4(float(neighbors), fric_alpha, 0.0, 0.0);
+    scratch[i] = fo;
+}

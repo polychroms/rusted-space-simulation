@@ -1,0 +1,85 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+struct Particle {
+    vec4 pos_vel;
+    vec4 acc_xsph;
+    vec4 thermo;
+    vec4 stress;
+    vec4 mech;
+    vec4 det_aux;
+    vec4 grav_pad;
+    uvec4 meta;
+};
+
+layout(std430, set = 0, binding = 0) buffer ParticleBuf {
+    Particle particles[];
+};
+
+layout(std430, set = 0, binding = 5) readonly buffer GravGridBuf {
+    ivec4 grav_cells[];
+};
+
+layout(push_constant) uniform PushConsts {
+    uint num_particles;
+    uint step_index;
+    float dt;
+    float dx;
+    float h;
+    float cutoff;
+    float grid_cell_size;
+    float down_gravity;
+    vec4 grav_domain; // x: min_x, y: min_y, z: span, w: grav_g
+} pc;
+
+shared vec4 sh_cells[256]; // xy = world_com, z = mass
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+    bool is_valid = (i < pc.num_particles);
+
+    vec2 pi = is_valid ? particles[i].pos_vel.xy : vec2(0.0);
+    float span = max(pc.grav_domain.z, 1.0);
+    float cell_sz = span / 32.0;
+    float g_const = pc.grav_domain.w;
+    float soft_sq = (2.4 * pc.dx) * (2.4 * pc.dx) + 0.20 * cell_sz * cell_sz;
+    vec2 g_acc = vec2(0.0);
+
+    for (uint tile = 0u; tile < 4u; ++tile) {
+        uint cid = tile * 256u + lid;
+        ivec4 raw = grav_cells[cid];
+        if (raw.x > 0) {
+            uint gx = cid & 31u;
+            uint gy = cid >> 5u;
+            float inv_m = 1.0 / float(raw.x);
+            float cx_w = pc.grav_domain.x + (float(gx) + float(raw.y) * inv_m) * cell_sz;
+            float cy_w = pc.grav_domain.y + (float(gy) + float(raw.z) * inv_m) * cell_sz;
+            float m = float(raw.x) * (1.0 / 2048.0);
+            sh_cells[lid] = vec4(cx_w, cy_w, m, 0.0);
+        } else {
+            sh_cells[lid] = vec4(0.0);
+        }
+
+        barrier();
+
+        if (is_valid) {
+            for (uint k = 0u; k < 256u; ++k) {
+                vec4 c = sh_cells[k];
+                if (c.z > 0.0) {
+                    vec2 d = c.xy - pi;
+                    float r2 = dot(d, d) + soft_sq;
+                    float inv_r = inversesqrt(r2);
+                    g_acc += d * (g_const * c.z * inv_r * inv_r * inv_r);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    if (is_valid) {
+        particles[i].grav_pad.xy = g_acc;
+    }
+}

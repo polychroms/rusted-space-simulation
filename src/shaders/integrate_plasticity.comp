@@ -1,0 +1,283 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+struct Particle {
+    vec4 pos_vel;   // x, y, vx, vy
+    vec4 acc_xsph;  // ax, ay, xsph_x, xsph_y
+    vec4 thermo;    // rho, rho0, energy, temp
+    vec4 stress;    // s_xx, s_yy, s_xy, sph_pressure
+    vec4 mech;      // plastic_strain, damage, net_pressure, mass
+    vec4 det_aux;   // det_timer, det_age, shock_rate, crumb_angle
+    vec4 grav_pad;  // grav_x, grav_y, crumb_spin, pad
+    uvec4 meta;     // mat_id, body_id, det_state, crumb_seed
+};
+
+struct Material {
+    vec4 eos;       // rho0, c0, hugoniot_s, gamma0
+    vec4 strength;  // shear_mod, yield_strength, hardening, pressure_hardening
+    vec4 fracture;  // spall_strength, fracture_strain, melt_temp, cv
+    vec4 energetic; // detonation_vel, detonation_energy, initiation_pressure, delay_us
+    vec4 flags;     // friction, is_energetic, is_ductile, youngs_mod
+    vec4 jwl_ab;    // jwl_a, jwl_b, jwl_r1, jwl_r2
+    vec4 jc_jwl;    // jwl_omega, jc_rate_c, thermal_m, poisson_nu
+};
+
+struct ForceOut {
+    vec4 acc_xsph;  // ax, ay, xsph_x, xsph_y
+    vec4 rates;     // drho_dt, de_dt, shock_comp, symp_burn_dt
+    vec4 grad_v;    // dvx_dx, dvx_dy, dvy_dx, dvy_dy
+    vec4 stats;     // neighbors, fric_alpha, pad, pad
+};
+
+layout(std430, set = 0, binding = 0) buffer ParticleBuf {
+    Particle particles[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer MaterialBuf {
+    Material materials[24];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer ScratchBuf {
+    ForceOut scratch[];
+};
+
+layout(push_constant) uniform PushConsts {
+    uint num_particles;
+    uint step_index;
+    float dt;
+    float dx;
+    float h;
+    float cutoff;
+    float grid_cell_size;
+    float down_gravity;
+    vec4 grav_domain;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.num_particles) {
+        return;
+    }
+
+    Particle p = particles[i];
+    ForceOut fo = scratch[i];
+
+    uint mat_id = min(p.meta.x, 23u);
+    Material m = materials[mat_id];
+
+    vec2 acc = fo.acc_xsph.xy;
+    vec2 xsph = fo.acc_xsph.zw;
+    float drho = fo.rates.x;
+    float de_dt = fo.rates.y;
+    float shock_comp = fo.rates.z;
+    float symp_burn_dt = fo.rates.w;
+    float neighbors = fo.stats.x;
+
+    float dt = pc.dt;
+    float rho = p.thermo.x;
+    float rho0 = p.thermo.y;
+    float energy = p.thermo.z;
+    float temp = p.thermo.w;
+    float sph_p = p.stress.w;
+    float eps_p = p.mech.x;
+    float dmg = clamp(p.mech.y, 0.0, 1.0);
+    uint det_state = p.meta.z;
+    float det_timer = p.det_aux.x;
+    float det_age = p.det_aux.y;
+    float shock_rate = 0.65 * p.det_aux.z + 0.35 * shock_comp;
+
+    // 1. Bounded Continuum Density Update (rate-limited per substep to prevent single-cell detonation Euler overshoot)
+    float delta_rho = clamp(drho * dt, -0.10 * rho0, 0.12 * rho0);
+    float new_rho = rho + delta_rho;
+    if (det_state == 2u) {
+        if (neighbors < 10.0) {
+            float target_gas = 0.08 * rho0;
+            if (new_rho > target_gas) {
+                new_rho -= (new_rho - target_gas) * min(0.35 * dt, 0.25);
+            }
+        }
+        rho = clamp(new_rho, 0.05 * rho0, 2.2 * rho0);
+    } else {
+        if (dmg > 0.45 || temp >= m.fracture.z || neighbors < 1.5) {
+            if (new_rho < rho0) {
+                float relax = min(dt / 0.30, 0.25);
+                new_rho += (rho0 - new_rho) * relax;
+            } else if (new_rho > rho0 && (neighbors < 3.5 || (dmg > 0.70 && shock_comp < 0.03))) {
+                // Fractured rubble outside active impact shocks unloads trapped elastic compression cleanly to P~0
+                float relax = min(dt / 0.40, 0.22);
+                new_rho += (rho0 - new_rho) * relax;
+            }
+        }
+        rho = clamp(new_rho, 0.85 * rho0, 1.72 * rho0);
+    }
+
+    // 2. Hooke's Law + Jaumann Spin + Full Johnson-Cook Viscoplastic Radial Return
+    vec3 s = p.stress.xyz;
+    float plastic_heat = 0.0;
+    float sigma_eq_eff = 0.0;
+    float theta = clamp((temp - 293.0) / max(m.fracture.z - 293.0, 50.0), 0.0, 0.999);
+    float thermal_m = max(m.jc_jwl.z, 0.5);
+    float thermal_soft = 1.0 - pow(theta, thermal_m);
+
+    if (det_state == 2u || temp >= m.fracture.z) {
+        s = vec3(0.0);
+    } else {
+        vec4 lv = clamp(fo.grad_v, vec4(-4.5), vec4(4.5));
+        float eps_xx = lv.x;
+        float eps_yy = lv.w;
+        float eps_xy = 0.5 * (lv.y + lv.z);
+        float omega_xy = 0.5 * (lv.y - lv.z);
+        float div_v = eps_xx + eps_yy;
+
+        float d_xx = eps_xx - 0.3333333 * div_v;
+        float d_yy = eps_yy - 0.3333333 * div_v;
+        float d_zz = -0.3333333 * div_v;
+
+        float dmg_soft = 1.0 - 0.85 * dmg;
+        float g_eff = m.strength.x * dmg_soft * thermal_soft;
+        s.x += dt * (2.0 * g_eff * d_xx + 2.0 * s.z * omega_xy);
+        s.y += dt * (2.0 * g_eff * d_yy - 2.0 * s.z * omega_xy);
+        s.z += dt * (2.0 * g_eff * eps_xy - (s.x - s.y) * omega_xy);
+
+        float s_zz = -(s.x + s.y);
+        float j2 = 0.5 * (s.x * s.x + s.y * s.y + s_zz * s_zz) + s.z * s.z;
+        float sigma_eq = sqrt(max(3.0 * j2, 0.0));
+
+        // Equivalent deviatoric strain rate edot_eq (1/us = 10^6 s^-1 -> edot/edot_0 = edot_eq * 1e6)
+        float edot_eq = sqrt(max(0.6666667 * (d_xx * d_xx + d_yy * d_yy + d_zz * d_zz + 2.0 * eps_xy * eps_xy), 0.0));
+        float rate_mult = 1.0 + m.jc_jwl.y * log(max(edot_eq * 1.0e6, 1.0));
+
+        float p_conf = max(sph_p, 0.0);
+        // Drucker-Prager confined rubble shear resistance survives even after brittle micro-fracture!
+        float y_coh = m.strength.y * (1.0 + m.strength.z * pow(max(eps_p, 0.0), 0.48)) * dmg_soft;
+        float y_rub = m.strength.w * p_conf * (1.0 - 0.35 * dmg);
+        float y_flow = (y_coh + y_rub) * rate_mult * thermal_soft;
+
+        if (sigma_eq > y_flow && sigma_eq > 1e-7) {
+            float sigma_eq_old = sigma_eq;
+            float scale = y_flow / sigma_eq;
+            s *= scale;
+            sigma_eq = y_flow;
+            float d_eps_p = (sigma_eq_old - y_flow) / max(3.0 * max(g_eff, 0.005), 1e-5);
+            eps_p += d_eps_p;
+            // Taylor-Quinney 90% plastic work conversion into adiabatic shear heating!
+            plastic_heat = (0.90 * y_flow * d_eps_p) / max(rho, 0.1);
+        }
+        sigma_eq_eff = sigma_eq;
+    }
+
+    // 3. Stress-Triaxiality Fracture & Spall Mechanics (Johnson-Cook Ductile Failure + Brittle Ceramics)
+    float sigma_mean = -sph_p + 0.5 * (s.x + s.y);
+    float tau_max = sqrt(0.25 * (s.x - s.y) * (s.x - s.y) + s.z * s.z);
+    float sigma_1_tens = sigma_mean + tau_max;
+    float spall_th = max(m.fracture.x * thermal_soft, 1e-4);
+
+    if (det_state == 2u) {
+        dmg = 1.0;
+    } else if (m.flags.z > 0.5) {
+        if (sigma_mean > 0.25 * spall_th && sigma_1_tens > spall_th) {
+            float over = (sigma_1_tens - spall_th) / spall_th;
+            dmg = clamp(dmg + dt * 1.65 * over, 0.0, 1.0);
+        }
+        // Regularized Johnson-Cook triaxiality allows smooth armor bending & petaling without brittle hinge snaps
+        float k1 = max(rho0 * m.eos.y * m.eos.y, 0.05);
+        float triax = sigma_mean / max(sigma_eq_eff, max(m.strength.y, 0.005));
+        float eps_f_jc = (sigma_mean > 0.0)
+            ? m.fracture.y * max(0.38 + 0.62 * exp(-1.3 * triax), 0.35)
+            : m.fracture.y * min(1.5 + 4.5 * max(sph_p, 0.0) / k1, 3.0);
+        if (eps_p > eps_f_jc) {
+            float over_jc = (eps_p - eps_f_jc) / max(eps_f_jc, 0.05);
+            dmg = clamp(dmg + dt * 2.80 * over_jc, 0.0, 1.0);
+        }
+    } else {
+        if (sigma_mean > 0.15 * spall_th && sigma_1_tens > spall_th) {
+            float over = (sigma_1_tens - spall_th) / spall_th;
+            dmg = clamp(dmg + dt * 1.8 * over, 0.0, 1.0);
+        }
+        float k1 = max(rho0 * m.eos.y * m.eos.y, 0.05);
+        float eps_f_conf = m.fracture.y * (1.0 + 3.2 * max(sph_p, 0.0) / k1);
+        if (eps_p > eps_f_conf) {
+            float over_p = (eps_p - eps_f_conf) / max(eps_f_conf, 0.005);
+            dmg = clamp(dmg + dt * 1.2 * over_p, 0.0, 1.0);
+        }
+    }
+
+    // 4. Reactive Energetic Detonation State Machine
+    if (m.flags.y > 0.5) {
+        float total_comp_p = max(sph_p, 0.0) + tau_max * 0.5;
+        bool inertia_trip = (mat_id == 23u) && (pc.step_index > 6u)
+            && (dot(acc, acc) >= (0.0018 * 0.0018))
+            && (total_comp_p >= 0.00025);
+        if (det_state == 0u) {
+            if (symp_burn_dt > 0.0) {
+                det_state = 1u;
+                det_timer = (mat_id == 23u) ? max(m.energetic.w, symp_burn_dt) : symp_burn_dt;
+            } else if (total_comp_p >= m.energetic.z || inertia_trip || temp >= m.fracture.z) {
+                det_state = 1u;
+                det_timer = m.energetic.w;
+            }
+        }
+        if (det_state == 1u) {
+            if (mat_id != 23u && symp_burn_dt > 0.0 && symp_burn_dt < det_timer) {
+                det_timer = symp_burn_dt;
+            }
+            det_timer -= dt;
+            if (det_timer <= 0.0) {
+                det_state = 2u;
+                det_age = 0.0;
+                dmg = 1.0;
+                s = vec3(0.0);
+                energy += m.energetic.y;
+                temp = clamp(temp + m.energetic.y / max(m.fracture.w, 1e-7), 2600.0, 5200.0);
+            }
+        } else if (det_state == 2u) {
+            det_age += dt;
+        }
+    }
+
+    // 5. Final Velocity Kick, Internal Energy & Temperature
+    vec2 pos = p.pos_vel.xy;
+    vec2 vel = p.pos_vel.zw;
+    if (pc.step_index == 0u) {
+        vel += acc * dt;
+        pos += (vel + xsph) * dt;
+    } else {
+        vel += 0.5 * acc * dt;
+    }
+
+    float new_e = max(energy + de_dt * dt + plastic_heat, 0.0);
+    if (det_state == 2u && neighbors < 8.0) {
+        new_e *= max(1.0 - 0.14 * dt, 0.85);
+    }
+    float delta_e = new_e - energy;
+    energy = new_e;
+    temp = clamp(temp + delta_e / max(m.fracture.w, 1e-7), 50.0, 24000.0);
+
+    float net_p = (det_state == 2u) ? sph_p : (-sigma_mean);
+
+    // 6. Angular Crumb Spin & Orientation Integration
+    float crumb_angle = p.det_aux.w;
+    float crumb_spin = p.grav_pad.z;
+    float fric_alpha = fo.stats.y;
+    if (det_state != 2u) {
+        if (neighbors >= 2.0) {
+            float vort = clamp(0.5 * (fo.grad_v.z - fo.grad_v.y), -3.5, 3.5);
+            float blend = min(dt * 7.5, 0.45);
+            crumb_spin = clamp(mix(crumb_spin, vort, blend) + fric_alpha * dt, -3.5, 3.5);
+        } else {
+            crumb_spin = clamp(crumb_spin + fric_alpha * dt, -3.5, 3.5);
+        }
+        crumb_angle += crumb_spin * dt;
+    }
+
+    p.pos_vel = vec4(pos, vel);
+    p.acc_xsph = vec4(acc, xsph);
+    p.thermo = vec4(rho, rho0, energy, temp);
+    p.stress = vec4(s, sph_p);
+    p.mech = vec4(eps_p, dmg, net_p, p.mech.w);
+    p.det_aux = vec4(det_timer, det_age, shock_rate, crumb_angle);
+    p.grav_pad.z = crumb_spin;
+    p.meta.z = det_state;
+    particles[i] = p;
+}

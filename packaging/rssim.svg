@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="65%">
+      <stop offset="0%" stop-color="#131b2e"/>
+      <stop offset="100%" stop-color="#070a12"/>
+    </radialGradient>
+    <radialGradient id="core" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#f2a666"/>
+      <stop offset="100%" stop-color="#b86b3a"/>
+    </radialGradient>
+    <radialGradient id="plume" cx="25%" cy="50%" r="70%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="35%" stop-color="#ffcf56"/>
+      <stop offset="75%" stop-color="#ff5e1a"/>
+      <stop offset="100%" stop-color="#ff3d00" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="256" height="256" rx="44" fill="url(#bg)"/>
+  <circle cx="138" cy="128" r="82" fill="#7ecdf2"/>
+  <circle cx="138" cy="128" r="71" fill="#7c6855"/>
+  <circle cx="144" cy="128" r="36" fill="url(#core)"/>
+  <path d="M56 128 C72 86, 114 82, 128 128 C114 174, 72 170, 56 128 Z" fill="url(#plume)"/>
+  <circle cx="52" cy="128" r="14" fill="#dfe8f2" stroke="#ffd27d" stroke-width="3"/>
+  <line x1="16" y1="128" x2="42" y2="128" stroke="#6ee7ff" stroke-width="4" stroke-linecap="round"/>
+  <line x1="24" y1="112" x2="46" y2="118" stroke="#ffb347" stroke-width="3" stroke-linecap="round"/>
+  <line x1="24" y1="144" x2="46" y2="138" stroke="#ffb347" stroke-width="3" stroke-linecap="round"/>
+</svg>
