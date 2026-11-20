@@ -2132,6 +2132,248 @@ mod tests {
     }
 
     #[test]
+    fn orbital_predictor_grazing_rim_shapes_and_physics_parity() {
+        // Helper to measure actual body #2 COM position in ContinuumWorld
+        let body_com = |w: &ContinuumWorld, bid: u16| -> Vec2 {
+            let mut m_tot = 0.0f32;
+            let mut c = Vec2::ZERO;
+            for i in 0..w.len() {
+                if w.body_id[i] == bid && w.pos[i].is_finite() {
+                    m_tot += w.mass[i];
+                    c += w.pos[i] * w.mass[i];
+                }
+            }
+            if m_tot > 0.0 { c / m_tot } else { Vec2::ZERO }
+        };
+
+        // 1. Grazing orbital rim collision: small asteroid (r=2.0 cm) skims a giant R=26.0 cm planet.
+        // Center stays outside R=26.0 cm (~27 cm periapsis), while its rim collides inside 28.0 cm!
+        // Under old 0.88*(26+2)=24.64 cm this completely missed unless center entered the planet.
+        let mut graze_scene = SceneSpec::empty();
+        graze_scene.self_gravity = true;
+        graze_scene.grav_g = 8.0e-5;
+        graze_scene.targets.push(TargetSpec {
+            name: "Giant Planet".to_string(),
+            pos: Vec2::ZERO,
+            angle_deg: 0.0,
+            vel: Vec2::ZERO,
+            temp_k: 320.0,
+            kind: TargetKind::LayeredPlanet {
+                shells: vec![
+                    PlanetShell {
+                        thickness: 12.0,
+                        mat: MaterialId::PlanetaryIron,
+                        temp_k: 950.0,
+                    },
+                    PlanetShell {
+                        thickness: 14.0,
+                        mat: MaterialId::BasaltRock,
+                        temp_k: 320.0,
+                    },
+                ],
+            },
+        });
+        let mut imp = ProjectileSpec::default_with_shape(
+            ProjectileShape::Sphere,
+            Vec2::new(-38.0, 27.6),
+            MaterialId::BasaltRock,
+        );
+        imp.radius_cm = 2.0;
+        imp.set_vel_cm_per_us(Vec2::new(0.24, 0.0));
+        graze_scene.projectiles.push(imp);
+
+        let dx = 0.45f32;
+        let tr_hit = graze_scene.predict_staging_trajectories_with_dx(dx);
+        let hit_pt = tr_hit[1]
+            .impact
+            .expect("Grazing rim collision must be predicted even when center misses target core");
+        let center_pt = tr_hit[1]
+            .impact_body_pos
+            .expect("Predictor must record body center position at first rim touch");
+        assert!(
+            (hit_pt.length() - 26.0).abs() < 0.7,
+            "Impact crosshair must sit on R=26 cm planet rim, not halfway to core (got r={:.2})",
+            hit_pt.length()
+        );
+        assert!(
+            center_pt.length() > 26.2 && (center_pt.length() - 28.0).abs() < 0.6,
+            "Body center at contact must remain outside R=26 at R+r=28 cm (got {:.2})",
+            center_pt.length()
+        );
+
+        // Verify actual ContinuumWorld (Vulkan GPU) physics really does curve and strike the planet rim!
+        let mut vk = crate::vulkan_gpu::VulkanPhysicsEngine::new().expect("Vulkan GPU init");
+        let mut world_hit = graze_scene.build_world(dx);
+        while world_hit.time_us < 200.0 {
+            let dt = world_hit.compute_cfl_dt();
+            vk.step_batch(&mut world_hit, 12, dt);
+        }
+        let peak_gpa = world_hit
+            .sph_pressure
+            .iter()
+            .copied()
+            .fold(0.0f32, f32::max)
+            * 100.0;
+        let max_ep = world_hit
+            .plastic_strain
+            .iter()
+            .copied()
+            .fold(0.0f32, f32::max);
+        assert!(
+            peak_gpa > 2.5 || max_ep > 0.02 || world_hit.fractured_count > 5,
+            "Real GPU simulation must collide on grazing rim trajectory (peakP={peak_gpa:.2}, max_ep={max_ep:.3}, spall={})",
+            world_hit.fractured_count
+        );
+
+        // 2. Clean orbital flyby miss just outside R+r clearance must NOT false-trigger impact
+        let mut flyby_scene = graze_scene.clone();
+        flyby_scene.projectiles[0].pos = Vec2::new(-38.0, 35.0);
+        flyby_scene.projectiles[0].set_vel_cm_per_us(Vec2::new(0.28, 0.0));
+        let tr_miss = flyby_scene.predict_staging_trajectories_with_dx(dx);
+        assert!(
+            tr_miss[1].impact.is_none(),
+            "Safe flyby outside R+r clearance must not predict impact, got {:?}",
+            tr_miss[1].impact
+        );
+
+        // Compare curved COM gravity trajectory of predictor vs real ContinuumWorld after t~120 us
+        let mut world_fly = flyby_scene.build_world(dx);
+        let proj_bid = world_fly.next_body_id - 1;
+        let init_moon = body_com(&world_fly, proj_bid);
+        assert!(
+            (init_moon - flyby_scene.projectiles[0].pos).length() < 0.4,
+            "Initial spawned moon COM {init_moon:?} must match staged pos {:?}",
+            flyby_scene.projectiles[0].pos
+        );
+        while world_fly.time_us < 120.0 {
+            let dt = world_fly.compute_cfl_dt();
+            vk.step_batch(&mut world_fly, 10, dt);
+        }
+        let actual_com = body_com(&world_fly, proj_bid);
+        let min_sep = tr_miss[1]
+            .points
+            .iter()
+            .map(|&p| (p - actual_com).length())
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            min_sep < 0.6,
+            "Curved N-body orbital predictor must closely match real GPU gravity COM path (actual={actual_com:?}, min_sep={min_sep:.2} cm)"
+        );
+
+        // 3. Exact non-circular shapes & 100 km/s swept non-tunneling
+        let mut wall_scene = SceneSpec::empty();
+        wall_scene.targets.push(TargetSpec {
+            name: "Thin Armor".to_string(),
+            pos: Vec2::new(20.0, 0.0),
+            angle_deg: 0.0,
+            vel: Vec2::ZERO,
+            temp_k: 293.0,
+            kind: TargetKind::SolidBox {
+                width: 2.0,
+                height: 40.0,
+                mat: MaterialId::RhaSteel,
+            },
+        });
+        let mut hyper = ProjectileSpec::default_with_shape(
+            ProjectileShape::Sphere,
+            Vec2::new(-25.0, 0.0),
+            MaterialId::Tungsten,
+        );
+        hyper.radius_cm = 1.5;
+        hyper.speed_kms = 100.0;
+        wall_scene.projectiles.push(hyper);
+        let tr_hyper = wall_scene.predict_staging_trajectories();
+        let wall_hit = tr_hyper[1]
+            .impact
+            .expect("100 km/s projectile must not tunnel through 2 cm plate");
+        assert!(
+            (wall_hit.x - 19.0).abs() < 0.35,
+            "Impact crosshair must land on front strike face x=19.0, got {:.2}",
+            wall_hit.x
+        );
+
+        // Clearing just above the vertical plate (y=22.0 > 20.0 + 1.5) must miss (old bounding circle gave false hit!)
+        wall_scene.projectiles[0].pos = Vec2::new(-25.0, 22.0);
+        let tr_clear = wall_scene.predict_staging_trajectories();
+        assert!(
+            tr_clear[1].impact.is_none(),
+            "Shot above thin plate top must miss (old bounding circle failed this)"
+        );
+
+        // HollowRing outer strike vs interior hollow cavity clearance vs inner cavity wall strike
+        let mut ring_scene = SceneSpec::empty();
+        ring_scene
+            .targets
+            .push(TargetSpec::default_ring(Vec2::new(15.0, 0.0), MaterialId::Aluminum));
+        let mut bb = ProjectileSpec::default_with_shape(
+            ProjectileShape::Sphere,
+            Vec2::new(-12.0, 0.0),
+            MaterialId::Tungsten,
+        );
+        bb.radius_cm = 1.8;
+        bb.speed_kms = 3.0;
+        ring_scene.projectiles.push(bb);
+        let outer_ring_hit = ring_scene.predict_staging_trajectories()[1]
+            .impact
+            .expect("External shot toward HollowRing must hit its outer left rim");
+        assert!(
+            (outer_ring_hit.x - 1.0).abs() < 0.35,
+            "External strike must hit ring outer edge x=15-14=1.0 cm, got {:.2}",
+            outer_ring_hit.x
+        );
+        // Slow projectile traveling strictly inside the central hole (r < 10.8 - 1.8 = 9.0) must not collide
+        ring_scene.projectiles[0].pos = Vec2::new(13.0, 0.0);
+        ring_scene.projectiles[0].speed_kms = 0.08;
+        assert!(
+            ring_scene.predict_staging_trajectories()[1].impact.is_none(),
+            "Projectile staying inside HollowRing central hole must not collide with ring wall"
+        );
+        // Fast projectile launched from center outward hits inner right wall at x = 15 + 10.8 = 25.8
+        ring_scene.projectiles[0].speed_kms = 2.5;
+        let inner_ring_hit = ring_scene.predict_staging_trajectories()[1]
+            .impact
+            .expect("Outward shot from inside HollowRing must hit inner cavity wall");
+        assert!(
+            (inner_ring_hit.x - 25.8).abs() < 0.45,
+            "Inner cavity strike must land at x=25.8 cm, got {:.2}",
+            inner_ring_hit.x
+        );
+
+        // Sideways LongRodDart (tail fins half-width = 2.15 * 1.45 = 3.12 cm, bound_r = 11.6 cm):
+        // y=2.5 clips deck top y=0.5 via tail fins; y=4.2 clears cleanly despite < bound_r!
+        let mut rod_scene = SceneSpec::empty();
+        rod_scene.targets.push(TargetSpec {
+            name: "Deck".to_string(),
+            pos: Vec2::new(10.0, 0.0),
+            angle_deg: 0.0,
+            vel: Vec2::ZERO,
+            temp_k: 293.0,
+            kind: TargetKind::SolidBox {
+                width: 24.0,
+                height: 1.0,
+                mat: MaterialId::RhaSteel,
+            },
+        });
+        let mut dart = ProjectileSpec::default_with_shape(
+            ProjectileShape::LongRodDart,
+            Vec2::new(-25.0, 2.5),
+            MaterialId::Tungsten,
+        );
+        dart.angle_deg = 0.0;
+        dart.speed_kms = 2.0;
+        rod_scene.projectiles.push(dart);
+        assert!(
+            rod_scene.predict_staging_trajectories()[1].impact.is_some(),
+            "LongRodDart tail fins (2.15*1.45=3.12 cm) at y=2.5 must clip deck top y=0.5"
+        );
+        rod_scene.projectiles[0].pos = Vec2::new(-25.0, 4.2);
+        assert!(
+            rod_scene.predict_staging_trajectories()[1].impact.is_none(),
+            "Horizontal LongRodDart at y=4.2 must clear y=0.5 deck without bloated bounding-circle false hit"
+        );
+    }
+
+    #[test]
     fn thirty_two_materials_thermite_octol_gpu_parity_and_ocean_moon() {
         // 1. All 32 materials roundtrip cleanly by code and index
         assert_eq!(MaterialId::ALL.len(), 32);

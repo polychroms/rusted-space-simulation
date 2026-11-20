@@ -284,7 +284,7 @@ impl TargetSpec {
                 let mut r_prev = 0.0f32;
                 let mut m = 0.0f32;
                 for s in shells {
-                    let r_next = r_prev + s.thickness.max(0.0);
+                    let r_next = r_prev + s.thickness.max(0.5);
                     m += std::f32::consts::PI
                         * (r_next * r_next - r_prev * r_prev)
                         * s.mat.props().rho0;
@@ -539,6 +539,15 @@ impl ProjectileSpec {
                     * (rc * rc * self.core_mat.props().rho0
                         + (r * r - rc * rc) * self.mat.props().rho0)
             }
+            ProjectileShape::Ellipse => {
+                std::f32::consts::PI * 0.5 * self.length_cm * r * self.mat.props().rho0
+            }
+            ProjectileShape::Wedge => {
+                0.5 * self.length_cm * 2.0 * r * self.mat.props().rho0
+            }
+            ProjectileShape::LongRodDart => {
+                0.90 * self.length_cm * 2.0 * r * self.mat.props().rho0
+            }
             ProjectileShape::CustomBlueprint => {
                 if let Some(bp) = &self.blueprint {
                     let cell_area = 0.35f32 * 0.35f32;
@@ -591,6 +600,794 @@ pub struct TrajectoryTrace {
     pub is_projectile: bool,
     pub points: Vec<Vec2>,
     pub impact: Option<Vec2>,
+    pub impact_body_pos: Option<Vec2>,
+}
+
+#[derive(Clone)]
+enum BodyShapeGeom {
+    Circle {
+        radius: f32,
+    },
+    Annulus {
+        inner_r: f32,
+        outer_r: f32,
+    },
+    Rect {
+        hx: f32,
+        hy: f32,
+        rot: Vec2,
+    },
+    Ellipse {
+        rx: f32,
+        ry: f32,
+        rot: Vec2,
+    },
+    Polygon {
+        verts_rot: Vec<Vec2>,
+    },
+    Blueprint {
+        bp: PixelBlueprint,
+        dx: f32,
+        rot: Vec2,
+        mid_gx: f32,
+        mid_gy: f32,
+    },
+}
+
+impl BodyShapeGeom {
+    fn inv_rotate(rot: Vec2, v: Vec2) -> Vec2 {
+        Vec2::new(v.x * rot.x + v.y * rot.y, -v.x * rot.y + v.y * rot.x)
+    }
+
+    /// Returns `(is_inside, closest_world_boundary_point)` relative to body center at `body_pos`.
+    fn closest_boundary_world(&self, body_pos: Vec2, world_pt: Vec2) -> (bool, Vec2) {
+        let d = world_pt - body_pos;
+        match self {
+            BodyShapeGeom::Circle { radius } => {
+                let r = *radius;
+                let len = d.length();
+                let inside = len <= r;
+                let dir = if len > 1e-6 { d / len } else { Vec2::X };
+                (inside, body_pos + dir * r)
+            }
+            BodyShapeGeom::Annulus { inner_r, outer_r } => {
+                let len = d.length();
+                let dir = if len > 1e-6 { d / len } else { Vec2::X };
+                let inside = len >= *inner_r && len <= *outer_r;
+                let r_surf = if inside {
+                    if (len - *inner_r) < (*outer_r - len) {
+                        *inner_r
+                    } else {
+                        *outer_r
+                    }
+                } else {
+                    len.clamp(*inner_r, *outer_r)
+                };
+                (inside, body_pos + dir * r_surf)
+            }
+            BodyShapeGeom::Rect { hx, hy, rot } => {
+                let lp = Self::inv_rotate(*rot, d);
+                let inside = lp.x.abs() <= *hx && lp.y.abs() <= *hy;
+                let q = if inside {
+                    let dx_face = *hx - lp.x.abs();
+                    let dy_face = *hy - lp.y.abs();
+                    if dx_face < dy_face {
+                        Vec2::new(if lp.x >= 0.0 { *hx } else { -*hx }, lp.y)
+                    } else {
+                        Vec2::new(lp.x, if lp.y >= 0.0 { *hy } else { -*hy })
+                    }
+                } else {
+                    Vec2::new(lp.x.clamp(-*hx, *hx), lp.y.clamp(-*hy, *hy))
+                };
+                (inside, body_pos + rot.rotate(q))
+            }
+            BodyShapeGeom::Ellipse { rx, ry, rot } => {
+                let lp = Self::inv_rotate(*rot, d);
+                let u2 = (lp.x / *rx).powi(2) + (lp.y / *ry).powi(2);
+                let inside = u2 <= 1.0;
+                let px = lp.x.abs();
+                let py = lp.y.abs();
+                let mut t = (ry * py).atan2(rx * px).clamp(0.0, std::f32::consts::FRAC_PI_2);
+                let e2 = rx * rx - ry * ry;
+                for _ in 0..6 {
+                    let (st, ct) = t.sin_cos();
+                    let f = e2 * ct * st - px * rx * st + py * ry * ct;
+                    let df = e2 * (ct * ct - st * st) - px * rx * ct - py * ry * st;
+                    if df.abs() < 1e-8 {
+                        break;
+                    }
+                    t = (t - f / df).clamp(0.0, std::f32::consts::FRAC_PI_2);
+                }
+                let (st, ct) = t.sin_cos();
+                let q = Vec2::new(
+                    if lp.x >= 0.0 { rx * ct } else { -rx * ct },
+                    if lp.y >= 0.0 { ry * st } else { -ry * st },
+                );
+                (inside, body_pos + rot.rotate(q))
+            }
+            BodyShapeGeom::Polygon { verts_rot } => {
+                let (inside, closest_rel) = closest_point_and_inside_poly(verts_rot, d);
+                (inside, body_pos + closest_rel)
+            }
+            BodyShapeGeom::Blueprint {
+                bp,
+                dx,
+                rot,
+                mid_gx,
+                mid_gy,
+                ..
+            } => {
+                let lp = Self::inv_rotate(*rot, d);
+                let dy = *dx * 0.866_025_4;
+                let gx_f = lp.x / *dx + *mid_gx;
+                let gy_f = *mid_gy - lp.y / dy;
+                let cx = gx_f.round() as i32;
+                let cy = gy_f.round() as i32;
+                let inside = bp.get(cx, cy).is_some();
+                let mut best_d2 = f32::INFINITY;
+                let mut best_local = lp;
+                let scan = (bp.width.max(bp.height) as i32).clamp(4, 12);
+                for yy in (cy - scan)..=(cy + scan) {
+                    if yy < 0 || (yy as usize) >= bp.height {
+                        continue;
+                    }
+                    let row_off = if (yy as usize) % 2 == 1 { 0.5 * *dx } else { 0.0 };
+                    let ly = (*mid_gy - yy as f32) * dy;
+                    for xx in (cx - scan)..=(cx + scan) {
+                        if bp.get(xx, yy).is_none() {
+                            continue;
+                        }
+                        let lx = (xx as f32 - *mid_gx) * *dx + row_off;
+                        let cell_p = Vec2::new(lx, ly);
+                        let d2 = (cell_p - lp).length_squared();
+                        if d2 < best_d2 {
+                            best_d2 = d2;
+                            best_local = cell_p;
+                        }
+                    }
+                }
+                if !best_d2.is_finite() {
+                    best_local = Vec2::ZERO;
+                }
+                (inside, body_pos + rot.rotate(best_local))
+            }
+        }
+    }
+}
+
+fn closest_point_and_inside_poly(verts: &[Vec2], p: Vec2) -> (bool, Vec2) {
+    let n = verts.len();
+    if n < 3 {
+        return (false, p);
+    }
+    let mut inside = false;
+    let mut best_d2 = f32::INFINITY;
+    let mut best_q = verts[0];
+    let mut j = n - 1;
+    for i in 0..n {
+        let vi = verts[i];
+        let vj = verts[j];
+        if ((vi.y > p.y) != (vj.y > p.y))
+            && (p.x < (vj.x - vi.x) * (p.y - vi.y) / (vj.y - vi.y + 1e-12) + vi.x)
+        {
+            inside = !inside;
+        }
+        let ab = vi - vj;
+        let len2 = ab.length_squared().max(1e-12);
+        let t = ((p - vj).dot(ab) / len2).clamp(0.0, 1.0);
+        let q = vj + ab * t;
+        let d2 = (p - q).length_squared();
+        if d2 < best_d2 {
+            best_d2 = d2;
+            best_q = q;
+        }
+        j = i;
+    }
+    (inside, best_q)
+}
+
+fn segments_intersect(a0: Vec2, a1: Vec2, b0: Vec2, b1: Vec2) -> Option<Vec2> {
+    let r = a1 - a0;
+    let s = b1 - b0;
+    let denom = r.perp_dot(s);
+    if denom.abs() < 1e-8 {
+        return None;
+    }
+    let qp = b0 - a0;
+    let t = qp.perp_dot(s) / denom;
+    let u = qp.perp_dot(r) / denom;
+    if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
+        Some(a0 + r * t)
+    } else {
+        None
+    }
+}
+
+fn sample_poly_perimeter_rot(verts: &[Vec2], max_seg_step: f32) -> Vec<Vec2> {
+    let mut out = Vec::new();
+    let n = verts.len();
+    for i in 0..n {
+        let a = verts[i];
+        let b = verts[(i + 1) % n];
+        let seg_len = (b - a).length();
+        let k = ((seg_len / max_seg_step).ceil() as usize).max(1);
+        for s in 0..k {
+            out.push(a.lerp(b, s as f32 / k as f32));
+        }
+    }
+    out
+}
+
+fn sample_rect_mass_nodes(hx: f32, hy: f32, total_mass: f32, rot: Vec2) -> Vec<(Vec2, f32)> {
+    let nx = 4usize;
+    let ny = 4usize;
+    let dm = total_mass / (nx * ny) as f32;
+    let mut out = Vec::with_capacity(nx * ny);
+    for iy in 0..ny {
+        let ly = -hy + (iy as f32 + 0.5) * (2.0 * hy / ny as f32);
+        for ix in 0..nx {
+            let lx = -hx + (ix as f32 + 0.5) * (2.0 * hx / nx as f32);
+            out.push((rot.rotate(Vec2::new(lx, ly)), dm));
+        }
+    }
+    out
+}
+
+fn sample_disk_mass_nodes(radius: f32, shells: &[(f32, f32)], total_mass: f32) -> Vec<(Vec2, f32)> {
+    let r_max = radius.max(0.5);
+    let step = (r_max / 3.8).max(0.45);
+    let n = (r_max / step).ceil() as i32;
+    let dy = step * 0.866_025_4;
+    let mut raw = Vec::with_capacity(64);
+    for iy in -n..=n {
+        let ro = if iy.rem_euclid(2) == 1 { 0.5 * step } else { 0.0 };
+        let ly = iy as f32 * dy;
+        for ix in -n..=n {
+            let lx = ix as f32 * step + ro;
+            let r = lx.hypot(ly);
+            if r <= r_max {
+                let rho = shells
+                    .iter()
+                    .find(|(sr, _)| r <= *sr)
+                    .map(|(_, d)| *d)
+                    .unwrap_or_else(|| shells.last().map(|(_, d)| *d).unwrap_or(1.0));
+                raw.push((Vec2::new(lx, ly), rho));
+            }
+        }
+    }
+    if raw.is_empty() {
+        return vec![(Vec2::ZERO, total_mass)];
+    }
+    let sum_w: f32 = raw.iter().map(|(_, w)| *w).sum();
+    if sum_w > 0.0 {
+        let scale = total_mass / sum_w;
+        for (_, w) in &mut raw {
+            *w *= scale;
+        }
+    }
+    raw
+}
+
+#[derive(Clone)]
+struct BodyProxy {
+    pos: Vec2,
+    vel: Vec2,
+    mass: f32,
+    bound_r: f32,
+    is_proj: bool,
+    geom: BodyShapeGeom,
+    boundary_rot: Vec<Vec2>,
+    edges_rot: Vec<(Vec2, Vec2)>,
+    mass_nodes_rot: Vec<(Vec2, f32)>,
+    inertia_gyr2: f32,
+}
+
+impl BodyProxy {
+    fn from_target(t: &TargetSpec, sim_dx: f32) -> Self {
+        let mass = t.estimate_mass().max(1.0);
+        let bound_r = t.bounding_radius().max(0.6);
+        let rot = Vec2::from_angle(t.angle_deg.to_radians());
+        let mut edges_rot = Vec::new();
+        let (geom, boundary_rot, mass_nodes_rot) = match &t.kind {
+            TargetKind::SolidBox { width, height, .. } => {
+                let hx = 0.5 * *width;
+                let hy = 0.5 * *height;
+                let verts = [
+                    rot.rotate(Vec2::new(-hx, -hy)),
+                    rot.rotate(Vec2::new(hx, -hy)),
+                    rot.rotate(Vec2::new(hx, hy)),
+                    rot.rotate(Vec2::new(-hx, hy)),
+                ];
+                edges_rot = (0..4).map(|k| (verts[k], verts[(k + 1) % 4])).collect();
+                let bnd = sample_poly_perimeter_rot(&verts, 0.7);
+                let mn = sample_rect_mass_nodes(hx, hy, mass, rot);
+                (BodyShapeGeom::Rect { hx, hy, rot }, bnd, mn)
+            }
+            TargetKind::CompositePlate { height, layers } => {
+                let w: f32 = layers.iter().map(|l| l.thickness).sum();
+                let hx = 0.5 * w;
+                let hy = 0.5 * *height;
+                let verts = [
+                    rot.rotate(Vec2::new(-hx, -hy)),
+                    rot.rotate(Vec2::new(hx, -hy)),
+                    rot.rotate(Vec2::new(hx, hy)),
+                    rot.rotate(Vec2::new(-hx, hy)),
+                ];
+                edges_rot = (0..4).map(|k| (verts[k], verts[(k + 1) % 4])).collect();
+                let bnd = sample_poly_perimeter_rot(&verts, 0.7);
+                let mut acc_x = -hx;
+                let mut mn = Vec::new();
+                for l in layers {
+                    let cx = acc_x + 0.5 * l.thickness;
+                    let lm = l.thickness * *height * l.mat.props().rho0;
+                    for iy in 0..4 {
+                        let ly = -hy + (iy as f32 + 0.5) * (*height * 0.25);
+                        mn.push((rot.rotate(Vec2::new(cx, ly)), lm * 0.25));
+                    }
+                    acc_x += l.thickness;
+                }
+                if mn.is_empty() {
+                    mn.push((Vec2::ZERO, mass));
+                }
+                (BodyShapeGeom::Rect { hx, hy, rot }, bnd, mn)
+            }
+            TargetKind::Ellipse { rx, ry, .. } => {
+                let verts: Vec<Vec2> = (0..32)
+                    .map(|k| {
+                        let th = (k as f32 / 32.0) * std::f32::consts::TAU;
+                        rot.rotate(Vec2::new(*rx * th.cos(), *ry * th.sin()))
+                    })
+                    .collect();
+                let mut mn = Vec::with_capacity(24);
+                let step_x = (*rx * 0.45).max(0.5);
+                let step_y = (*ry * 0.45).max(0.5);
+                for iy in -2..=2 {
+                    let ly = iy as f32 * step_y;
+                    for ix in -2..=2 {
+                        let lx = ix as f32 * step_x;
+                        if (lx / *rx).powi(2) + (ly / *ry).powi(2) <= 1.0 {
+                            mn.push((rot.rotate(Vec2::new(lx, ly)), 1.0f32));
+                        }
+                    }
+                }
+                let n_len = mn.len().max(1) as f32;
+                for (_, w) in &mut mn {
+                    *w = mass / n_len;
+                }
+                if mn.is_empty() {
+                    mn.push((Vec2::ZERO, mass));
+                }
+                (BodyShapeGeom::Ellipse { rx: *rx, ry: *ry, rot }, verts, mn)
+            }
+            TargetKind::HollowRing { outer_r, wall_thick, .. } => {
+                let inner_r = (*outer_r - *wall_thick).max(0.0);
+                let mut verts = Vec::with_capacity(32);
+                let r_mid = 0.5 * (*outer_r + inner_r);
+                let mn: Vec<(Vec2, f32)> = (0..16)
+                    .map(|k| {
+                        let th = (k as f32 / 16.0) * std::f32::consts::TAU;
+                        (Vec2::from_angle(th) * r_mid, mass / 16.0)
+                    })
+                    .collect();
+                for k in 0..24 {
+                    let th = (k as f32 / 24.0) * std::f32::consts::TAU;
+                    verts.push(Vec2::from_angle(th) * *outer_r);
+                }
+                (
+                    BodyShapeGeom::Annulus {
+                        inner_r,
+                        outer_r: *outer_r,
+                    },
+                    verts,
+                    mn,
+                )
+            }
+            TargetKind::TriangleWedge { width, height, .. } => {
+                let hw = (0.5 * *width).max(1.0);
+                let hh = (0.5 * *height).max(1.0);
+                let verts = vec![
+                    rot.rotate(Vec2::new(-hw, -hh)),
+                    rot.rotate(Vec2::new(hw, 0.0)),
+                    rot.rotate(Vec2::new(-hw, hh)),
+                ];
+                edges_rot = (0..3).map(|k| (verts[k], verts[(k + 1) % 3])).collect();
+                let bnd = sample_poly_perimeter_rot(&verts, 0.7);
+                let com = rot.rotate(Vec2::new(-hw / 3.0, 0.0));
+                let mn = vec![(com, mass)];
+                (
+                    BodyShapeGeom::Polygon {
+                        verts_rot: verts,
+                    },
+                    bnd,
+                    mn,
+                )
+            }
+            TargetKind::LayeredPlanet { shells } => {
+                let mut acc_r = 0.0f32;
+                let mut cum = Vec::with_capacity(shells.len());
+                for s in shells {
+                    acc_r += s.thickness.max(0.5);
+                    cum.push((acc_r, s.mat.props().rho0));
+                }
+                let r_out = acc_r.max(1.0);
+                let bnd: Vec<Vec2> = (0..24)
+                    .map(|k| Vec2::from_angle((k as f32 / 24.0) * std::f32::consts::TAU) * r_out)
+                    .collect();
+                let mn = sample_disk_mass_nodes(r_out, &cum, mass);
+                (BodyShapeGeom::Circle { radius: r_out }, bnd, mn)
+            }
+            TargetKind::Blueprint { bp } => Self::build_blueprint_proxy(bp, sim_dx, rot, mass),
+        };
+        Self::finish(t.pos, t.vel, mass, bound_r, false, geom, boundary_rot, edges_rot, mass_nodes_rot)
+    }
+
+    fn from_projectile(p: &ProjectileSpec, sim_dx: f32) -> Self {
+        let mass = p.estimate_mass().max(0.5);
+        let bound_r = p.bounding_radius().max(0.6);
+        let vel = p.vel_cm_per_us();
+        let rot = Vec2::from_angle(p.angle_deg.to_radians());
+        let mut edges_rot = Vec::new();
+        let r = p.radius_cm.max(0.45);
+        let (geom, boundary_rot, mass_nodes_rot) = match p.shape {
+            ProjectileShape::Sphere => {
+                let bnd = (0..20)
+                    .map(|k| Vec2::from_angle((k as f32 / 20.0) * std::f32::consts::TAU) * r)
+                    .collect();
+                let mn = sample_disk_mass_nodes(r, &[(r, p.mat.props().rho0)], mass);
+                (BodyShapeGeom::Circle { radius: r }, bnd, mn)
+            }
+            ProjectileShape::DifferentiatedAsteroid => {
+                let rc = (r * p.core_frac.clamp(0.15, 0.85)).max(0.4);
+                let bnd = (0..20)
+                    .map(|k| Vec2::from_angle((k as f32 / 20.0) * std::f32::consts::TAU) * r)
+                    .collect();
+                let mn = sample_disk_mass_nodes(
+                    r,
+                    &[(rc, p.core_mat.props().rho0), (r, p.mat.props().rho0)],
+                    mass,
+                );
+                (BodyShapeGeom::Circle { radius: r }, bnd, mn)
+            }
+            ProjectileShape::HollowRing => {
+                let inner_r = (r * (1.0 - p.core_frac.clamp(0.15, 0.85))).max(0.0);
+                let r_mid = 0.5 * (r + inner_r);
+                let bnd = (0..20)
+                    .map(|k| Vec2::from_angle((k as f32 / 20.0) * std::f32::consts::TAU) * r)
+                    .collect();
+                let mn = (0..12)
+                    .map(|k| {
+                        (
+                            Vec2::from_angle((k as f32 / 12.0) * std::f32::consts::TAU) * r_mid,
+                            mass / 12.0,
+                        )
+                    })
+                    .collect();
+                (BodyShapeGeom::Annulus { inner_r, outer_r: r }, bnd, mn)
+            }
+            ProjectileShape::Ellipse => {
+                let rx = (0.5 * p.length_cm).max(1.0);
+                let bnd = (0..24)
+                    .map(|k| {
+                        let th = (k as f32 / 24.0) * std::f32::consts::TAU;
+                        rot.rotate(Vec2::new(rx * th.cos(), r * th.sin()))
+                    })
+                    .collect();
+                let mn = sample_rect_mass_nodes(0.75 * rx, 0.75 * r, mass, rot);
+                (BodyShapeGeom::Ellipse { rx, ry: r, rot }, bnd, mn)
+            }
+            ProjectileShape::BluntSlug => {
+                let hx = (0.5 * p.length_cm).max(1.0);
+                let verts = [
+                    rot.rotate(Vec2::new(-hx, -r)),
+                    rot.rotate(Vec2::new(hx, -r)),
+                    rot.rotate(Vec2::new(hx, r)),
+                    rot.rotate(Vec2::new(-hx, r)),
+                ];
+                edges_rot = (0..4).map(|k| (verts[k], verts[(k + 1) % 4])).collect();
+                let bnd = sample_poly_perimeter_rot(&verts, 0.65);
+                let mn = sample_rect_mass_nodes(hx, r, mass, rot);
+                (BodyShapeGeom::Rect { hx, hy: r, rot }, bnd, mn)
+            }
+            ProjectileShape::Wedge => {
+                let hw = (0.5 * p.length_cm).max(1.0);
+                let verts = vec![
+                    rot.rotate(Vec2::new(-hw, -r)),
+                    rot.rotate(Vec2::new(hw, 0.0)),
+                    rot.rotate(Vec2::new(-hw, r)),
+                ];
+                edges_rot = (0..3).map(|k| (verts[k], verts[(k + 1) % 3])).collect();
+                let bnd = sample_poly_perimeter_rot(&verts, 0.65);
+                let mn = vec![(rot.rotate(Vec2::new(-hw / 3.0, 0.0)), mass)];
+                (BodyShapeGeom::Polygon { verts_rot: verts }, bnd, mn)
+            }
+            ProjectileShape::LongRodDart => {
+                let hl = (0.5 * p.length_cm).max(2.0);
+                let ns = hl * 0.58;
+                let fs = -hl * 0.72;
+                let verts = vec![
+                    rot.rotate(Vec2::new(-hl, 2.15 * r)),
+                    rot.rotate(Vec2::new(fs, r)),
+                    rot.rotate(Vec2::new(ns, r)),
+                    rot.rotate(Vec2::new(hl, 0.18 * r)),
+                    rot.rotate(Vec2::new(hl, -0.18 * r)),
+                    rot.rotate(Vec2::new(ns, -r)),
+                    rot.rotate(Vec2::new(fs, -r)),
+                    rot.rotate(Vec2::new(-hl, -2.15 * r)),
+                ];
+                edges_rot = (0..verts.len())
+                    .map(|k| (verts[k], verts[(k + 1) % verts.len()]))
+                    .collect();
+                let bnd = sample_poly_perimeter_rot(&verts, 0.65);
+                let mn = sample_rect_mass_nodes(0.85 * hl, r, mass, rot);
+                (BodyShapeGeom::Polygon { verts_rot: verts }, bnd, mn)
+            }
+            ProjectileShape::ShapedJet => {
+                let hl = (0.5 * p.length_cm).max(3.0);
+                let verts = vec![
+                    rot.rotate(Vec2::new(-hl, 1.45 * r)),
+                    rot.rotate(Vec2::new(hl, 0.80 * r)),
+                    rot.rotate(Vec2::new(hl, -0.80 * r)),
+                    rot.rotate(Vec2::new(-hl, -1.45 * r)),
+                ];
+                edges_rot = (0..4).map(|k| (verts[k], verts[(k + 1) % 4])).collect();
+                let bnd = sample_poly_perimeter_rot(&verts, 0.65);
+                let mn = sample_rect_mass_nodes(0.85 * hl, r, mass, rot);
+                (BodyShapeGeom::Polygon { verts_rot: verts }, bnd, mn)
+            }
+            ProjectileShape::CustomBlueprint => {
+                if let Some(bp) = &p.blueprint {
+                    Self::build_blueprint_proxy(bp, sim_dx, rot, mass)
+                } else {
+                    let hx = (0.5 * p.length_cm).max(1.0);
+                    let verts = [
+                        rot.rotate(Vec2::new(-hx, -r)),
+                        rot.rotate(Vec2::new(hx, -r)),
+                        rot.rotate(Vec2::new(hx, r)),
+                        rot.rotate(Vec2::new(-hx, r)),
+                    ];
+                    edges_rot = (0..4).map(|k| (verts[k], verts[(k + 1) % 4])).collect();
+                    let bnd = sample_poly_perimeter_rot(&verts, 0.65);
+                    let mn = sample_rect_mass_nodes(hx, r, mass, rot);
+                    (BodyShapeGeom::Rect { hx, hy: r, rot }, bnd, mn)
+                }
+            }
+        };
+        Self::finish(p.pos, vel, mass, bound_r, true, geom, boundary_rot, edges_rot, mass_nodes_rot)
+    }
+
+    fn build_blueprint_proxy(
+        bp: &PixelBlueprint,
+        dx: f32,
+        rot: Vec2,
+        total_mass: f32,
+    ) -> (BodyShapeGeom, Vec<Vec2>, Vec<(Vec2, f32)>) {
+        let Some((min_x, min_y, max_x, max_y)) = bp.occupied_bounds() else {
+            return (
+                BodyShapeGeom::Circle { radius: 1.5 },
+                vec![Vec2::X * 1.5, Vec2::NEG_X * 1.5],
+                vec![(Vec2::ZERO, total_mass)],
+            );
+        };
+        let dy = dx * 0.866_025_4;
+        let mid_gx = 0.5 * (min_x + max_x) as f32;
+        let mid_gy = 0.5 * (min_y + max_y) as f32;
+
+        let mut raw_bnd = Vec::new();
+        let mut bins = vec![(Vec2::ZERO, 0.0f32); 16];
+        let mut sum_rho = 0.0f32;
+        let w_span = (max_x - min_x + 1).max(1) as f32;
+        let h_span = (max_y - min_y + 1).max(1) as f32;
+
+        for y in min_y..=max_y {
+            let row_off = if y % 2 == 1 { 0.5 * dx } else { 0.0 };
+            let ly = (mid_gy - y as f32) * dy;
+            for x in min_x..=max_x {
+                if let Some(m) = bp.get(x as i32, y as i32) {
+                    let lx = (x as f32 - mid_gx) * dx + row_off;
+                    let lp = Vec2::new(lx, ly);
+                    let rho = m.props().rho0;
+                    sum_rho += rho;
+                    let bx = (((x - min_x) as f32 / w_span) * 4.0).floor().clamp(0.0, 3.0) as usize;
+                    let by = (((y - min_y) as f32 / h_span) * 4.0).floor().clamp(0.0, 3.0) as usize;
+                    let bid = by * 4 + bx;
+                    bins[bid].0 += lp * rho;
+                    bins[bid].1 += rho;
+
+                    let xi = x as i32;
+                    let yi = y as i32;
+                    if bp.get(xi - 1, yi).is_none()
+                        || bp.get(xi + 1, yi).is_none()
+                        || bp.get(xi, yi - 1).is_none()
+                        || bp.get(xi, yi + 1).is_none()
+                    {
+                        raw_bnd.push(rot.rotate(lp));
+                    }
+                }
+            }
+        }
+        let max_pts = 72usize;
+        let bnd = if raw_bnd.len() > max_pts {
+            let stride = raw_bnd.len().div_ceil(max_pts);
+            raw_bnd.into_iter().step_by(stride).collect()
+        } else {
+            raw_bnd
+        };
+        let mut mn = Vec::with_capacity(16);
+        let scale = if sum_rho > 0.0 { total_mass / sum_rho } else { 1.0 };
+        for (com_sum, w) in bins {
+            if w > 0.0 {
+                mn.push((rot.rotate(com_sum / w), w * scale));
+            }
+        }
+        if mn.is_empty() {
+            mn.push((Vec2::ZERO, total_mass));
+        }
+        (
+            BodyShapeGeom::Blueprint {
+                bp: bp.clone(),
+                dx,
+                rot,
+                mid_gx,
+                mid_gy,
+            },
+            bnd,
+            mn,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish(
+        pos: Vec2,
+        vel: Vec2,
+        mass: f32,
+        bound_r: f32,
+        is_proj: bool,
+        geom: BodyShapeGeom,
+        boundary_rot: Vec<Vec2>,
+        edges_rot: Vec<(Vec2, Vec2)>,
+        mass_nodes_rot: Vec<(Vec2, f32)>,
+    ) -> Self {
+        let inertia_gyr2 = if mass > 0.0 {
+            mass_nodes_rot
+                .iter()
+                .map(|(off, m)| m * off.length_squared())
+                .sum::<f32>()
+                / mass
+        } else {
+            0.5 * bound_r * bound_r
+        };
+        Self {
+            pos,
+            vel,
+            mass,
+            bound_r,
+            is_proj,
+            geom,
+            boundary_rot,
+            edges_rot,
+            mass_nodes_rot,
+            inertia_gyr2,
+        }
+    }
+}
+
+fn collide_bodies(a: &BodyProxy, pos_a: Vec2, b: &BodyProxy, pos_b: Vec2) -> Option<Vec2> {
+    if let (BodyShapeGeom::Circle { radius: ra }, BodyShapeGeom::Circle { radius: rb }) =
+        (&a.geom, &b.geom)
+    {
+        let d = pos_b - pos_a;
+        let r_sum = ra + rb;
+        let d2 = d.length_squared();
+        if d2 <= r_sum * r_sum {
+            let dist = d2.sqrt();
+            let dir = if dist > 1e-6 { d / dist } else { Vec2::X };
+            return Some(pos_a + dir * (*ra).min(dist));
+        }
+        return None;
+    }
+    if let BodyShapeGeom::Circle { radius: ra } = &a.geom {
+        let (inside, closest_b) = b.geom.closest_boundary_world(pos_b, pos_a);
+        if inside || (pos_a - closest_b).length_squared() <= ra * ra {
+            return Some(closest_b);
+        }
+        return None;
+    }
+    if let BodyShapeGeom::Circle { radius: rb } = &b.geom {
+        let (inside, closest_a) = a.geom.closest_boundary_world(pos_a, pos_b);
+        if inside || (pos_b - closest_a).length_squared() <= rb * rb {
+            return Some(closest_a);
+        }
+        return None;
+    }
+
+    let bp_pad_a: f32 = if matches!(a.geom, BodyShapeGeom::Blueprint { .. }) { 0.35 } else { 0.12 };
+    let bp_pad_b: f32 = if matches!(b.geom, BodyShapeGeom::Blueprint { .. }) { 0.35 } else { 0.12 };
+    let tol = bp_pad_a.max(bp_pad_b);
+
+    for &off_a in &a.boundary_rot {
+        let pt_w = pos_a + off_a;
+        let (inside, closest_b) = b.geom.closest_boundary_world(pos_b, pt_w);
+        if inside || (pt_w - closest_b).length_squared() <= tol * tol {
+            return Some(closest_b);
+        }
+    }
+    for &off_b in &b.boundary_rot {
+        let pt_w = pos_b + off_b;
+        let (inside, closest_a) = a.geom.closest_boundary_world(pos_a, pt_w);
+        if inside || (pt_w - closest_a).length_squared() <= tol * tol {
+            return Some(pt_w);
+        }
+    }
+    for &(a0, a1) in &a.edges_rot {
+        for &(b0, b1) in &b.edges_rot {
+            if let Some(hit) = segments_intersect(pos_a + a0, pos_a + a1, pos_b + b0, pos_b + b1) {
+                return Some(hit);
+            }
+        }
+    }
+    None
+}
+
+fn compute_domain_soft_sq(bodies: &[BodyProxy], positions: &[Vec2], active: &[bool], dx: f32) -> f32 {
+    let mut tot_m = 0.0f32;
+    let mut com = Vec2::ZERO;
+    for (i, b) in bodies.iter().enumerate() {
+        if active[i] {
+            tot_m += b.mass;
+            com += positions[i] * b.mass;
+        }
+    }
+    if tot_m <= 0.0 {
+        return (2.4 * dx) * (2.4 * dx) + 0.6;
+    }
+    com /= tot_m;
+    let mut r2_sum = 0.0f32;
+    for (i, b) in bodies.iter().enumerate() {
+        if active[i] {
+            r2_sum += b.mass * ((positions[i] - com).length_squared() + b.inertia_gyr2);
+        }
+    }
+    let r_rms = (r2_sum / tot_m).sqrt();
+    let half_span = (3.4 * r_rms).clamp(28.0, 600.0);
+    let cell_sz = (2.0 * half_span) / 32.0;
+    (2.4 * dx) * (2.4 * dx) + 0.20 * cell_sz * cell_sz
+}
+
+fn compute_pair_gravity_acc(
+    recv: &BodyProxy,
+    pos_r: Vec2,
+    src: &BodyProxy,
+    pos_s: Vec2,
+    grav: f32,
+    soft_sq: f32,
+) -> Vec2 {
+    let d_com = pos_s - pos_r;
+    let close_thresh = 4.2 * (recv.bound_r + src.bound_r);
+    if d_com.length_squared() > close_thresh * close_thresh
+        || (recv.mass_nodes_rot.len() <= 1 && src.mass_nodes_rot.len() <= 1)
+    {
+        let r2 = d_com.length_squared() + soft_sq;
+        return d_com * (grav * src.mass / (r2 * r2.sqrt()));
+    }
+    let r_stride = recv.mass_nodes_rot.len().div_ceil(12).max(1);
+    let mut acc_sum = Vec2::ZERO;
+    let mut m_sum = 0.0f32;
+    for &(ro, rm) in recv.mass_nodes_rot.iter().step_by(r_stride) {
+        let wp_r = pos_r + ro;
+        let mut g_node = Vec2::ZERO;
+        for &(so, sm) in &src.mass_nodes_rot {
+            let d = (pos_s + so) - wp_r;
+            let r2 = d.length_squared() + soft_sq;
+            g_node += d * (grav * sm / (r2 * r2.sqrt()));
+        }
+        acc_sum += g_node * rm;
+        m_sum += rm;
+    }
+    if m_sum > 0.0 {
+        acc_sum / m_sum
+    } else {
+        Vec2::ZERO
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -612,7 +1409,7 @@ impl SceneSpec {
     }
 
     /// Compute circular or eccentric orbit `(speed_kms, angle_deg)` for `projectiles[proj_idx]`
-    /// around the nearest massive target body under softened 2D N-body gravity.
+    /// around the nearest massive target body under softened extended-body 2D N-body gravity.
     pub fn compute_orbit_velocity(
         &self,
         proj_idx: usize,
@@ -623,15 +1420,25 @@ impl SceneSpec {
         if !self.self_gravity || self.grav_g <= 0.0 || self.targets.is_empty() {
             return None;
         }
-        let mut best_target: Option<(&TargetSpec, f32)> = None;
-        for t in &self.targets {
-            let score = t.estimate_mass() / (t.pos - p.pos).length_squared().max(1.0);
-            if best_target.is_none_or(|(_, s)| score > s) {
-                best_target = Some((t, score));
+        let dx = 0.35f32;
+        let tgt_proxies: Vec<BodyProxy> = self
+            .targets
+            .iter()
+            .map(|t| BodyProxy::from_target(t, dx))
+            .collect();
+        let proj_proxy = BodyProxy::from_projectile(p, dx);
+        let mut best_idx = 0usize;
+        let mut best_score = f32::NEG_INFINITY;
+        for (ti, t) in tgt_proxies.iter().enumerate() {
+            let score = t.mass / (t.pos - proj_proxy.pos).length_squared().max(1.0);
+            if score > best_score {
+                best_score = score;
+                best_idx = ti;
             }
         }
-        let (tgt, _) = best_target?;
-        let rel = p.pos - tgt.pos;
+        let tgt_p = &tgt_proxies[best_idx];
+        let tgt = &self.targets[best_idx];
+        let rel = proj_proxy.pos - tgt_p.pos;
         let r = rel.length().max(1.0);
         let r_hat = rel / r;
         let tang = if retrograde {
@@ -639,10 +1446,17 @@ impl SceneSpec {
         } else {
             Vec2::new(-r_hat.y, r_hat.x)
         };
-        let m_tot = tgt.estimate_mass() + p.estimate_mass();
-        let soft_sq = 2.0f32;
-        let denom = (r * r + soft_sq).powf(1.5);
-        let v_rel = (self.grav_g * m_tot * r * r / denom).max(0.0).sqrt() * eccentricity_factor;
+        let mut all_proxies = tgt_proxies.clone();
+        all_proxies.push(proj_proxy.clone());
+        let positions: Vec<Vec2> = all_proxies.iter().map(|b| b.pos).collect();
+        let active = vec![true; all_proxies.len()];
+        let soft_sq = compute_domain_soft_sq(&all_proxies, &positions, &active, dx);
+
+        let a_vec =
+            compute_pair_gravity_acc(&proj_proxy, proj_proxy.pos, tgt_p, tgt_p.pos, self.grav_g, soft_sq);
+        let a_inward = (-a_vec.dot(r_hat)).max(0.0);
+        let reduced_scale = (tgt_p.mass + proj_proxy.mass) / tgt_p.mass.max(1e-4);
+        let v_rel = (a_inward * r * reduced_scale).max(0.0).sqrt() * eccentricity_factor;
         let v_vec = tgt.vel + tang * v_rel;
         let speed_kms = (v_vec.length() * 10.0).clamp(0.0, 100.0);
         let angle_deg = if v_vec.length_squared() > 1e-12 {
@@ -653,32 +1467,26 @@ impl SceneSpec {
         Some((speed_kms, angle_deg))
     }
 
-    /// Integrate softened N-body trajectories in staging to visualize curved gravitational orbits & impact markers.
+    /// Integrate extended-body softened N-body trajectories with continuous swept shape-vs-shape collision.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn predict_staging_trajectories(&self) -> Vec<TrajectoryTrace> {
+        self.predict_staging_trajectories_with_dx(0.35)
+    }
+
+    /// Variant accepting active simulation spacing `dx` for blueprint cell scale parity.
+    pub fn predict_staging_trajectories_with_dx(&self, sim_dx: f32) -> Vec<TrajectoryTrace> {
         let n_t = self.targets.len();
         let n_p = self.projectiles.len();
         let n = n_t + n_p;
         if n == 0 {
             return Vec::new();
         }
-        let mut pos = Vec::with_capacity(n);
-        let mut vel = Vec::with_capacity(n);
-        let mut mass = Vec::with_capacity(n);
-        let mut rad = Vec::with_capacity(n);
-        let mut is_proj = Vec::with_capacity(n);
+        let mut bodies = Vec::with_capacity(n);
         for t in &self.targets {
-            pos.push(t.pos);
-            vel.push(t.vel);
-            mass.push(t.estimate_mass());
-            rad.push(t.bounding_radius());
-            is_proj.push(false);
+            bodies.push(BodyProxy::from_target(t, sim_dx));
         }
         for p in &self.projectiles {
-            pos.push(p.pos);
-            vel.push(p.vel_cm_per_us());
-            mass.push(p.estimate_mass());
-            rad.push(p.bounding_radius());
-            is_proj.push(true);
+            bodies.push(BodyProxy::from_projectile(p, sim_dx));
         }
 
         let grav = if self.self_gravity && self.grav_g > 0.0 {
@@ -687,22 +1495,59 @@ impl SceneSpec {
             0.0
         };
 
-        let mut traces: Vec<TrajectoryTrace> = (0..n)
-            .map(|i| TrajectoryTrace {
-                is_projectile: is_proj[i],
-                points: vec![pos[i]],
+        let mut pos: Vec<Vec2> = bodies.iter().map(|b| b.pos).collect();
+        let mut vel: Vec<Vec2> = bodies.iter().map(|b| b.vel).collect();
+        let mut traces: Vec<TrajectoryTrace> = bodies
+            .iter()
+            .map(|b| TrajectoryTrace {
+                is_projectile: b.is_proj,
+                points: vec![b.pos],
                 impact: None,
+                impact_body_pos: None,
             })
             .collect();
         let mut active = vec![true; n];
+        let mut last_recorded_pos: Vec<Vec2> = pos.clone();
 
-        let steps = if grav > 0.0 { 260usize } else { 90usize };
-        let soft_sq = 2.0f32;
+        // Check initial t = 0 overlap immediately
+        for i in 0..n {
+            if !active[i] {
+                continue;
+            }
+            for j in (i + 1)..n {
+                if !active[j] {
+                    continue;
+                }
+                if (pos[j] - pos[i]).length_squared() <= (bodies[i].bound_r + bodies[j].bound_r).powi(2)
+                {
+                    if let Some(contact) = collide_bodies(&bodies[i], pos[i], &bodies[j], pos[j]) {
+                        let keep_tgt_i = !bodies[i].is_proj
+                            && bodies[j].is_proj
+                            && bodies[j].mass < 0.35 * bodies[i].mass;
+                        let keep_tgt_j = !bodies[j].is_proj
+                            && bodies[i].is_proj
+                            && bodies[i].mass < 0.35 * bodies[j].mass;
+                        if !keep_tgt_i {
+                            traces[i].impact = Some(contact);
+                            traces[i].impact_body_pos = Some(pos[i]);
+                            active[i] = false;
+                        }
+                        if !keep_tgt_j {
+                            traces[j].impact = Some(contact);
+                            traces[j].impact_body_pos = Some(pos[j]);
+                            active[j] = false;
+                        }
+                    }
+                }
+            }
+        }
+
         let compute_acc = |positions: &[Vec2], alive: &[bool]| -> Vec<Vec2> {
             let mut acc = vec![Vec2::ZERO; n];
             if grav <= 0.0 {
                 return acc;
             }
+            let soft_sq = compute_domain_soft_sq(&bodies, positions, alive, sim_dx);
             for i in 0..n {
                 if !alive[i] {
                     continue;
@@ -712,70 +1557,152 @@ impl SceneSpec {
                     if i == j || !alive[j] {
                         continue;
                     }
-                    let d = positions[j] - positions[i];
-                    let r2 = d.length_squared() + soft_sq;
-                    g += d * (grav * mass[j] / (r2 * r2.sqrt()));
+                    g += compute_pair_gravity_acc(
+                        &bodies[i],
+                        positions[i],
+                        &bodies[j],
+                        positions[j],
+                        grav,
+                        soft_sq,
+                    );
                 }
                 acc[i] = g;
             }
             acc
         };
 
-        let max_v = vel.iter().map(|v| v.length()).fold(0.05f32, f32::max);
-        let dt = if grav > 0.0 {
-            (1.6 / max_v.max(0.04)).clamp(0.45, 5.5)
-        } else {
-            (1.2 / max_v.max(0.04)).clamp(0.25, 2.5)
-        };
+        let steps = if grav > 0.0 { 520usize } else { 180usize };
         let mut acc = compute_acc(&pos, &active);
 
         for step_idx in 0..steps {
-            for i in 0..n {
-                if !active[i] {
-                    continue;
-                }
-                pos[i] += vel[i] * dt + 0.5 * acc[i] * dt * dt;
+            if !active.iter().any(|&a| a) {
+                break;
             }
+            let mut v_max = 0.02f32;
+            let mut a_max = 0.0f32;
+            for i in 0..n {
+                if active[i] {
+                    v_max = v_max.max(vel[i].length());
+                    a_max = a_max.max(acc[i].length());
+                }
+            }
+            let dt = if grav > 0.0 {
+                let dt_v = 0.85 / v_max.max(0.03);
+                let dt_a = if a_max > 1e-7 {
+                    (0.10 * v_max.max(0.05) / a_max).clamp(0.10, 4.2)
+                } else {
+                    4.2
+                };
+                dt_v.min(dt_a).clamp(0.08, 4.2)
+            } else {
+                (1.8 / v_max.max(0.04)).clamp(0.15, 2.5)
+            };
+
+            let prev_pos = pos.clone();
+            for i in 0..n {
+                if active[i] {
+                    pos[i] += vel[i] * dt + 0.5 * acc[i] * dt * dt;
+                }
+            }
+
+            // Swept continuous shape-vs-shape collision detection sorted earliest-first
+            loop {
+                let mut earliest: Option<(f32, usize, usize, Vec2)> = None;
+                for i in 0..n {
+                    if !active[i] {
+                        continue;
+                    }
+                    for j in (i + 1)..n {
+                        if !active[j] {
+                            continue;
+                        }
+                        let r_rel0 = prev_pos[i] - prev_pos[j];
+                        let r_rel1 = pos[i] - pos[j];
+                        let seg = r_rel1 - r_rel0;
+                        let seg_len2 = seg.length_squared();
+                        let u_min = if seg_len2 > 1e-12 {
+                            (-r_rel0.dot(seg) / seg_len2).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let min_d2 = (r_rel0 + seg * u_min).length_squared();
+                        let br_sum = bodies[i].bound_r + bodies[j].bound_r + 0.4;
+                        if min_d2 > br_sum * br_sum {
+                            continue;
+                        }
+
+                        let n_sub = ((seg_len2.sqrt() / 0.35).ceil() as usize).clamp(1, 28);
+                        let mut hit_span: Option<(f32, f32, Vec2)> = None;
+                        for s in 1..=n_sub {
+                            let u_hi = s as f32 / n_sub as f32;
+                            let pa = prev_pos[i].lerp(pos[i], u_hi);
+                            let pb = prev_pos[j].lerp(pos[j], u_hi);
+                            if let Some(c) = collide_bodies(&bodies[i], pa, &bodies[j], pb) {
+                                let u_lo = (s - 1) as f32 / n_sub as f32;
+                                hit_span = Some((u_lo, u_hi, c));
+                                break;
+                            }
+                        }
+                        if let Some((mut lo, mut hi, mut contact)) = hit_span {
+                            for _ in 0..6 {
+                                let mid = 0.5 * (lo + hi);
+                                let pa = prev_pos[i].lerp(pos[i], mid);
+                                let pb = prev_pos[j].lerp(pos[j], mid);
+                                if let Some(c) = collide_bodies(&bodies[i], pa, &bodies[j], pb) {
+                                    hi = mid;
+                                    contact = c;
+                                } else {
+                                    lo = mid;
+                                }
+                            }
+                            if earliest.is_none_or(|(best_u, _, _, _)| hi < best_u) {
+                                earliest = Some((hi, i, j, contact));
+                            }
+                        }
+                    }
+                }
+
+                let Some((u_hit, i, j, contact)) = earliest else {
+                    break;
+                };
+                let pi_hit = prev_pos[i].lerp(pos[i], u_hit);
+                let pj_hit = prev_pos[j].lerp(pos[j], u_hit);
+                let keep_tgt_i = !bodies[i].is_proj
+                    && bodies[j].is_proj
+                    && bodies[j].mass < 0.35 * bodies[i].mass;
+                let keep_tgt_j = !bodies[j].is_proj
+                    && bodies[i].is_proj
+                    && bodies[i].mass < 0.35 * bodies[j].mass;
+                if !keep_tgt_i {
+                    traces[i].points.push(pi_hit);
+                    traces[i].impact = Some(contact);
+                    traces[i].impact_body_pos = Some(pi_hit);
+                    active[i] = false;
+                }
+                if !keep_tgt_j {
+                    traces[j].points.push(pj_hit);
+                    traces[j].impact = Some(contact);
+                    traces[j].impact_body_pos = Some(pj_hit);
+                    active[j] = false;
+                }
+            }
+
             let next_acc = compute_acc(&pos, &active);
             for i in 0..n {
-                if !active[i] {
-                    continue;
+                if active[i] {
+                    vel[i] += 0.5 * (acc[i] + next_acc[i]) * dt;
                 }
-                vel[i] += 0.5 * (acc[i] + next_acc[i]) * dt;
             }
             acc = next_acc;
 
             for i in 0..n {
-                if !active[i] {
-                    continue;
-                }
-                for j in (i + 1)..n {
-                    if !active[j] {
-                        continue;
-                    }
-                    let d = pos[j] - pos[i];
-                    let hit_r = 0.88 * (rad[i] + rad[j]);
-                    if d.length_squared() <= hit_r * hit_r {
-                        let contact = 0.5 * (pos[i] + pos[j]);
-                        if is_proj[i] || !is_proj[j] {
-                            traces[i].points.push(contact);
-                            traces[i].impact = Some(contact);
-                            active[i] = false;
-                        }
-                        if is_proj[j] || !is_proj[i] {
-                            traces[j].points.push(contact);
-                            traces[j].impact = Some(contact);
-                            active[j] = false;
-                        }
-                    }
-                }
-            }
-
-            if step_idx % 4 == 3 || step_idx + 1 == steps {
-                for i in 0..n {
-                    if active[i] && (traces[i].is_projectile || vel[i].length_squared() > 1e-8) {
-                        traces[i].points.push(pos[i]);
-                    }
+                if active[i]
+                    && (traces[i].is_projectile || vel[i].length_squared() > 1e-8)
+                    && ((pos[i] - last_recorded_pos[i]).length_squared() >= 0.72
+                        || step_idx + 1 == steps)
+                {
+                    traces[i].points.push(pos[i]);
+                    last_recorded_pos[i] = pos[i];
                 }
             }
         }

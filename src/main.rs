@@ -1378,7 +1378,7 @@ impl eframe::App for RustedSpaceSimApp {
                     );
                     pill_badge(
                         ui,
-                        "v0.1.0",
+                        "v0.1.1",
                         ACCENT_CYAN,
                         Color32::from_rgb(16, 36, 54),
                     );
@@ -4068,8 +4068,11 @@ impl RustedSpaceSimApp {
         };
 
         // Predicted N-body / ballistic orbital trajectory arcs and impact markers
-        let traces = self.scene.predict_staging_trajectories();
-        for tr in &traces {
+        let traces = self
+            .scene
+            .predict_staging_trajectories_with_dx(self.resolution.dx());
+        let n_t = self.scene.targets.len();
+        for (ti, tr) in traces.iter().enumerate() {
             if tr.points.len() >= 2 {
                 let col = if tr.is_projectile {
                     Color32::from_rgba_unmultiplied(255, 200, 95, 145)
@@ -4086,6 +4089,33 @@ impl RustedSpaceSimApp {
                 }
             }
             if let Some(hit_w) = tr.impact {
+                if let Some(body_c) = tr.impact_body_pos {
+                    let ghost_stroke =
+                        Stroke::new(1.1_f32, Color32::from_rgba_unmultiplied(255, 135, 95, 115));
+                    if ti >= n_t {
+                        if let Some(p_orig) = self.scene.projectiles.get(ti - n_t) {
+                            let mut p_ghost = p_orig.clone();
+                            p_ghost.pos = body_c;
+                            draw_projectile_outline(
+                                painter,
+                                &to_screen,
+                                self.cam.zoom,
+                                &p_ghost,
+                                ghost_stroke,
+                            );
+                        }
+                    } else if let Some(t_orig) = self.scene.targets.get(ti) {
+                        let mut t_ghost = t_orig.clone();
+                        t_ghost.pos = body_c;
+                        draw_target_outline(painter, &to_screen, self.cam.zoom, &t_ghost, ghost_stroke);
+                    }
+                    if (body_c - hit_w).length_squared() > 0.04 {
+                        painter.line_segment(
+                            [to_screen(body_c), to_screen(hit_w)],
+                            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 115, 90, 120)),
+                        );
+                    }
+                }
                 let hs = to_screen(hit_w);
                 if rect.contains(hs) {
                     let hit_col = Color32::from_rgba_unmultiplied(255, 95, 75, 225);
@@ -5159,7 +5189,7 @@ fn run_headless_benchmark() {
 
 fn print_help() {
     println!(
-        "Rusted Space Simulation (rssim) v0.1.0
+        "Rusted Space Simulation (rssim) v0.1.1
 Vulkan GPU-Accelerated Continuum Elasto-Plastic, Reactive Detonation & Planetary Hydrocode
 (Mie-Gruneisen + JWL EOS + CSPM Renormalization + Johnson-Cook Viscoplasticity + 32x32 LDS Self-Gravity)
 
