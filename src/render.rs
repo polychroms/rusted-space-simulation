@@ -2190,6 +2190,18 @@ fn crumb_pixel_tex_rgb(
                 (speck + 12, speck - 4, speck - 8)
             }
         }
+        MaterialId::AttractorMass => {
+            // Luminous cyan-cobalt dense core micro-lattice
+            let shimmer = if ((tx + ty) & 1) == 0 { 16 } else { -8 };
+            let core = shimmer + ((n0 * 14) >> 7) - 6;
+            (core - 6, core + 6, core + 16)
+        }
+        MaterialId::RepulsorMass => {
+            // Radiant violet-magenta anti-gravity field striations
+            let wave = if (ty & 1) == 0 { 18 } else { -10 };
+            let glow = wave + ((n0 * 14) >> 7) - 6;
+            (glow + 14, glow - 6, glow + 18)
+        }
     };
 
     // Connected jagged 1-texel micro-crack bolts across damaged crumbs!

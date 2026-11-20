@@ -485,11 +485,22 @@ impl PixelBlueprint {
 }
 
 pub fn blueprint_storage_dir(subfolder: &str) -> PathBuf {
-    let base = std::env::var("HOME")
+    #[cfg(windows)]
+    let root = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("APPDATA"))
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".local/share/rssim")
-        .join(subfolder);
+        .unwrap_or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+        })
+        .join("rssim");
+    #[cfg(not(windows))]
+    let root = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".local/share/rssim");
+    let base = root.join(subfolder);
     let _ = fs::create_dir_all(&base);
     base
 }

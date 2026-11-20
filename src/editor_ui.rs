@@ -645,7 +645,28 @@ impl BlueprintEditor {
             // Live material physical & detonation properties card
             let mp = self.mat.props();
             ui.add_space(3.0);
-            if mp.is_energetic {
+            if self.mat.is_gravity_material() {
+                let q = self.mat.grav_charge_mult();
+                let mode_str = if q < 0.0 { "Repel vs matter" } else { "Attract" };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} | ρ₀={:.2} | Grav={:+.1}× ({}) | K={:.0} GPa | Y₀={:.2} GPa",
+                        mp.name,
+                        mp.rho0,
+                        q,
+                        mode_str,
+                        mp.bulk_modulus_gpa(),
+                        mp.yield_gpa(),
+                    ))
+                    .monospace()
+                    .size(9.8)
+                    .color(if q < 0.0 {
+                        Color32::from_rgb(225, 130, 255)
+                    } else {
+                        Color32::from_rgb(95, 215, 255)
+                    }),
+                );
+            } else if mp.is_energetic {
                 ui.label(
                     egui::RichText::new(format!(
                         "💥 {} | ρ₀={:.2} | D_CJ={:.2} km/s | P_init={:.2} GPa | Delay={:.1} µs",

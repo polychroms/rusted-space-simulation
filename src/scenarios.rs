@@ -2375,8 +2375,8 @@ mod tests {
 
     #[test]
     fn thirty_two_materials_thermite_octol_gpu_parity_and_ocean_moon() {
-        // 1. All 32 materials roundtrip cleanly by code and index
-        assert_eq!(MaterialId::ALL.len(), 32);
+        // 1. All 34 materials roundtrip cleanly by code and index
+        assert_eq!(MaterialId::ALL.len(), 34);
         for (idx, m) in crate::materials::MATERIALS.iter().enumerate() {
             let id = MaterialId::from_index(idx);
             assert_eq!(id as usize, idx);
@@ -2455,5 +2455,165 @@ mod tests {
             ocean.step(dt);
         }
         assert!(ocean.pos.iter().all(|p| p.is_finite()));
+    }
+
+    #[test]
+    fn attractor_and_repulsor_gravity_materials_orbits_and_gpu_parity() {
+        use crate::scene::{PlanetShell, ProjectileSpec, SceneSpec, TargetKind, TargetSpec};
+
+        // 1. Live brush paint auto-activates self-gravity
+        let mut brush_w = ContinuumWorld::new(0.45);
+        assert!(!brush_w.self_gravity);
+        brush_w.paint_matter_disc(Vec2::ZERO, 2.0, MaterialId::AttractorMass, Vec2::ZERO, None, 1);
+        assert!(brush_w.self_gravity && brush_w.grav_g > 0.0);
+
+        // 2. Staging Attractor + Tungsten satellite without manually toggling self_gravity builds a stable bound orbit
+        let mut orbit_scene = SceneSpec::empty();
+        assert!(!orbit_scene.self_gravity);
+        orbit_scene.targets.push(TargetSpec {
+            name: "Attractor Core".to_string(),
+            pos: Vec2::ZERO,
+            vel: Vec2::ZERO,
+            angle_deg: 0.0,
+            temp_k: 293.0,
+            kind: TargetKind::LayeredPlanet {
+                shells: vec![PlanetShell {
+                    thickness: 5.5,
+                    mat: MaterialId::AttractorMass,
+                    temp_k: 293.0,
+                }],
+            },
+        });
+        let mut orb_proj = ProjectileSpec::default_with_shape(
+            ProjectileShape::Sphere,
+            Vec2::new(15.0, 0.0),
+            MaterialId::Tungsten,
+        );
+        orb_proj.speed_kms = 0.0;
+        orb_proj.length_cm = 3.0;
+        orb_proj.radius_cm = 1.5;
+        orbit_scene.projectiles.push(orb_proj);
+        assert!(orbit_scene.effective_self_gravity().0);
+        let (orb_spd, orb_ang) = orbit_scene
+            .compute_orbit_velocity(0, false, 1.0)
+            .expect("Attractor must yield a valid circular orbit velocity");
+        assert!(orb_spd > 0.3, "Expected high-G orbital speed, got {orb_spd:.3} km/s");
+        orbit_scene.projectiles[0].speed_kms = orb_spd;
+        orbit_scene.projectiles[0].angle_deg = orb_ang;
+
+        let traces = orbit_scene.predict_staging_trajectories_with_dx(0.45);
+        assert!(traces[1].impact.is_none(), "Circular orbit around Attractor should not impact");
+        assert!(
+            traces[1].points.iter().any(|p| p.y > 6.0) && traces[1].points.iter().any(|p| p.x < 10.0),
+            "Predicted orbit trajectory must curve strongly around Attractor"
+        );
+
+        // CPU vs Vulkan GPU parity + intact cohesion for both Attractor and orbiting Tungsten body
+        let mut w_cpu = orbit_scene.build_world(0.45);
+        let mut w_gpu = orbit_scene.build_world(0.45);
+        assert!(w_cpu.self_gravity);
+        for _ in 0..280 {
+            w_cpu.step(0.14);
+        }
+        let mut vk_opt = crate::vulkan_gpu::VulkanPhysicsEngine::new().ok();
+        if let Some(vk) = &mut vk_opt {
+            vk.step_batch(&mut w_gpu, 280, 0.14);
+        } else {
+            for _ in 0..280 {
+                w_gpu.step(0.14);
+            }
+        }
+        let body_com = |w: &ContinuumWorld, mat: MaterialId| -> (Vec2, f32) {
+            let mut sum = Vec2::ZERO;
+            let mut cnt = 0usize;
+            for i in 0..w.len() {
+                if w.mat[i] == mat {
+                    sum += w.pos[i];
+                    cnt += 1;
+                }
+            }
+            let com = sum / cnt.max(1) as f32;
+            let mut r2 = 0.0f32;
+            for i in 0..w.len() {
+                if w.mat[i] == mat {
+                    r2 += (w.pos[i] - com).length_squared();
+                }
+            }
+            (com, (r2 / cnt.max(1) as f32).sqrt())
+        };
+        let (sat_cpu, sat_r_cpu) = body_com(&w_cpu, MaterialId::Tungsten);
+        let (sat_gpu, sat_r_gpu) = body_com(&w_gpu, MaterialId::Tungsten);
+        let (attr_cpu, attr_r_cpu) = body_com(&w_cpu, MaterialId::AttractorMass);
+        let orb_r = (sat_cpu - attr_cpu).length();
+        assert!(
+            sat_cpu.y > 4.0 && sat_cpu.x < 14.3 && (13.8..=16.2).contains(&orb_r),
+            "Satellite must curve into circular orbit around Attractor (sat_cpu={sat_cpu:?}, orb_r={orb_r:.2})"
+        );
+        assert!(
+            (sat_cpu - sat_gpu).length() < 0.35 && (sat_r_cpu - sat_r_gpu).abs() < 0.15,
+            "Attractor orbit CPU/GPU parity drifted: cpu={sat_cpu:?} gpu={sat_gpu:?}"
+        );
+        assert!(attr_r_cpu < 4.5 && sat_r_cpu < 1.5, "Bodies stayed solid: attr_r={attr_r_cpu:.2}, sat_r={sat_r_cpu:.2}");
+        assert!(attr_cpu.length() < 2.0);
+
+        // 3. Repulsor repels normal matter while staying internally cohesive (same-sign `- * - > 0`), CPU vs GPU parity
+        let mut rep_scene = SceneSpec::empty();
+        rep_scene.targets.push(TargetSpec {
+            name: "Repulsor Core".to_string(),
+            pos: Vec2::ZERO,
+            vel: Vec2::ZERO,
+            angle_deg: 0.0,
+            temp_k: 293.0,
+            kind: TargetKind::LayeredPlanet {
+                shells: vec![PlanetShell {
+                    thickness: 5.0,
+                    mat: MaterialId::RepulsorMass,
+                    temp_k: 293.0,
+                }],
+            },
+        });
+        let mut rep_proj = ProjectileSpec::default_with_shape(
+            ProjectileShape::Sphere,
+            Vec2::new(11.0, 0.0),
+            MaterialId::BasaltRock,
+        );
+        rep_proj.speed_kms = 0.0;
+        rep_proj.length_cm = 3.0;
+        rep_proj.radius_cm = 1.5;
+        rep_scene.projectiles.push(rep_proj);
+        assert!(rep_scene.effective_self_gravity().0);
+        assert!(
+            rep_scene.compute_orbit_velocity(0, false, 1.0).is_none(),
+            "Pure Repulsor has no bound attractive orbit"
+        );
+        let rep_traces = rep_scene.predict_staging_trajectories_with_dx(0.45);
+        assert!(rep_traces[1].impact.is_none());
+        let pred_end_dist = (rep_traces[1].points.last().copied().unwrap() - Vec2::ZERO).length();
+        assert!(pred_end_dist > 14.0, "Predictor must push rock away from Repulsor (d={pred_end_dist:.2})");
+
+        let mut rw_cpu = rep_scene.build_world(0.45);
+        let mut rw_gpu = rep_scene.build_world(0.45);
+        for _ in 0..220 {
+            rw_cpu.step(0.14);
+        }
+        if let Some(vk) = &mut vk_opt {
+            vk.step_batch(&mut rw_gpu, 220, 0.14);
+        } else {
+            for _ in 0..220 {
+                rw_gpu.step(0.14);
+            }
+        }
+        let (rep_cpu, rep_r_cpu) = body_com(&rw_cpu, MaterialId::RepulsorMass);
+        let (rock_cpu, _) = body_com(&rw_cpu, MaterialId::BasaltRock);
+        let (rep_gpu, rep_r_gpu) = body_com(&rw_gpu, MaterialId::RepulsorMass);
+        let (rock_gpu, _) = body_com(&rw_gpu, MaterialId::BasaltRock);
+        let sep_cpu = (rock_cpu - rep_cpu).length();
+        assert!(sep_cpu > 11.5, "Repulsor must push BasaltRock farther than initial 11.0 cm (sep={sep_cpu:.3})");
+        assert!(rock_cpu.x > 11.05 && rep_cpu.x < -0.005, "Equal & opposite momentum recoil expected (rep={rep_cpu:?}, rock={rock_cpu:?})");
+        assert!(rep_r_cpu < 4.2, "Repulsor must stay cohesive internally, not self-explode (r_rms={rep_r_cpu:.2})");
+        assert!(
+            (rock_cpu - rock_gpu).length() < 0.25 && (rep_cpu - rep_gpu).length() < 0.15 && (rep_r_cpu - rep_r_gpu).abs() < 0.15,
+            "Repulsor CPU/GPU parity drifted: rock cpu={rock_cpu:?} gpu={rock_gpu:?}, rep cpu={rep_cpu:?} gpu={rep_gpu:?}"
+        );
     }
 }

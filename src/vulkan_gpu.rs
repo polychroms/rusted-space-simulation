@@ -9,6 +9,7 @@ use crate::physics::{ContinuumWorld, GpuMaterial, GpuParticle};
 pub const MAX_GPU_PARTICLES: usize = 196_608;
 const HASH_BUCKETS: usize = 131_072;
 const GRAV_CELLS: usize = 1_024;
+const GRAV_SLOTS: usize = GRAV_CELLS * 2;
 const WORKGROUP_SIZE: u32 = 256;
 
 const SPV_CLEAR_GRID: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/clear_grid.comp.spv"));
@@ -190,7 +191,7 @@ impl VulkanPhysicsEngine {
             let (materials_buf, _) = Self::alloc_buffer(
                 &device,
                 &mem_props,
-                (32 * size_of::<GpuMaterial>()) as vk::DeviceSize,
+                (34 * size_of::<GpuMaterial>()) as vk::DeviceSize,
                 vk::BufferUsageFlags::STORAGE_BUFFER,
                 MemKind::HostCoherentUpload,
             )?;
@@ -218,7 +219,7 @@ impl VulkanPhysicsEngine {
             let (grav_grid_buf, _) = Self::alloc_buffer(
                 &device,
                 &mem_props,
-                (GRAV_CELLS * 16) as vk::DeviceSize,
+                (GRAV_SLOTS * 16) as vk::DeviceSize,
                 vk::BufferUsageFlags::STORAGE_BUFFER,
                 MemKind::DeviceLocal,
             )?;
@@ -227,7 +228,7 @@ impl VulkanPhysicsEngine {
             ptr::copy_nonoverlapping(
                 mat_table.as_ptr() as *const u8,
                 materials_buf.mapped,
-                size_of::<[GpuMaterial; 32]>(),
+                size_of::<[GpuMaterial; 34]>(),
             );
 
             let bindings: [vk::DescriptorSetLayoutBinding<'_>; 6] = std::array::from_fn(|b| {
@@ -604,7 +605,7 @@ impl VulkanPhysicsEngine {
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
 
             let groups_clear = (HASH_BUCKETS as u32).div_ceil(WORKGROUP_SIZE);
-            let groups_grav_clear = (GRAV_CELLS as u32).div_ceil(WORKGROUP_SIZE);
+            let groups_grav_clear = (GRAV_SLOTS as u32).div_ceil(WORKGROUP_SIZE);
             let groups_pts = (n as u32).div_ceil(WORKGROUP_SIZE);
 
             for s in 0..substeps {

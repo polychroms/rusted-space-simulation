@@ -257,6 +257,22 @@ impl TargetSpec {
         }
     }
 
+    pub fn has_gravity_material(&self) -> bool {
+        match &self.kind {
+            TargetKind::SolidBox { mat, .. }
+            | TargetKind::TriangleWedge { mat, .. }
+            | TargetKind::Ellipse { mat, .. }
+            | TargetKind::HollowRing { mat, .. } => mat.is_gravity_material(),
+            TargetKind::CompositePlate { layers, .. } => {
+                layers.iter().any(|l| l.mat.is_gravity_material())
+            }
+            TargetKind::LayeredPlanet { shells } => {
+                shells.iter().any(|s| s.mat.is_gravity_material())
+            }
+            TargetKind::Blueprint { bp } => bp.cells.iter().flatten().any(|m| m.is_gravity_material()),
+        }
+    }
+
     pub fn estimate_mass(&self) -> f32 {
         match &self.kind {
             TargetKind::SolidBox { width, height, mat } => {
@@ -523,6 +539,17 @@ impl ProjectileSpec {
                 .max(0.8),
             _ => (0.5 * self.length_cm).hypot(self.radius_cm).max(0.8),
         }
+    }
+
+    pub fn has_gravity_material(&self) -> bool {
+        self.mat.is_gravity_material()
+            || (self.shape == ProjectileShape::DifferentiatedAsteroid
+                && self.core_mat.is_gravity_material())
+            || (self.shape == ProjectileShape::CustomBlueprint
+                && self
+                    .blueprint
+                    .as_ref()
+                    .is_some_and(|bp| bp.cells.iter().flatten().any(|m| m.is_gravity_material())))
     }
 
     pub fn estimate_mass(&self) -> f32 {
@@ -818,22 +845,33 @@ fn sample_poly_perimeter_rot(verts: &[Vec2], max_seg_step: f32) -> Vec<Vec2> {
     out
 }
 
-fn sample_rect_mass_nodes(hx: f32, hy: f32, total_mass: f32, rot: Vec2) -> Vec<(Vec2, f32)> {
+fn sample_rect_mass_nodes(
+    hx: f32,
+    hy: f32,
+    total_mass: f32,
+    grav_q: f32,
+    rot: Vec2,
+) -> Vec<(Vec2, f32, f32)> {
     let nx = 4usize;
     let ny = 4usize;
     let dm = total_mass / (nx * ny) as f32;
+    let dq = dm * grav_q;
     let mut out = Vec::with_capacity(nx * ny);
     for iy in 0..ny {
         let ly = -hy + (iy as f32 + 0.5) * (2.0 * hy / ny as f32);
         for ix in 0..nx {
             let lx = -hx + (ix as f32 + 0.5) * (2.0 * hx / nx as f32);
-            out.push((rot.rotate(Vec2::new(lx, ly)), dm));
+            out.push((rot.rotate(Vec2::new(lx, ly)), dm, dq));
         }
     }
     out
 }
 
-fn sample_disk_mass_nodes(radius: f32, shells: &[(f32, f32)], total_mass: f32) -> Vec<(Vec2, f32)> {
+fn sample_disk_mass_nodes(
+    radius: f32,
+    shells: &[(f32, f32, f32)],
+    total_mass: f32,
+) -> Vec<(Vec2, f32, f32)> {
     let r_max = radius.max(0.5);
     let step = (r_max / 3.8).max(0.45);
     let n = (r_max / step).ceil() as i32;
@@ -846,23 +884,25 @@ fn sample_disk_mass_nodes(radius: f32, shells: &[(f32, f32)], total_mass: f32) -
             let lx = ix as f32 * step + ro;
             let r = lx.hypot(ly);
             if r <= r_max {
-                let rho = shells
+                let (_, rho, q) = shells
                     .iter()
-                    .find(|(sr, _)| r <= *sr)
-                    .map(|(_, d)| *d)
-                    .unwrap_or_else(|| shells.last().map(|(_, d)| *d).unwrap_or(1.0));
-                raw.push((Vec2::new(lx, ly), rho));
+                    .find(|(sr, _, _)| r <= *sr)
+                    .copied()
+                    .unwrap_or_else(|| shells.last().copied().unwrap_or((r_max, 1.0, 1.0)));
+                raw.push((Vec2::new(lx, ly), rho, rho * q));
             }
         }
     }
     if raw.is_empty() {
-        return vec![(Vec2::ZERO, total_mass)];
+        let q = shells.first().map(|(_, _, q)| *q).unwrap_or(1.0);
+        return vec![(Vec2::ZERO, total_mass, total_mass * q)];
     }
-    let sum_w: f32 = raw.iter().map(|(_, w)| *w).sum();
+    let sum_w: f32 = raw.iter().map(|(_, w, _)| *w).sum();
     if sum_w > 0.0 {
         let scale = total_mass / sum_w;
-        for (_, w) in &mut raw {
+        for (_, w, qm) in &mut raw {
             *w *= scale;
+            *qm *= scale;
         }
     }
     raw
@@ -873,12 +913,13 @@ struct BodyProxy {
     pos: Vec2,
     vel: Vec2,
     mass: f32,
+    grav_charge_mass: f32,
     bound_r: f32,
     is_proj: bool,
     geom: BodyShapeGeom,
     boundary_rot: Vec<Vec2>,
     edges_rot: Vec<(Vec2, Vec2)>,
-    mass_nodes_rot: Vec<(Vec2, f32)>,
+    mass_nodes_rot: Vec<(Vec2, f32, f32)>,
     inertia_gyr2: f32,
 }
 
@@ -889,7 +930,7 @@ impl BodyProxy {
         let rot = Vec2::from_angle(t.angle_deg.to_radians());
         let mut edges_rot = Vec::new();
         let (geom, boundary_rot, mass_nodes_rot) = match &t.kind {
-            TargetKind::SolidBox { width, height, .. } => {
+            TargetKind::SolidBox { width, height, mat } => {
                 let hx = 0.5 * *width;
                 let hy = 0.5 * *height;
                 let verts = [
@@ -900,7 +941,7 @@ impl BodyProxy {
                 ];
                 edges_rot = (0..4).map(|k| (verts[k], verts[(k + 1) % 4])).collect();
                 let bnd = sample_poly_perimeter_rot(&verts, 0.7);
-                let mn = sample_rect_mass_nodes(hx, hy, mass, rot);
+                let mn = sample_rect_mass_nodes(hx, hy, mass, mat.grav_charge_mult(), rot);
                 (BodyShapeGeom::Rect { hx, hy, rot }, bnd, mn)
             }
             TargetKind::CompositePlate { height, layers } => {
@@ -920,18 +961,20 @@ impl BodyProxy {
                 for l in layers {
                     let cx = acc_x + 0.5 * l.thickness;
                     let lm = l.thickness * *height * l.mat.props().rho0;
+                    let lq = lm * l.mat.grav_charge_mult();
                     for iy in 0..4 {
                         let ly = -hy + (iy as f32 + 0.5) * (*height * 0.25);
-                        mn.push((rot.rotate(Vec2::new(cx, ly)), lm * 0.25));
+                        mn.push((rot.rotate(Vec2::new(cx, ly)), lm * 0.25, lq * 0.25));
                     }
                     acc_x += l.thickness;
                 }
                 if mn.is_empty() {
-                    mn.push((Vec2::ZERO, mass));
+                    mn.push((Vec2::ZERO, mass, mass));
                 }
                 (BodyShapeGeom::Rect { hx, hy, rot }, bnd, mn)
             }
-            TargetKind::Ellipse { rx, ry, .. } => {
+            TargetKind::Ellipse { rx, ry, mat } => {
+                let q = mat.grav_charge_mult();
                 let verts: Vec<Vec2> = (0..32)
                     .map(|k| {
                         let th = (k as f32 / 32.0) * std::f32::consts::TAU;
@@ -946,27 +989,30 @@ impl BodyProxy {
                     for ix in -2..=2 {
                         let lx = ix as f32 * step_x;
                         if (lx / *rx).powi(2) + (ly / *ry).powi(2) <= 1.0 {
-                            mn.push((rot.rotate(Vec2::new(lx, ly)), 1.0f32));
+                            mn.push((rot.rotate(Vec2::new(lx, ly)), 1.0f32, q));
                         }
                     }
                 }
                 let n_len = mn.len().max(1) as f32;
-                for (_, w) in &mut mn {
+                for (_, w, qm) in &mut mn {
                     *w = mass / n_len;
+                    *qm = *w * q;
                 }
                 if mn.is_empty() {
-                    mn.push((Vec2::ZERO, mass));
+                    mn.push((Vec2::ZERO, mass, mass * q));
                 }
                 (BodyShapeGeom::Ellipse { rx: *rx, ry: *ry, rot }, verts, mn)
             }
-            TargetKind::HollowRing { outer_r, wall_thick, .. } => {
+            TargetKind::HollowRing { outer_r, wall_thick, mat } => {
+                let q = mat.grav_charge_mult();
                 let inner_r = (*outer_r - *wall_thick).max(0.0);
                 let mut verts = Vec::with_capacity(32);
                 let r_mid = 0.5 * (*outer_r + inner_r);
-                let mn: Vec<(Vec2, f32)> = (0..16)
+                let mn: Vec<(Vec2, f32, f32)> = (0..16)
                     .map(|k| {
                         let th = (k as f32 / 16.0) * std::f32::consts::TAU;
-                        (Vec2::from_angle(th) * r_mid, mass / 16.0)
+                        let wm = mass / 16.0;
+                        (Vec2::from_angle(th) * r_mid, wm, wm * q)
                     })
                     .collect();
                 for k in 0..24 {
@@ -982,7 +1028,7 @@ impl BodyProxy {
                     mn,
                 )
             }
-            TargetKind::TriangleWedge { width, height, .. } => {
+            TargetKind::TriangleWedge { width, height, mat } => {
                 let hw = (0.5 * *width).max(1.0);
                 let hh = (0.5 * *height).max(1.0);
                 let verts = vec![
@@ -993,7 +1039,7 @@ impl BodyProxy {
                 edges_rot = (0..3).map(|k| (verts[k], verts[(k + 1) % 3])).collect();
                 let bnd = sample_poly_perimeter_rot(&verts, 0.7);
                 let com = rot.rotate(Vec2::new(-hw / 3.0, 0.0));
-                let mn = vec![(com, mass)];
+                let mn = vec![(com, mass, mass * mat.grav_charge_mult())];
                 (
                     BodyShapeGeom::Polygon {
                         verts_rot: verts,
@@ -1007,7 +1053,7 @@ impl BodyProxy {
                 let mut cum = Vec::with_capacity(shells.len());
                 for s in shells {
                     acc_r += s.thickness.max(0.5);
-                    cum.push((acc_r, s.mat.props().rho0));
+                    cum.push((acc_r, s.mat.props().rho0, s.mat.grav_charge_mult()));
                 }
                 let r_out = acc_r.max(1.0);
                 let bnd: Vec<Vec2> = (0..24)
@@ -1028,12 +1074,13 @@ impl BodyProxy {
         let rot = Vec2::from_angle(p.angle_deg.to_radians());
         let mut edges_rot = Vec::new();
         let r = p.radius_cm.max(0.45);
+        let q = p.mat.grav_charge_mult();
         let (geom, boundary_rot, mass_nodes_rot) = match p.shape {
             ProjectileShape::Sphere => {
                 let bnd = (0..20)
                     .map(|k| Vec2::from_angle((k as f32 / 20.0) * std::f32::consts::TAU) * r)
                     .collect();
-                let mn = sample_disk_mass_nodes(r, &[(r, p.mat.props().rho0)], mass);
+                let mn = sample_disk_mass_nodes(r, &[(r, p.mat.props().rho0, q)], mass);
                 (BodyShapeGeom::Circle { radius: r }, bnd, mn)
             }
             ProjectileShape::DifferentiatedAsteroid => {
@@ -1043,7 +1090,10 @@ impl BodyProxy {
                     .collect();
                 let mn = sample_disk_mass_nodes(
                     r,
-                    &[(rc, p.core_mat.props().rho0), (r, p.mat.props().rho0)],
+                    &[
+                        (rc, p.core_mat.props().rho0, p.core_mat.grav_charge_mult()),
+                        (r, p.mat.props().rho0, q),
+                    ],
                     mass,
                 );
                 (BodyShapeGeom::Circle { radius: r }, bnd, mn)
@@ -1056,9 +1106,11 @@ impl BodyProxy {
                     .collect();
                 let mn = (0..12)
                     .map(|k| {
+                        let wm = mass / 12.0;
                         (
                             Vec2::from_angle((k as f32 / 12.0) * std::f32::consts::TAU) * r_mid,
-                            mass / 12.0,
+                            wm,
+                            wm * q,
                         )
                     })
                     .collect();
@@ -1072,7 +1124,7 @@ impl BodyProxy {
                         rot.rotate(Vec2::new(rx * th.cos(), r * th.sin()))
                     })
                     .collect();
-                let mn = sample_rect_mass_nodes(0.75 * rx, 0.75 * r, mass, rot);
+                let mn = sample_rect_mass_nodes(0.75 * rx, 0.75 * r, mass, q, rot);
                 (BodyShapeGeom::Ellipse { rx, ry: r, rot }, bnd, mn)
             }
             ProjectileShape::BluntSlug => {
@@ -1085,7 +1137,7 @@ impl BodyProxy {
                 ];
                 edges_rot = (0..4).map(|k| (verts[k], verts[(k + 1) % 4])).collect();
                 let bnd = sample_poly_perimeter_rot(&verts, 0.65);
-                let mn = sample_rect_mass_nodes(hx, r, mass, rot);
+                let mn = sample_rect_mass_nodes(hx, r, mass, q, rot);
                 (BodyShapeGeom::Rect { hx, hy: r, rot }, bnd, mn)
             }
             ProjectileShape::Wedge => {
@@ -1097,7 +1149,7 @@ impl BodyProxy {
                 ];
                 edges_rot = (0..3).map(|k| (verts[k], verts[(k + 1) % 3])).collect();
                 let bnd = sample_poly_perimeter_rot(&verts, 0.65);
-                let mn = vec![(rot.rotate(Vec2::new(-hw / 3.0, 0.0)), mass)];
+                let mn = vec![(rot.rotate(Vec2::new(-hw / 3.0, 0.0)), mass, mass * q)];
                 (BodyShapeGeom::Polygon { verts_rot: verts }, bnd, mn)
             }
             ProjectileShape::LongRodDart => {
@@ -1118,7 +1170,7 @@ impl BodyProxy {
                     .map(|k| (verts[k], verts[(k + 1) % verts.len()]))
                     .collect();
                 let bnd = sample_poly_perimeter_rot(&verts, 0.65);
-                let mn = sample_rect_mass_nodes(0.85 * hl, r, mass, rot);
+                let mn = sample_rect_mass_nodes(0.85 * hl, r, mass, q, rot);
                 (BodyShapeGeom::Polygon { verts_rot: verts }, bnd, mn)
             }
             ProjectileShape::ShapedJet => {
@@ -1131,7 +1183,7 @@ impl BodyProxy {
                 ];
                 edges_rot = (0..4).map(|k| (verts[k], verts[(k + 1) % 4])).collect();
                 let bnd = sample_poly_perimeter_rot(&verts, 0.65);
-                let mn = sample_rect_mass_nodes(0.85 * hl, r, mass, rot);
+                let mn = sample_rect_mass_nodes(0.85 * hl, r, mass, q, rot);
                 (BodyShapeGeom::Polygon { verts_rot: verts }, bnd, mn)
             }
             ProjectileShape::CustomBlueprint => {
@@ -1147,7 +1199,7 @@ impl BodyProxy {
                     ];
                     edges_rot = (0..4).map(|k| (verts[k], verts[(k + 1) % 4])).collect();
                     let bnd = sample_poly_perimeter_rot(&verts, 0.65);
-                    let mn = sample_rect_mass_nodes(hx, r, mass, rot);
+                    let mn = sample_rect_mass_nodes(hx, r, mass, q, rot);
                     (BodyShapeGeom::Rect { hx, hy: r, rot }, bnd, mn)
                 }
             }
@@ -1160,12 +1212,12 @@ impl BodyProxy {
         dx: f32,
         rot: Vec2,
         total_mass: f32,
-    ) -> (BodyShapeGeom, Vec<Vec2>, Vec<(Vec2, f32)>) {
+    ) -> (BodyShapeGeom, Vec<Vec2>, Vec<(Vec2, f32, f32)>) {
         let Some((min_x, min_y, max_x, max_y)) = bp.occupied_bounds() else {
             return (
                 BodyShapeGeom::Circle { radius: 1.5 },
                 vec![Vec2::X * 1.5, Vec2::NEG_X * 1.5],
-                vec![(Vec2::ZERO, total_mass)],
+                vec![(Vec2::ZERO, total_mass, total_mass)],
             );
         };
         let dy = dx * 0.866_025_4;
@@ -1173,7 +1225,7 @@ impl BodyProxy {
         let mid_gy = 0.5 * (min_y + max_y) as f32;
 
         let mut raw_bnd = Vec::new();
-        let mut bins = vec![(Vec2::ZERO, 0.0f32); 16];
+        let mut bins = vec![(Vec2::ZERO, 0.0f32, 0.0f32); 16];
         let mut sum_rho = 0.0f32;
         let w_span = (max_x - min_x + 1).max(1) as f32;
         let h_span = (max_y - min_y + 1).max(1) as f32;
@@ -1192,6 +1244,7 @@ impl BodyProxy {
                     let bid = by * 4 + bx;
                     bins[bid].0 += lp * rho;
                     bins[bid].1 += rho;
+                    bins[bid].2 += rho * m.grav_charge_mult();
 
                     let xi = x as i32;
                     let yi = y as i32;
@@ -1214,13 +1267,13 @@ impl BodyProxy {
         };
         let mut mn = Vec::with_capacity(16);
         let scale = if sum_rho > 0.0 { total_mass / sum_rho } else { 1.0 };
-        for (com_sum, w) in bins {
+        for (com_sum, w, q_sum) in bins {
             if w > 0.0 {
-                mn.push((rot.rotate(com_sum / w), w * scale));
+                mn.push((rot.rotate(com_sum / w), w * scale, q_sum * scale));
             }
         }
         if mn.is_empty() {
-            mn.push((Vec2::ZERO, total_mass));
+            mn.push((Vec2::ZERO, total_mass, total_mass));
         }
         (
             BodyShapeGeom::Blueprint {
@@ -1245,12 +1298,13 @@ impl BodyProxy {
         geom: BodyShapeGeom,
         boundary_rot: Vec<Vec2>,
         edges_rot: Vec<(Vec2, Vec2)>,
-        mass_nodes_rot: Vec<(Vec2, f32)>,
+        mass_nodes_rot: Vec<(Vec2, f32, f32)>,
     ) -> Self {
+        let grav_charge_mass = mass_nodes_rot.iter().map(|(_, _, qm)| *qm).sum();
         let inertia_gyr2 = if mass > 0.0 {
             mass_nodes_rot
                 .iter()
-                .map(|(off, m)| m * off.length_squared())
+                .map(|(off, m, _)| m * off.length_squared())
                 .sum::<f32>()
                 / mass
         } else {
@@ -1260,6 +1314,7 @@ impl BodyProxy {
             pos,
             vel,
             mass,
+            grav_charge_mass,
             bound_r,
             is_proj,
             geom,
@@ -1367,20 +1422,25 @@ fn compute_pair_gravity_acc(
         || (recv.mass_nodes_rot.len() <= 1 && src.mass_nodes_rot.len() <= 1)
     {
         let r2 = d_com.length_squared() + soft_sq;
-        return d_com * (grav * src.mass / (r2 * r2.sqrt()));
+        let q_recv = if recv.mass > 0.0 {
+            recv.grav_charge_mass / recv.mass
+        } else {
+            1.0
+        };
+        return d_com * (grav * q_recv * src.grav_charge_mass / (r2 * r2.sqrt()));
     }
     let r_stride = recv.mass_nodes_rot.len().div_ceil(12).max(1);
     let mut acc_sum = Vec2::ZERO;
     let mut m_sum = 0.0f32;
-    for &(ro, rm) in recv.mass_nodes_rot.iter().step_by(r_stride) {
+    for &(ro, rm, rq) in recv.mass_nodes_rot.iter().step_by(r_stride) {
         let wp_r = pos_r + ro;
         let mut g_node = Vec2::ZERO;
-        for &(so, sm) in &src.mass_nodes_rot {
+        for &(so, _sm, sq) in &src.mass_nodes_rot {
             let d = (pos_s + so) - wp_r;
             let r2 = d.length_squared() + soft_sq;
-            g_node += d * (grav * sm / (r2 * r2.sqrt()));
+            g_node += d * (grav * sq / (r2 * r2.sqrt()));
         }
-        acc_sum += g_node * rm;
+        acc_sum += g_node * rq;
         m_sum += rm;
     }
     if m_sum > 0.0 {
@@ -1408,8 +1468,22 @@ impl SceneSpec {
         }
     }
 
+    pub fn effective_self_gravity(&self) -> (bool, f32) {
+        let active = self.self_gravity
+            || self.targets.iter().any(TargetSpec::has_gravity_material)
+            || self
+                .projectiles
+                .iter()
+                .any(ProjectileSpec::has_gravity_material);
+        if active {
+            (true, if self.grav_g > 0.0 { self.grav_g } else { 7.5e-5 })
+        } else {
+            (false, 0.0)
+        }
+    }
+
     /// Compute circular or eccentric orbit `(speed_kms, angle_deg)` for `projectiles[proj_idx]`
-    /// around the nearest massive target body under softened extended-body 2D N-body gravity.
+    /// around the nearest attractive massive target body under softened extended-body 2D N-body gravity.
     pub fn compute_orbit_velocity(
         &self,
         proj_idx: usize,
@@ -1417,7 +1491,8 @@ impl SceneSpec {
         eccentricity_factor: f32,
     ) -> Option<(f32, f32)> {
         let p = self.projectiles.get(proj_idx)?;
-        if !self.self_gravity || self.grav_g <= 0.0 || self.targets.is_empty() {
+        let (eff_grav, eff_g) = self.effective_self_gravity();
+        if !eff_grav || eff_g <= 0.0 || self.targets.is_empty() {
             return None;
         }
         let dx = 0.35f32;
@@ -1427,10 +1502,16 @@ impl SceneSpec {
             .map(|t| BodyProxy::from_target(t, dx))
             .collect();
         let proj_proxy = BodyProxy::from_projectile(p, dx);
+        let proj_q = if proj_proxy.mass > 0.0 {
+            proj_proxy.grav_charge_mass / proj_proxy.mass
+        } else {
+            1.0
+        };
         let mut best_idx = 0usize;
         let mut best_score = f32::NEG_INFINITY;
         for (ti, t) in tgt_proxies.iter().enumerate() {
-            let score = t.mass / (t.pos - proj_proxy.pos).length_squared().max(1.0);
+            let attract_q = t.grav_charge_mass * proj_q;
+            let score = attract_q / (t.pos - proj_proxy.pos).length_squared().max(1.0);
             if score > best_score {
                 best_score = score;
                 best_idx = ti;
@@ -1453,10 +1534,13 @@ impl SceneSpec {
         let soft_sq = compute_domain_soft_sq(&all_proxies, &positions, &active, dx);
 
         let a_vec =
-            compute_pair_gravity_acc(&proj_proxy, proj_proxy.pos, tgt_p, tgt_p.pos, self.grav_g, soft_sq);
-        let a_inward = (-a_vec.dot(r_hat)).max(0.0);
+            compute_pair_gravity_acc(&proj_proxy, proj_proxy.pos, tgt_p, tgt_p.pos, eff_g, soft_sq);
+        let a_inward = -a_vec.dot(r_hat);
+        if a_inward <= 1e-12 {
+            return None;
+        }
         let reduced_scale = (tgt_p.mass + proj_proxy.mass) / tgt_p.mass.max(1e-4);
-        let v_rel = (a_inward * r * reduced_scale).max(0.0).sqrt() * eccentricity_factor;
+        let v_rel = (a_inward * r * reduced_scale).sqrt() * eccentricity_factor;
         let v_vec = tgt.vel + tang * v_rel;
         let speed_kms = (v_vec.length() * 10.0).clamp(0.0, 100.0);
         let angle_deg = if v_vec.length_squared() > 1e-12 {
@@ -1489,11 +1573,8 @@ impl SceneSpec {
             bodies.push(BodyProxy::from_projectile(p, sim_dx));
         }
 
-        let grav = if self.self_gravity && self.grav_g > 0.0 {
-            self.grav_g
-        } else {
-            0.0
-        };
+        let (eff_grav, eff_g) = self.effective_self_gravity();
+        let grav = if eff_grav { eff_g } else { 0.0 };
 
         let mut pos: Vec<Vec2> = bodies.iter().map(|b| b.pos).collect();
         let mut vel: Vec<Vec2> = bodies.iter().map(|b| b.vel).collect();
@@ -1711,12 +1792,9 @@ impl SceneSpec {
 
     pub fn build_world(&self, dx: f32) -> ContinuumWorld {
         let mut world = ContinuumWorld::new(dx);
-        world.self_gravity = self.self_gravity;
-        world.grav_g = if self.self_gravity && self.grav_g <= 0.0 {
-            7.0e-5
-        } else {
-            self.grav_g
-        };
+        let (eff_grav, eff_g) = self.effective_self_gravity();
+        world.self_gravity = eff_grav;
+        world.grav_g = eff_g;
 
         for target in &self.targets {
             target.spawn_into(&mut world);

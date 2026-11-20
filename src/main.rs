@@ -1,3 +1,5 @@
+#![cfg_attr(all(not(debug_assertions), not(test)), windows_subsystem = "windows")]
+
 mod analysis;
 mod blueprint;
 mod editor_ui;
@@ -2319,7 +2321,7 @@ impl RustedSpaceSimApp {
                                 &self.scene.targets,
                                 &mut changed,
                             );
-                            if self.scene.self_gravity && !self.scene.targets.is_empty() {
+                            if self.scene.effective_self_gravity().0 && !self.scene.targets.is_empty() {
                                 ui.horizontal(|ui| {
                                     if ui.small_button("🌐 Orbit +").clicked() {
                                         if let Some((os, oa)) =
@@ -2481,7 +2483,7 @@ impl RustedSpaceSimApp {
                         self.scene.projectiles[i].pos = pos_v;
                         self.scene.projectiles[i].speed_kms = spd;
                         self.scene.projectiles[i].angle_deg = ang;
-                        if self.scene.self_gravity && !self.scene.targets.is_empty() {
+                        if self.scene.effective_self_gravity().0 && !self.scene.targets.is_empty() {
                             ui.horizontal(|ui| {
                                 if ui.small_button("🌐 Orbit +").clicked() {
                                     if let Some((os, oa)) =
@@ -2718,13 +2720,21 @@ impl RustedSpaceSimApp {
             ui.add(egui::Slider::new(&mut self.substeps_per_frame, 1..=32).text("Substeps / Frame"));
 
             let mut grav_changed = false;
+            let (eff_grav, _) = self.scene.effective_self_gravity();
             if self.phase == SimPhase::Staging {
                 grav_changed |= ui
                     .checkbox(&mut self.scene.self_gravity, "Planetary Self-Gravity")
                     .changed();
-                if self.scene.self_gravity {
+                if eff_grav {
                     if self.scene.grav_g <= 0.0 {
-                        self.scene.grav_g = 7.0e-5;
+                        self.scene.grav_g = 7.5e-5;
+                    }
+                    if !self.scene.self_gravity {
+                        ui.label(
+                            egui::RichText::new("Auto-active (Attractor / Repulsor material)")
+                                .size(10.0)
+                                .color(Color32::from_rgb(95, 215, 255)),
+                        );
                     }
                     grav_changed |= ui
                         .add(
@@ -4030,7 +4040,7 @@ impl RustedSpaceSimApp {
                     studio_card(ui, "VULKAN COMPUTE & CONTINUUM ARCHITECTURE", ACCENT_EMERALD, |ui| {
                         for bullet in [
                             "• GPU Compute: Vulkan 1.2 SPIR-V (131K spatial hash + 32x32 LDS N-body self-gravity + HOST_CACHED UMA DMA).",
-                            "• 32 Calibrated Materials: Mie-Grüneisen & Tillotson vaporization EOS, CSPM kernel gradients, Johnson-Cook rate/thermal plasticity, Drucker-Prager brittle confinement & tensile spall.",
+                            "• 34 Calibrated Materials: Mie-Grüneisen & Tillotson vaporization EOS, CSPM kernel gradients, Johnson-Cook rate/thermal plasticity, Drucker-Prager brittle confinement & Attractor/Repulsor gravity.",
                             "• Energetics & Thermal Physics: Programmed-burn JWL EOS detonation waves, condensed-phase Thermite reaction, Fourier thermal conduction, Stefan-Boltzmann radiative cooling & molten droplet capillary tension.",
                         ] {
                             ui.add(
@@ -5189,7 +5199,7 @@ fn run_headless_benchmark() {
 
 fn print_help() {
     println!(
-        "Rusted Space Simulation (rssim) v0.1.1
+        "Rusted Space Simulation (rssim) v0.1.2
 Vulkan GPU-Accelerated Continuum Elasto-Plastic, Reactive Detonation & Planetary Hydrocode
 (Mie-Gruneisen + JWL EOS + CSPM Renormalization + Johnson-Cook Viscoplasticity + 32x32 LDS Self-Gravity)
 
@@ -5199,7 +5209,7 @@ USAGE:
     rssim --help     Show this help message
 
 KEY CAPABILITIES & INSTRUMENTATION:
-    • 32 Continuum Materials (Metals, Ceramics, Concrete, Polymers, Liquid Water, Octol & Condensed Thermite)
+    • 34 Continuum Materials (Metals, Ceramics, Polymers, Water, Octol, Thermite, Attractor & Repulsor)
     • Vulkan 1.2 SPIR-V Compute Pipeline (131K spatial hash, GPU-resident 32x32 LDS self-gravity, HOST_CACHED DMA)
     • Live Physics Tools: Matter Brush, Void Eraser, Thermal Laser, Gravity Vortex, Shock Blast (Q/B/E/L/G/X)
     • Orbital N-Body Trajectory Preview & 17 Presets (HEAT, EFP, ERA, APHE, Roche Ring, Binary Planets, Europa)

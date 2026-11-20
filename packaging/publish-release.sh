@@ -66,12 +66,26 @@ chmod +x "${PKG_DIR}/rssim" "${PKG_DIR}/install.sh" dist/rssim dist/install.sh
 tar -C dist -czf "dist/${PKG_NAME}.tar.gz" "$PKG_NAME"
 rm -rf "$PKG_DIR"
 
+WIN_PKG="rssim-${TAG}-x86_64-windows"
+WIN_DIR="dist/${WIN_PKG}"
+rm -rf "$WIN_DIR"
+export PATH="$HOME/.cargo/bin:$PATH"
+RUSTFLAGS="-C target-feature=+crt-static" cargo-xwin build --release --target x86_64-pc-windows-msvc
+mkdir -p "$WIN_DIR"
+cp target/x86_64-pc-windows-msvc/release/rssim.exe dist/rssim.exe
+cp target/x86_64-pc-windows-msvc/release/rssim.exe "${WIN_DIR}/rssim.exe"
+cp LICENSE README.md "${WIN_DIR}/"
+(cd dist && zip -rq "${WIN_PKG}.zip" "$WIN_PKG")
+rm -rf "$WIN_DIR"
+
 (
     cd dist
     sha256sum \
         "${PKG_NAME}.tar.gz" \
+        "${WIN_PKG}.zip" \
         "Rusted_Space_Simulation-${VER}-x86_64.AppImage" \
         rssim \
+        rssim.exe \
         install.sh > SHA256SUMS.txt
 )
 
@@ -85,7 +99,9 @@ git push origin "$TAG"
 gh release create "$TAG" \
     "$APPIMAGE" \
     "dist/${PKG_NAME}.tar.gz" \
+    "dist/${WIN_PKG}.zip" \
     dist/rssim \
+    dist/rssim.exe \
     dist/install.sh \
     dist/SHA256SUMS.txt \
     --repo rappar222/rusted-space-simulation \

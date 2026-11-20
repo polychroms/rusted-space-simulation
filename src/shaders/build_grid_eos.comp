@@ -21,6 +21,7 @@ struct Material {
     vec4 flags;     // friction, is_energetic, is_ductile, youngs_mod
     vec4 jwl_ab;    // jwl_a, jwl_b, jwl_r1, jwl_r2
     vec4 jc_jwl;    // jwl_omega, jc_rate_c, thermal_m, poisson_nu
+    vec4 gravity;   // grav_charge_mult, pad, pad, pad
 };
 
 layout(std430, set = 0, binding = 0) buffer ParticleBuf {
@@ -28,7 +29,7 @@ layout(std430, set = 0, binding = 0) buffer ParticleBuf {
 };
 
 layout(std430, set = 0, binding = 1) readonly buffer MaterialBuf {
-    Material materials[32];
+    Material materials[34];
 };
 
 layout(std430, set = 0, binding = 3) buffer GridHeadBuf {
@@ -82,7 +83,7 @@ void main() {
     grid_next[i] = atomicExchange(grid_head[bucket], int(i));
 
     // Equation of State: Polynomial Mie-Gruneisen Solid or Programmed-Burn JWL Detonation Gas
-    uint mat_id = min(p.meta.x, 31u);
+    uint mat_id = min(p.meta.x, 33u);
     Material m = materials[mat_id];
     float rho = p.thermo.x;
     float rho0 = max(p.thermo.y, 1e-4);

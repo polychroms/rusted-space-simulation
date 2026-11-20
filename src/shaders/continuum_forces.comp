@@ -21,6 +21,7 @@ struct Material {
     vec4 flags;     // friction, is_energetic, is_ductile, youngs_mod
     vec4 jwl_ab;    // jwl_a, jwl_b, jwl_r1, jwl_r2
     vec4 jc_jwl;    // jwl_omega, jc_rate_c, thermal_m, poisson_nu
+    vec4 gravity;   // grav_charge_mult, pad, pad, pad
 };
 
 struct ForceOut {
@@ -35,7 +36,7 @@ layout(std430, set = 0, binding = 0) readonly buffer ParticleBuf {
 };
 
 layout(std430, set = 0, binding = 1) readonly buffer MaterialBuf {
-    Material materials[32];
+    Material materials[34];
 };
 
 layout(std430, set = 0, binding = 2) writeonly buffer ScratchBuf {
@@ -85,7 +86,7 @@ void main() {
     float press_i = pi_p.stress.w;
     float dmg_i = clamp(pi_p.mech.y, 0.0, 1.0);
     float mass_i = pi_p.mech.w;
-    uint mat_i = min(pi_p.meta.x, 31u);
+    uint mat_i = min(pi_p.meta.x, 33u);
     uint body_i = pi_p.meta.y;
     uint det_i = pi_p.meta.z;
 
@@ -173,7 +174,7 @@ void main() {
                 float press_j = stress_j.w;
                 float dmg_j = clamp(mech_j.y, 0.0, 1.0);
                 float mj = mech_j.w;
-                uint mat_j = min(meta_j.x, 31u);
+                uint mat_j = min(meta_j.x, 33u);
                 uint body_j = meta_j.y;
                 uint det_j = meta_j.z;
                 Material m_j = materials[mat_j];

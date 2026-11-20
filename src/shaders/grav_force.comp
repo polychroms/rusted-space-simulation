@@ -13,8 +13,23 @@ struct Particle {
     uvec4 meta;
 };
 
+struct Material {
+    vec4 eos;
+    vec4 strength;
+    vec4 fracture;
+    vec4 energetic;
+    vec4 flags;
+    vec4 jwl_ab;
+    vec4 jc_jwl;
+    vec4 gravity;
+};
+
 layout(std430, set = 0, binding = 0) buffer ParticleBuf {
     Particle particles[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer MaterialBuf {
+    Material materials[34];
 };
 
 layout(std430, set = 0, binding = 5) readonly buffer GravGridBuf {
@@ -47,17 +62,18 @@ void main() {
     float soft_sq = (2.4 * pc.dx) * (2.4 * pc.dx) + 0.20 * cell_sz * cell_sz;
     vec2 g_acc = vec2(0.0);
 
-    for (uint tile = 0u; tile < 4u; ++tile) {
+    for (uint tile = 0u; tile < 8u; ++tile) {
         uint cid = tile * 256u + lid;
         ivec4 raw = grav_cells[cid];
         if (raw.x > 0) {
-            uint gx = cid & 31u;
-            uint gy = cid >> 5u;
+            uint grid_idx = cid >> 1u;
+            uint gx = grid_idx & 31u;
+            uint gy = grid_idx >> 5u;
             float inv_m = 1.0 / float(raw.x);
             float cx_w = pc.grav_domain.x + (float(gx) + float(raw.y) * inv_m) * cell_sz;
             float cy_w = pc.grav_domain.y + (float(gy) + float(raw.z) * inv_m) * cell_sz;
-            float m = float(raw.x) * (1.0 / 2048.0);
-            sh_cells[lid] = vec4(cx_w, cy_w, m, 0.0);
+            float m_signed = float(raw.x) * (1.0 / 2048.0) * (((cid & 1u) == 0u) ? 1.0 : -1.0);
+            sh_cells[lid] = vec4(cx_w, cy_w, m_signed, 0.0);
         } else {
             sh_cells[lid] = vec4(0.0);
         }
@@ -67,7 +83,7 @@ void main() {
         if (is_valid) {
             for (uint k = 0u; k < 256u; ++k) {
                 vec4 c = sh_cells[k];
-                if (c.z > 0.0) {
+                if (c.z != 0.0) {
                     vec2 d = c.xy - pi;
                     float r2 = dot(d, d) + soft_sq;
                     float inv_r = inversesqrt(r2);
@@ -80,6 +96,7 @@ void main() {
     }
 
     if (is_valid) {
-        particles[i].grav_pad.xy = g_acc;
+        uint mat_id = min(particles[i].meta.x, 33u);
+        particles[i].grav_pad.xy = g_acc * materials[mat_id].gravity.x;
     }
 }

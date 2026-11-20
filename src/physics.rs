@@ -30,11 +30,12 @@ pub struct GpuMaterial {
     pub flags: [f32; 4],     // friction, is_energetic, is_ductile, youngs_mod
     pub jwl_ab: [f32; 4],    // jwl_a, jwl_b, jwl_r1, jwl_r2
     pub jc_jwl: [f32; 4],    // jwl_omega, jc_rate_c, thermal_m, poisson_nu
+    pub gravity: [f32; 4],   // grav_charge_mult, pad, pad, pad
 }
 
 impl GpuMaterial {
-    pub fn table() -> [GpuMaterial; 32] {
-        let mut out = [GpuMaterial::default(); 32];
+    pub fn table() -> [GpuMaterial; 34] {
+        let mut out = [GpuMaterial::default(); 34];
         for (idx, m) in MATERIALS.iter().enumerate() {
             let mat_id = MaterialId::from_index(idx);
             let jwl = mat_id.jwl_params();
@@ -66,6 +67,7 @@ impl GpuMaterial {
                     mat_id.thermal_m(),
                     m.poisson_ratio(),
                 ],
+                gravity: [mat_id.grav_charge_mult(), 0.0, 0.0, 0.0],
             };
         }
         out
@@ -324,6 +326,12 @@ impl ContinuumWorld {
         body_id: u16,
         temp_override: Option<f32>,
     ) -> usize {
+        if mat.is_gravity_material() {
+            self.self_gravity = true;
+            if self.grav_g <= 0.0 {
+                self.grav_g = 7.5e-5;
+            }
+        }
         let props = mat.props();
         let m = props.rho0 * self.particle_area();
         let t0 = temp_override.unwrap_or(if mat == MaterialId::WaterIce {
@@ -1766,47 +1774,56 @@ impl ContinuumWorld {
         let half_span = (3.4 * r_rms).clamp(28.0, 600.0);
         let grid_min = com_all - Vec2::splat(half_span);
         let cell_sz = Vec2::splat((2.0 * half_span) / G_DIM as f32);
-        let mut cells = [GravCell::default(); G_DIM * G_DIM];
+        let mut cells_pos = [GravCell::default(); G_DIM * G_DIM];
+        let mut cells_neg = [GravCell::default(); G_DIM * G_DIM];
 
         for i in 0..self.pos.len() {
             let rel = (self.pos[i] - grid_min) / cell_sz;
             let gx = (rel.x.floor() as isize).clamp(0, G_DIM as isize - 1) as usize;
             let gy = (rel.y.floor() as isize).clamp(0, G_DIM as isize - 1) as usize;
-            let c = &mut cells[gy * G_DIM + gx];
-            let m = self.mass[i];
-            c.com += self.pos[i] * m;
-            c.mass += m;
+            let idx = gy * G_DIM + gx;
+            let qm = self.mat[i].grav_charge_mult() * self.mass[i];
+            if qm >= 0.0 {
+                cells_pos[idx].com += self.pos[i] * qm;
+                cells_pos[idx].mass += qm;
+            } else {
+                let mag = -qm;
+                cells_neg[idx].com += self.pos[i] * mag;
+                cells_neg[idx].mass += mag;
+            }
         }
-        let active_cells: Vec<GravCell> = cells
-            .into_iter()
-            .filter_map(|mut c| {
-                if c.mass > 0.0 {
-                    c.com /= c.mass;
-                    Some(c)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut active_cells: Vec<(Vec2, f32)> = Vec::with_capacity(G_DIM * G_DIM);
+        for c in cells_pos {
+            if c.mass > 0.0 {
+                active_cells.push((c.com / c.mass, c.mass));
+            }
+        }
+        for c in cells_neg {
+            if c.mass > 0.0 {
+                active_cells.push((c.com / c.mass, -c.mass));
+            }
+        }
 
         let g_const = self.grav_g;
         let soft_sq = (2.4 * self.dx) * (2.4 * self.dx) + 0.20 * cell_sz.x * cell_sz.y;
         let pos_ref = &self.pos;
+        let mat_ref = &self.mat;
 
         self.grav_acc
             .par_iter_mut()
             .enumerate()
             .for_each(|(i, g_out)| {
                 let pi = pos_ref[i];
+                let qi = mat_ref[i].grav_charge_mult();
                 let mut g = Vec2::ZERO;
-                for c in &active_cells {
-                    let d = c.com - pi;
+                for &(c_com, c_qm) in &active_cells {
+                    let d = c_com - pi;
                     let r2 = d.length_squared() + soft_sq;
                     let inv_r = 1.0 / r2.sqrt();
                     let inv_r3 = inv_r / r2;
-                    g += d * (g_const * c.mass * inv_r3);
+                    g += d * (g_const * c_qm * inv_r3);
                 }
-                *g_out = g;
+                *g_out = g * qi;
             });
     }
 

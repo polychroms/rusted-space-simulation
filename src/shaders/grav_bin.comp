@@ -13,8 +13,23 @@ struct Particle {
     uvec4 meta;
 };
 
+struct Material {
+    vec4 eos;
+    vec4 strength;
+    vec4 fracture;
+    vec4 energetic;
+    vec4 flags;
+    vec4 jwl_ab;
+    vec4 jc_jwl;
+    vec4 gravity;
+};
+
 layout(std430, set = 0, binding = 0) readonly buffer ParticleBuf {
     Particle particles[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer MaterialBuf {
+    Material materials[34];
 };
 
 layout(std430, set = 0, binding = 5) buffer GravGridBuf {
@@ -44,6 +59,9 @@ void main() {
     if (mass <= 0.0) {
         return;
     }
+    uint mat_id = min(particles[i].meta.x, 33u);
+    float q_grav = materials[mat_id].gravity.x;
+    float qm_mag = abs(mass * q_grav);
 
     float span = max(pc.grav_domain.z, 1.0);
     vec2 u = clamp((pos - pc.grav_domain.xy) / span, vec2(0.0), vec2(0.999999));
@@ -51,15 +69,15 @@ void main() {
     float gy_f = u.y * 32.0;
     int gx = clamp(int(floor(gx_f)), 0, 31);
     int gy = clamp(int(floor(gy_f)), 0, 31);
-    uint cid = uint(gy * 32 + gx);
+    uint slot = uint(gy * 32 + gx) * 2u + ((q_grav < 0.0) ? 1u : 0u);
 
     float fx = clamp(gx_f - float(gx), 0.0, 1.0);
     float fy = clamp(gy_f - float(gy), 0.0, 1.0);
 
-    int m_fp = int(round(mass * 2048.0));
+    int m_fp = int(round(qm_mag * 2048.0));
     if (m_fp > 0) {
-        atomicAdd(grav_cells[cid].x, m_fp);
-        atomicAdd(grav_cells[cid].y, int(round(float(m_fp) * fx)));
-        atomicAdd(grav_cells[cid].z, int(round(float(m_fp) * fy)));
+        atomicAdd(grav_cells[slot].x, m_fp);
+        atomicAdd(grav_cells[slot].y, int(round(float(m_fp) * fx)));
+        atomicAdd(grav_cells[slot].z, int(round(float(m_fp) * fy)));
     }
 }

@@ -13,14 +13,16 @@ pub enum MaterialCategory {
     CeramicsMinerals,
     PolymersNera,
     ExplosivesFuzes,
+    GravitySpace,
 }
 
 impl MaterialCategory {
-    pub const ALL: [MaterialCategory; 4] = [
+    pub const ALL: [MaterialCategory; 5] = [
         MaterialCategory::Metals,
         MaterialCategory::CeramicsMinerals,
         MaterialCategory::PolymersNera,
         MaterialCategory::ExplosivesFuzes,
+        MaterialCategory::GravitySpace,
     ];
 
     pub fn label(self) -> &'static str {
@@ -29,6 +31,7 @@ impl MaterialCategory {
             MaterialCategory::CeramicsMinerals => "Ceramics & Rock",
             MaterialCategory::PolymersNera => "Polymers & NERA",
             MaterialCategory::ExplosivesFuzes => "Explosives & Fuzes",
+            MaterialCategory::GravitySpace => "Gravity & Space",
         }
     }
 }
@@ -68,10 +71,12 @@ pub enum MaterialId {
     UhMwPe = 29,
     OctolExplosive = 30,
     ThermitePyro = 31,
+    AttractorMass = 32,
+    RepulsorMass = 33,
 }
 
 impl MaterialId {
-    pub const ALL: [MaterialId; 32] = [
+    pub const ALL: [MaterialId; 34] = [
         // Metals
         MaterialId::RhaSteel,
         MaterialId::HhaSteel,
@@ -108,6 +113,9 @@ impl MaterialId {
         MaterialId::ThermitePyro,
         MaterialId::ImpactFuze,
         MaterialId::DelayFuze,
+        // Gravity & Space
+        MaterialId::AttractorMass,
+        MaterialId::RepulsorMass,
     ];
 
     #[inline]
@@ -153,8 +161,26 @@ impl MaterialId {
             28 => MaterialId::TungstenCarbide,
             29 => MaterialId::UhMwPe,
             30 => MaterialId::OctolExplosive,
-            _ => MaterialId::ThermitePyro,
+            31 => MaterialId::ThermitePyro,
+            32 => MaterialId::AttractorMass,
+            _ => MaterialId::RepulsorMass,
         }
+    }
+
+    /// Signed gravitational charge multiplier applied to source mass and passive particle acceleration.
+    /// Repulsors share `-` sign so same-sign pairs attract internally (`- * - > 0`) while repelling normal/`+` matter.
+    #[inline]
+    pub const fn grav_charge_mult(self) -> f32 {
+        match self {
+            MaterialId::AttractorMass => 3.5,
+            MaterialId::RepulsorMass => -3.5,
+            _ => 1.0,
+        }
+    }
+
+    #[inline]
+    pub const fn is_gravity_material(self) -> bool {
+        matches!(self, MaterialId::AttractorMass | MaterialId::RepulsorMass)
     }
 
     /// Johnson-Cook logarithmic strain-rate sensitivity constant C in [1 + C * ln(edot / edot_0)].
@@ -183,6 +209,7 @@ impl MaterialId {
             | MaterialId::TntExplosive
             | MaterialId::OctolExplosive => 0.010,
             MaterialId::ImpactFuze | MaterialId::DelayFuze | MaterialId::ThermitePyro => 0.014,
+            MaterialId::AttractorMass | MaterialId::RepulsorMass => 0.012,
         }
     }
 
@@ -308,8 +335,8 @@ impl MaterialProps {
     }
 }
 
-/// Indexed by `MaterialId as usize` (0..32)
-pub const MATERIALS: [MaterialProps; 32] = [
+/// Indexed by `MaterialId as usize` (0..34)
+pub const MATERIALS: [MaterialProps; 34] = [
     // 0: Tungsten Heavy Alloy (WHA)
     MaterialProps {
         code: "WHA",
@@ -1141,5 +1168,57 @@ pub const MATERIALS: [MaterialProps; 32] = [
         initiation_pressure: 0.0,
         delay_us: 0.0,
         color: [215, 92, 48],
+    },
+    // 32: Attractor Core (High-Gravity Mass, q = +3.5x)
+    MaterialProps {
+        code: "ATTR",
+        name: "Attractor Core (High-Gravity Mass)",
+        short_name: "Attractor",
+        category: MaterialCategory::GravitySpace,
+        rho0: 12.0,
+        c0: 0.85,
+        hugoniot_s: 1.35,
+        gamma0: 1.40,
+        youngs_mod: 4.50,
+        yield_strength: 0.045,
+        hardening: 0.25,
+        spall_strength: 0.120,
+        fracture_strain: 0.90,
+        pressure_hardening: 0.60,
+        melt_temp: 8500.0,
+        cv: 6.0e-6,
+        friction: 0.35,
+        is_energetic: false,
+        detonation_vel: 0.0,
+        detonation_energy: 0.0,
+        initiation_pressure: 0.0,
+        delay_us: 0.0,
+        color: [64, 198, 255],
+    },
+    // 33: Repulsor Mass (Anti-Gravity Field, q = -3.5x)
+    MaterialProps {
+        code: "REPL",
+        name: "Repulsor Mass (Anti-Gravity Field)",
+        short_name: "Repulsor",
+        category: MaterialCategory::GravitySpace,
+        rho0: 12.0,
+        c0: 0.85,
+        hugoniot_s: 1.35,
+        gamma0: 1.40,
+        youngs_mod: 4.50,
+        yield_strength: 0.045,
+        hardening: 0.25,
+        spall_strength: 0.120,
+        fracture_strain: 0.90,
+        pressure_hardening: 0.60,
+        melt_temp: 8500.0,
+        cv: 6.0e-6,
+        friction: 0.35,
+        is_energetic: false,
+        detonation_vel: 0.0,
+        detonation_energy: 0.0,
+        initiation_pressure: 0.0,
+        delay_us: 0.0,
+        color: [208, 92, 255],
     },
 ];

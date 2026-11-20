@@ -8,7 +8,7 @@ layout(std430, set = 0, binding = 5) buffer GravGridBuf {
 
 void main() {
     uint cid = gl_GlobalInvocationID.x;
-    if (cid < 1024u) {
+    if (cid < 2048u) {
         grav_cells[cid] = ivec4(0);
     }
 }
