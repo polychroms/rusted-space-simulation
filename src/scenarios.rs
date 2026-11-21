@@ -2616,4 +2616,12 @@ mod tests {
             "Repulsor CPU/GPU parity drifted: rock cpu={rock_cpu:?} gpu={rock_gpu:?}, rep cpu={rep_cpu:?} gpu={rep_gpu:?}"
         );
     }
+
+    #[test]
+    fn app_icon_png_decodes_256x256_rgba() {
+        let icon = eframe::icon_data::from_png_bytes(include_bytes!("../packaging/rssim.png"))
+            .expect("packaging/rssim.png must decode into eframe IconData");
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
 }

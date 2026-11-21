@@ -104,8 +104,25 @@ gh release create "$TAG" \
     dist/rssim.exe \
     dist/install.sh \
     dist/SHA256SUMS.txt \
-    --repo rappar222/rusted-space-simulation \
+    --repo polychroms/rusted-space-simulation \
     --title "$TITLE" \
     --notes-file "$NOTES_FILE"
 
-gh release view "$TAG" --repo rappar222/rusted-space-simulation --json tagName,url,assets
+gh release view "$TAG" --repo polychroms/rusted-space-simulation --json tagName,url,assets
+
+if git remote get-url gitlab >/dev/null 2>&1; then
+    git push gitlab main
+    git push gitlab "$TAG"
+    glab release create "$TAG" \
+        "$APPIMAGE" \
+        "dist/${PKG_NAME}.tar.gz" \
+        "dist/${WIN_PKG}.zip" \
+        dist/rssim \
+        dist/rssim.exe \
+        dist/install.sh \
+        dist/SHA256SUMS.txt \
+        -R polychroms/rssim \
+        --name "$TITLE" \
+        --notes-file "$NOTES_FILE" \
+        --use-package-registry
+fi

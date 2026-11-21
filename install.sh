@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="rappar222/rusted-space-simulation"
-VERSION="v0.1.2"
+REPO="polychroms/rusted-space-simulation"
+VERSION="v0.2.0"
 INSTALL_DIR="${INSTALL_DIR:-}"
 FROM_SOURCE=0
 
@@ -14,7 +14,7 @@ Usage:
   install.sh [options]
 
 Options:
-  --version <tag>   GitHub release tag to install (default: v0.1.2)
+  --version <tag>   GitHub release tag to install (default: v0.2.0)
   --dir <path>      Target bin directory (default: ~/bin, or /usr/local/bin if root)
   --from-source     Download GitHub source archive and build with cargo --release
   -h, --help        Show this help message

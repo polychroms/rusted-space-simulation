@@ -5199,7 +5199,7 @@ fn run_headless_benchmark() {
 
 fn print_help() {
     println!(
-        "Rusted Space Simulation (rssim) v0.1.2
+        "Rusted Space Simulation (rssim) v0.2.0
 Vulkan GPU-Accelerated Continuum Elasto-Plastic, Reactive Detonation & Planetary Hydrocode
 (Mie-Gruneisen + JWL EOS + CSPM Renormalization + Johnson-Cook Viscoplasticity + 32x32 LDS Self-Gravity)
 
@@ -5228,11 +5228,16 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Rusted Space Simulation (rssim) — Continuum Impact & Shock Physics")
+        .with_inner_size([1520.0, 920.0])
+        .with_min_inner_size([1024.0, 640.0]);
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../packaging/rssim.png")) {
+        viewport = viewport.with_icon(icon);
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Rusted Space Simulation (rssim) — Continuum Impact & Shock Physics")
-            .with_inner_size([1520.0, 920.0])
-            .with_min_inner_size([1024.0, 640.0]),
+        viewport,
         ..Default::default()
     };
 

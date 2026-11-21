@@ -2,7 +2,7 @@
 
 Vulkan 1.2 GPU and Rayon CPU 2D continuum shock, armor penetration, reactive detonation, and self-gravitating planetary collision simulator written in Rust.
 
-## Key Capabilities (`v0.1.2`)
+## Key Capabilities (`v0.2.0`)
 
 - **Attractor & Repulsor Gravity Materials (`v0.1.2`)**: Dedicated `Attractor` (`+3.5×` cyan core) and `Repulsor` (`-3.5×` violet anti-gravity field) continuum materials with momentum-conserving signed 32×32 gravity grids (CPU + Vulkan GPU + predictor parity), automatic gravity activation on placement/painting, and same-sign internal cohesion so Repulsor bodies never self-explode.
 - **Exact Swept Orbital & Ballistic Impact Predictor**: Multi-node 2D extended-body mass quadrature with dynamic spatial softening parity (`ContinuumWorld` 32×32 gravity match), adaptive symplectic Velocity-Verlet integration, exact shape-vs-shape swept collision (`Circle`, `Annulus` cavity/wall, oriented `Rect`, `Ellipse`, `Polygon` incl. `LongRodDart` fins & `TriangleWedge`, and `Blueprint` cell grids) with `0` tunneling up to `100 km/s`, surface-accurate contact markers (`impact`), and translucent ghost silhouettes at impact contact.
@@ -16,26 +16,26 @@ Vulkan 1.2 GPU and Rayon CPU 2D continuum shock, armor penetration, reactive det
 
 ## Quick Install (Linux x86_64)
 
-Download and run the installer from release `v0.1.2` to fetch release files from GitHub into your user `~/bin` directory (and desktop application menu):
+Download and run the installer from release `v0.2.0` to fetch release files from GitHub into your user `~/bin` directory (and desktop application menu):
 
 ```bash
-curl -fsSL https://github.com/rappar222/rusted-space-simulation/releases/download/v0.1.2/install.sh | bash
+curl -fsSL https://github.com/polychroms/rusted-space-simulation/releases/download/v0.2.0/install.sh | bash
 ```
 
-Or run `Rusted_Space_Simulation-0.1.2-x86_64.AppImage` directly from the [GitHub Releases](https://github.com/rappar222/rusted-space-simulation/releases) page:
+Or run `Rusted_Space_Simulation-0.2.0-x86_64.AppImage` directly from [GitHub Releases](https://github.com/polychroms/rusted-space-simulation/releases) or [GitLab Releases](https://gitlab.com/polychroms/rssim/-/releases):
 
 ```bash
-chmod +x Rusted_Space_Simulation-0.1.2-x86_64.AppImage
-./Rusted_Space_Simulation-0.1.2-x86_64.AppImage
+chmod +x Rusted_Space_Simulation-0.2.0-x86_64.AppImage
+./Rusted_Space_Simulation-0.2.0-x86_64.AppImage
 ```
 
 Installer options:
 - `INSTALL_DIR=/custom/bin ./install.sh` or `./install.sh --dir /custom/bin` installs to a custom bin directory.
-- `./install.sh --from-source` downloads the `v0.1.2` source archive from GitHub and compiles with `cargo build --release`.
+- `./install.sh --from-source` downloads the `v0.2.0` source archive from GitHub and compiles with `cargo build --release`.
 
 ## Windows x86_64 Standalone App
 
-Download `rssim.exe` or `rssim-v0.1.2-x86_64-windows.zip` from the [GitHub Releases](https://github.com/rappar222/rusted-space-simulation/releases) page and double-click `rssim.exe`. No installer or Visual C++ Redistributable is required (static CRT, Vulkan 1.2 compute with automatic CPU fallback). Saved blueprints, scenes, and captures live in `%LOCALAPPDATA%\rssim\`.
+Download `rssim.exe` or `rssim-v0.2.0-x86_64-windows.zip` from [GitHub Releases](https://github.com/polychroms/rusted-space-simulation/releases) or [GitLab Releases](https://gitlab.com/polychroms/rssim/-/releases) and double-click `rssim.exe`. No installer or Visual C++ Redistributable is required (static CRT, Vulkan 1.2 compute with automatic CPU fallback). Saved blueprints, scenes, and captures live in `%LOCALAPPDATA%\rssim\`.
 
 ## Building from Source
 
