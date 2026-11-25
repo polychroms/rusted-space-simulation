@@ -174,6 +174,60 @@ impl PixelBlueprint {
         self.cells = next;
     }
 
+    pub fn auto_center(&mut self) {
+        let Some((min_x, min_y, max_x, max_y)) = self.occupied_bounds() else {
+            return;
+        };
+        let cw = max_x - min_x + 1;
+        let ch = max_y - min_y + 1;
+        let pad_x = self.width.saturating_sub(cw) / 2;
+        let pad_y = self.height.saturating_sub(ch) / 2;
+        let mut next = vec![None; self.width * self.height];
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let nx = pad_x + (x - min_x);
+                let ny = pad_y + (y - min_y);
+                if nx < self.width && ny < self.height {
+                    next[ny * self.width + nx] = self.cells[y * self.width + x];
+                }
+            }
+        }
+        self.cells = next;
+    }
+
+    /// Returns `(charge_mass_g_cm, inert_mass_g_cm, c_over_m, gurney_frag_kms)`.
+    pub fn warhead_gurney_estimate(&self, dx: f32) -> (f32, f32, f32, f32) {
+        let area = 0.866_025_4 * dx * dx;
+        let mut c_mass = 0.0f32;
+        let mut m_mass = 0.0f32;
+        let mut gurney_e_sum = 0.0f32;
+        for m in self.cells.iter().flatten() {
+            let p = m.props();
+            let pm = p.rho0 * area;
+            if p.is_energetic
+                && *m != MaterialId::ImpactFuze
+                && *m != MaterialId::DelayFuze
+            {
+                let g_const = p.det_speed_kms() / 2.85;
+                gurney_e_sum += pm * g_const * g_const;
+                c_mass += pm;
+            } else {
+                m_mass += pm;
+            }
+        }
+        if c_mass <= 1e-6 {
+            return (0.0, m_mass, 0.0, 0.0);
+        }
+        let gurney_2e = gurney_e_sum / c_mass;
+        let c_over_m = if m_mass > 1e-6 { c_mass / m_mass } else { 99.0 };
+        let v_frag = if m_mass > 1e-6 {
+            (gurney_2e / (m_mass / c_mass + 0.5)).max(0.0).sqrt()
+        } else {
+            gurney_2e.sqrt() * 1.4
+        };
+        (c_mass, m_mass, c_over_m, v_frag)
+    }
+
     pub fn filled_count(&self) -> usize {
         self.cells.iter().filter(|c| c.is_some()).count()
     }
@@ -322,9 +376,16 @@ impl PixelBlueprint {
 
         if !filled {
             // V-shaped liner legs from (x_base, cy - half_h) -> (x_tip, cy) -> (x_base, cy + half_h)
-            let r = (thickness.max(1) - 1) / 2;
+            let t = thickness.max(1);
+            let r = (t - 1) / 2;
             self.paint_line((x_base, cy - half_h), (x_tip, cy), r, val, sym);
             self.paint_line((x_base, cy + half_h), (x_tip, cy), r, val, sym);
+            // Even thickness (e.g. 2, 4) paints an adjacent inward pass so thickness 2 != 1.
+            if t % 2 == 0 {
+                let x_shift = if x_base >= x_tip { 1 } else { -1 };
+                self.paint_line((x_base - x_shift, cy - half_h), (x_tip - x_shift, cy), r, val, sym);
+                self.paint_line((x_base - x_shift, cy + half_h), (x_tip - x_shift, cy), r, val, sym);
+            }
             return;
         }
 
@@ -553,10 +614,11 @@ pub enum BuiltinProjectileBp {
     ApfsdsDepletedU,
     ApheDelayShell,
     HeshSquashHead,
+    OctolFragShell,
 }
 
 impl BuiltinProjectileBp {
-    pub const ALL: [BuiltinProjectileBp; 7] = [
+    pub const ALL: [BuiltinProjectileBp; 8] = [
         BuiltinProjectileBp::HeatWarhead,
         BuiltinProjectileBp::TandemHeat,
         BuiltinProjectileBp::EfpDishWarhead,
@@ -564,6 +626,7 @@ impl BuiltinProjectileBp {
         BuiltinProjectileBp::ApfsdsDepletedU,
         BuiltinProjectileBp::ApheDelayShell,
         BuiltinProjectileBp::HeshSquashHead,
+        BuiltinProjectileBp::OctolFragShell,
     ];
 
     pub fn label(self) -> &'static str {
@@ -575,6 +638,7 @@ impl BuiltinProjectileBp {
             BuiltinProjectileBp::ApfsdsDepletedU => "APFSDS Depleted Uranium",
             BuiltinProjectileBp::ApheDelayShell => "APHE Armor-Piercing HE (88mm)",
             BuiltinProjectileBp::HeshSquashHead => "HESH Squash-Head (120mm)",
+            BuiltinProjectileBp::OctolFragShell => "155mm Octol HE-Frag Shell",
         }
     }
 
@@ -587,39 +651,40 @@ impl BuiltinProjectileBp {
             BuiltinProjectileBp::ApfsdsDepletedU => 1.70,
             BuiltinProjectileBp::ApheDelayShell => 1.15,
             BuiltinProjectileBp::HeshSquashHead => 0.73,
+            BuiltinProjectileBp::OctolFragShell => 0.68,
         }
     }
 
     pub fn build(self) -> PixelBlueprint {
         match self {
             BuiltinProjectileBp::HeatWarhead => {
-                // 92x57 grid (odd height -> exact hex-parity symmetry!): Confined Comp-B + 48° V-shaped Copper cone + open standoff cowl
-                let mut bp = PixelBlueprint::new_empty("PG-7 HEAT Warhead", 92, 57);
-                let cy = 28;
+                // 92x67 grid (odd height -> exact hex-parity symmetry!): High-C/M Confined Comp-B + V-shaped Copper cone + open standoff cowl
+                let mut bp = PixelBlueprint::new_empty("PG-7 HEAT Warhead", 92, 67);
+                let cy = 33;
                 let sym = SymmetryMode::HorizontalAxis;
 
-                // 1. Main Comp-B Explosive charge (y = cy-14..cy+14, ample charge thickness even at cone mouth!)
-                bp.paint_rect((12, cy - 14), (48, cy + 14), true, 1, Some(MaterialId::CompB), sym);
+                // 1. High-confinement Main Comp-B Explosive charge (thick radial charge even at cone mouth!)
+                bp.paint_rect((10, cy - 18), (48, cy + 18), true, 1, Some(MaterialId::CompB), sym);
                 // Carve open V-cavity on front of Comp-B so copper cone sits cleanly inside
                 bp.paint_wedge((49, cy - 10), (19, cy), true, 1, None, sym);
 
                 // 2. Heavy Mild-Steel warhead confinement jacket & rear tamper (directs detonation energy inward)
-                bp.paint_line((9, cy - 16), (49, cy - 16), 0, Some(MaterialId::MildSteel), sym);
-                bp.paint_line((9, cy - 15), (49, cy - 15), 0, Some(MaterialId::MildSteel), sym);
-                bp.paint_line((9, cy - 16), (9, cy - 2), 0, Some(MaterialId::MildSteel), sym);
-                bp.paint_line((10, cy - 15), (10, cy - 2), 0, Some(MaterialId::MildSteel), sym);
-                bp.paint_rect((1, cy - 3), (6, cy + 3), true, 1, Some(MaterialId::Aluminum), sym);
+                bp.paint_line((8, cy - 20), (49, cy - 20), 0, Some(MaterialId::MildSteel), sym);
+                bp.paint_line((8, cy - 19), (49, cy - 19), 0, Some(MaterialId::MildSteel), sym);
+                bp.paint_line((8, cy - 20), (8, cy - 2), 0, Some(MaterialId::MildSteel), sym);
+                bp.paint_line((9, cy - 19), (9, cy - 2), 0, Some(MaterialId::MildSteel), sym);
+                bp.paint_rect((1, cy - 3), (5, cy + 3), true, 1, Some(MaterialId::Aluminum), sym);
 
-                // 3. V-shaped OFHC Copper Shaped-Charge Liner (apex x=19, mouth x=48, 2 cells thick for hypersonic jet stream)
+                // 3. V-shaped OFHC Copper Shaped-Charge Liner (apex x=19, mouth x=48, genuine 2-cell thickness for heavy hypersonic jet stream)
                 bp.paint_wedge((48, cy - 9), (19, cy), false, 2, Some(MaterialId::Copper), sym);
 
                 // 4. Open-bore Aluminum Standoff Cowl + flush Piezo Impact Nose Ring + insulated rear firing wire
-                bp.paint_line((49, cy - 15), (81, cy - 7), 0, Some(MaterialId::Aluminum), sym);
-                bp.paint_line((50, cy - 17), (81, cy - 8), 0, Some(MaterialId::ImpactFuze), sym);
-                bp.paint_line((7, cy - 17), (50, cy - 17), 0, Some(MaterialId::ImpactFuze), sym);
-                bp.paint_line((7, cy - 17), (7, cy), 0, Some(MaterialId::ImpactFuze), sym);
-                bp.paint_rect((7, cy - 1), (12, cy + 1), true, 1, Some(MaterialId::ImpactFuze), sym);
-                bp.paint_rect((81, cy - 8), (87, cy - 5), true, 1, Some(MaterialId::ImpactFuze), sym);
+                bp.paint_line((49, cy - 19), (79, cy - 8), 0, Some(MaterialId::Aluminum), sym);
+                bp.paint_line((50, cy - 21), (79, cy - 9), 0, Some(MaterialId::ImpactFuze), sym);
+                bp.paint_line((6, cy - 21), (50, cy - 21), 0, Some(MaterialId::ImpactFuze), sym);
+                bp.paint_line((6, cy - 21), (6, cy), 0, Some(MaterialId::ImpactFuze), sym);
+                bp.paint_rect((6, cy - 1), (10, cy + 1), true, 1, Some(MaterialId::ImpactFuze), sym);
+                bp.paint_rect((79, cy - 8), (85, cy - 5), true, 1, Some(MaterialId::ImpactFuze), sym);
                 bp
             }
 
@@ -748,6 +813,23 @@ impl BuiltinProjectileBp {
                 bp.paint_line((9, cy - 12), (9, cy), 0, Some(MaterialId::MildSteel), sym);
                 // Base Delay Fuze (18 µs so C4 squashes flat onto armor plate before detonating!)
                 bp.paint_rect((10, cy - 6), (16, cy + 6), true, 1, Some(MaterialId::DelayFuze), sym);
+                bp
+            }
+
+            BuiltinProjectileBp::OctolFragShell => {
+                let mut bp = PixelBlueprint::new_empty("155mm Octol HE-Frag Shell", 78, 45);
+                let cy = 22;
+                let sym = SymmetryMode::HorizontalAxis;
+
+                // High-brisance Octol 75/25 bursting core with aerodynamic ogive & scored MildSteel/HHA frag jacket
+                bp.paint_rect((11, cy - 12), (46, cy + 12), true, 1, Some(MaterialId::OctolExplosive), sym);
+                bp.paint_wedge((46, cy - 12), (69, cy), true, 1, Some(MaterialId::OctolExplosive), sym);
+                bp.paint_line((9, cy - 14), (47, cy - 14), 1, Some(MaterialId::HhaSteel), sym);
+                bp.paint_line((47, cy - 14), (71, cy), 1, Some(MaterialId::MildSteel), sym);
+                bp.paint_line((9, cy - 14), (9, cy), 1, Some(MaterialId::MildSteel), sym);
+                // Nose piezo ImpactFuze cap + copper driving band
+                bp.paint_rect((67, cy - 2), (73, cy + 2), true, 1, Some(MaterialId::ImpactFuze), sym);
+                bp.paint_rect((14, cy - 15), (18, cy - 14), true, 1, Some(MaterialId::Copper), sym);
                 bp
             }
         }

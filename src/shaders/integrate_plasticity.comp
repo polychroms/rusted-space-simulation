@@ -88,14 +88,15 @@ void main() {
     float det_age = p.det_aux.y;
     float shock_rate = 0.65 * p.det_aux.z + 0.35 * shock_comp;
 
-    // 1. Bounded Continuum Density Update (rate-limited per substep to prevent single-cell detonation Euler overshoot)
-    float delta_rho = clamp(drho * dt, -0.10 * rho0, 0.12 * rho0);
+    // 1. Bounded Continuum Density Update (rate-limited per substep; preserve active blast expansion)
+    float rho_lim = (det_state == 2u) ? 0.14 : 0.10;
+    float delta_rho = clamp(drho * dt, -rho_lim * rho0, 0.14 * rho0);
     float new_rho = rho + delta_rho;
     if (det_state == 2u) {
-        if (neighbors < 10.0) {
+        if (det_age > 4.5 && neighbors <= 3.0) {
             float target_gas = 0.08 * rho0;
             if (new_rho > target_gas) {
-                new_rho -= (new_rho - target_gas) * min(0.35 * dt, 0.25);
+                new_rho -= (new_rho - target_gas) * min(0.18 * dt, 0.16);
             }
         }
         rho = clamp(new_rho, 0.05 * rho0, 2.2 * rho0);
@@ -182,15 +183,19 @@ void main() {
             float over = (sigma_1_tens - spall_th) / spall_th;
             dmg = clamp(dmg + dt * 1.65 * over, 0.0, 1.0);
         }
-        // Regularized Johnson-Cook triaxiality allows smooth armor bending & petaling without brittle hinge snaps
+        // Regularized Johnson-Cook triaxiality allows smooth armor bending & petaling,
+        // while >18 GPa hypervelocity stagnation drives adiabatic thermal-shear plugging erosion.
         float k1 = max(rho0 * m.eos.y * m.eos.y, 0.05);
         float triax = sigma_mean / max(sigma_eq_eff, max(m.strength.y, 0.005));
+        float hydro_shear = (sph_p > 0.18 && tau_max > 1.35 * m.strength.y)
+            ? clamp((sph_p - 0.18) / 0.30, 0.0, 1.0)
+            : 0.0;
         float eps_f_jc = (sigma_mean > 0.0)
             ? m.fracture.y * max(0.38 + 0.62 * exp(-1.3 * triax), 0.35)
-            : m.fracture.y * min(1.5 + 4.5 * max(sph_p, 0.0) / k1, 3.0);
+            : m.fracture.y * max(min(1.5 + 4.5 * max(sph_p, 0.0) / k1, 3.0) * (1.0 - 0.65 * hydro_shear), 0.55);
         if (eps_p > eps_f_jc) {
             float over_jc = (eps_p - eps_f_jc) / max(eps_f_jc, 0.05);
-            dmg = clamp(dmg + dt * 2.80 * over_jc, 0.0, 1.0);
+            dmg = clamp(dmg + dt * (2.80 + 4.20 * hydro_shear) * over_jc, 0.0, 1.0);
         }
     } else {
         if (sigma_mean > 0.15 * spall_th && sigma_1_tens > spall_th) {
@@ -252,14 +257,56 @@ void main() {
         }
     }
 
-    // 5. Final Velocity Kick, Internal Energy & Temperature
+    // 5. Final Velocity Kick, Internal Energy & Temperature (kick-limited & speed-bounded)
     vec2 pos = p.pos_vel.xy;
     vec2 vel = p.pos_vel.zw;
+    if (any(isnan(acc)) || any(isinf(acc))) {
+        acc = vec2(0.0);
+    }
+    if (any(isnan(xsph)) || any(isinf(xsph))) {
+        xsph = vec2(0.0);
+    }
+    if (any(isnan(vel)) || any(isinf(vel))) {
+        vel = vec2(0.0);
+    }
+    float dt_safe = max(dt, 1e-4);
+    float max_dv_end = ((pc.step_index == 0u) ? 0.60 : 0.45) * pc.dx / dt_safe;
     if (pc.step_index == 0u) {
-        vel += acc * dt;
-        pos += (vel + xsph) * dt;
+        vec2 dv = acc * dt;
+        float dvl = length(dv);
+        if (dvl > max_dv_end && dvl > 1e-8) {
+            dv *= max_dv_end / dvl;
+        }
+        vel += dv;
+        float vl = length(vel);
+        if (vl > 15.0) {
+            vel *= 15.0 / vl;
+        }
+        vec2 xs = xsph;
+        float xsl = length(xs);
+        if (xsl > 3.0) {
+            xs *= 3.0 / xsl;
+        }
+        vec2 dp = (vel + xs) * dt;
+        float max_dp = 0.65 * pc.dx;
+        float dpl = length(dp);
+        if (dpl > max_dp && dpl > 1e-8) {
+            dp *= max_dp / dpl;
+        }
+        if (!any(isnan(pos)) && !any(isinf(pos))) {
+            pos += dp;
+        }
     } else {
-        vel += 0.5 * acc * dt;
+        vec2 dv = 0.5 * acc * dt;
+        float dvl = length(dv);
+        if (dvl > max_dv_end && dvl > 1e-8) {
+            dv *= max_dv_end / dvl;
+        }
+        vel += dv;
+        float vl = length(vel);
+        if (vl > 15.0) {
+            vel *= 15.0 / vl;
+        }
     }
 
     float rad_cool_e = 0.0;
@@ -273,8 +320,8 @@ void main() {
     }
 
     float mech_e = max(energy + de_dt * dt + plastic_heat, 0.0);
-    if (det_state == 2u && neighbors < 8.0) {
-        mech_e *= max(1.0 - 0.14 * dt, 0.85);
+    if (det_state == 2u && det_age > 5.0 && neighbors < 4.0) {
+        mech_e *= max(1.0 - 0.08 * dt, 0.90);
     }
     float mech_de = mech_e - energy;
     energy = max(mech_e - rad_cool_e, 0.0);

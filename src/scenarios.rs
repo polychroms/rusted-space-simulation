@@ -49,11 +49,13 @@ pub enum ScenarioPreset {
     BinaryPlanetInspiral,
     KineticRodBunkerBuster,
     OceanMoonHyperImpact,
+    OctolFragDemolition,
+    GravitySlingshotOrbits,
     EmptySpace,
 }
 
 impl ScenarioPreset {
-    pub const ALL: [ScenarioPreset; 17] = [
+    pub const ALL: [ScenarioPreset; 19] = [
         ScenarioPreset::HeatVsRhaArmor,
         ScenarioPreset::ApfsdsVsKontakt5Era,
         ScenarioPreset::TandemHeatVsEra,
@@ -70,6 +72,8 @@ impl ScenarioPreset {
         ScenarioPreset::BinaryPlanetInspiral,
         ScenarioPreset::KineticRodBunkerBuster,
         ScenarioPreset::OceanMoonHyperImpact,
+        ScenarioPreset::OctolFragDemolition,
+        ScenarioPreset::GravitySlingshotOrbits,
         ScenarioPreset::EmptySpace,
     ];
 
@@ -84,13 +88,15 @@ impl ScenarioPreset {
             Self::ApheTankAmmoRack
             | Self::ApheVsConcreteBunker
             | Self::LowSpeedPlasticRicochet
-            | Self::KineticRodBunkerBuster => ScenarioCategory::NavalBunker,
+            | Self::KineticRodBunkerBuster
+            | Self::OctolFragDemolition => ScenarioCategory::NavalBunker,
             Self::PlanetaryImpact
             | Self::IcyCometCollision
             | Self::HypervelocityWhipple
             | Self::RocheLimitRingFormation
             | Self::BinaryPlanetInspiral
-            | Self::OceanMoonHyperImpact => ScenarioCategory::PlanetaryOrbital,
+            | Self::OceanMoonHyperImpact
+            | Self::GravitySlingshotOrbits => ScenarioCategory::PlanetaryOrbital,
             Self::EmptySpace => ScenarioCategory::All,
         }
     }
@@ -113,6 +119,8 @@ impl ScenarioPreset {
             ScenarioPreset::BinaryPlanetInspiral => "15. Binary Proto-Planet Inspiral Merger",
             ScenarioPreset::KineticRodBunkerBuster => "16. Tungsten Bunker-Buster vs Reinforced Vault",
             ScenarioPreset::OceanMoonHyperImpact => "17. Europa Ocean-Moon Hyper-Impact (9.2 km/s)",
+            ScenarioPreset::OctolFragDemolition => "18. 155mm Octol HE-Frag Shell vs Bunker Array",
+            ScenarioPreset::GravitySlingshotOrbits => "19. Attractor-Repulsor Orbital Slingshot Trap",
             ScenarioPreset::EmptySpace => "13. Empty Continuum Space",
         }
     }
@@ -166,6 +174,12 @@ impl ScenarioPreset {
             }
             ScenarioPreset::OceanMoonHyperImpact => {
                 "An ice-shelled Europa-like ocean moon (Fe-Ni core + Granite mantle + deep Liquid Water subsurface ocean + cryogenic Water Ice crust) under self-gravity is punched open by a hypervelocity 9.2 km/s metallic impactor, venting massive hydrodynamic ocean plumes!"
+            }
+            ScenarioPreset::OctolFragDemolition => {
+                "155mm Octol HE-Frag artillery shell slams into a reinforced concrete parapet protecting an internal Comp-B depot & aluminum witness bulkhead — unleashing an 8.48 km/s JWL detonation blast wave, supersonic fragment spray, and secondary cook-off!"
+            }
+            ScenarioPreset::GravitySlingshotOrbits => {
+                "Exotic Attractor (+3.5x) & Repulsor (-3.5x) field testbed: a multi-density Tungsten-Ice satellite orbits the central Attractor core while an off-axis Repulsor shepherd deflects incoming rocky debris!"
             }
             ScenarioPreset::EmptySpace => {
                 "Empty borderless continuum space. Design custom warheads & targets in Targets Builder & Projectiles Builder, place & aim them in STAGING, or pick a ballistic/astrophysics preset above."
@@ -301,8 +315,7 @@ pub fn spawn_oriented_box(
             if lx > half_extents.x - 0.05 * dx {
                 continue;
             }
-            let is_edge = ix == 0 || ix >= nx - 1 || iy == 0 || iy >= ny - 1;
-            let j_amp = if is_edge { 0.035 * dx } else { 0.16 * dx };
+            let j_amp = 0.03 * dx;
             let jit = hash_jitter(((ix as u64) << 20) ^ (iy as u64) ^ ((body_id as u64) << 40))
                 * j_amp;
             let local = Vec2::new(lx, ly) + jit;
@@ -711,31 +724,31 @@ pub fn preset_to_scene(preset: ScenarioPreset) -> SceneSpec {
         ScenarioPreset::HeatVsRhaArmor => {
             scene.targets.push(TargetSpec {
                 name: "Deep RHA Steel Armor".to_string(),
-                pos: Vec2::new(14.5, 0.0),
+                pos: Vec2::new(11.2, 0.0),
                 angle_deg: 0.0,
                 vel: Vec2::ZERO,
                 temp_k: 293.0,
                 kind: TargetKind::SolidBox {
-                    width: 16.0,
-                    height: 50.0,
+                    width: 8.5,
+                    height: 54.0,
                     mat: MaterialId::RhaSteel,
                 },
             });
             scene.targets.push(TargetSpec {
                 name: "Crew Aluminum Witness Plate".to_string(),
-                pos: Vec2::new(31.0, 0.0),
+                pos: Vec2::new(19.5, 0.0),
                 angle_deg: 0.0,
                 vel: Vec2::ZERO,
                 temp_k: 293.0,
                 kind: TargetKind::SolidBox {
                     width: 2.0,
-                    height: 48.0,
+                    height: 50.0,
                     mat: MaterialId::Aluminum,
                 },
             });
             let bp = BuiltinProjectileBp::HeatWarhead.build();
             let proj = ProjectileSpec::from_blueprint(
-                Vec2::new(-9.5, 0.0),
+                Vec2::new(-8.9, 0.0),
                 BuiltinProjectileBp::HeatWarhead.default_speed_kms(),
                 0.0,
                 bp,
@@ -991,14 +1004,14 @@ pub fn preset_to_scene(preset: ScenarioPreset) -> SceneSpec {
                 },
             });
             let mut slug = ProjectileSpec::default_with_shape(
-                ProjectileShape::BluntSlug,
-                Vec2::new(-9.0, 2.5),
-                MaterialId::Tungsten,
+                ProjectileShape::Ellipse,
+                Vec2::new(-2.0, 2.5),
+                MaterialId::Copper,
             );
             slug.name = "Sub-Hydrodynamic Slug".to_string();
-            slug.length_cm = 10.1;
-            slug.radius_cm = 2.94;
-            slug.set_vel_cm_per_us(Vec2::new(0.045, -0.004));
+            slug.length_cm = 10.0;
+            slug.radius_cm = 2.9;
+            slug.set_vel_cm_per_us(Vec2::new(0.0418, -0.004));
             scene.projectiles.push(slug);
         }
 
@@ -1248,6 +1261,117 @@ pub fn preset_to_scene(preset: ScenarioPreset) -> SceneSpec {
             scene.projectiles.push(imp);
         }
 
+        ScenarioPreset::OctolFragDemolition => {
+            scene.targets.push(TargetSpec {
+                name: "Reinforced Concrete Parapet".to_string(),
+                pos: Vec2::new(6.0, 0.0),
+                angle_deg: 0.0,
+                vel: Vec2::ZERO,
+                temp_k: 293.0,
+                kind: TargetKind::CompositePlate {
+                    height: 48.0,
+                    layers: vec![
+                        ArmorLayer {
+                            thickness: 2.2,
+                            mat: MaterialId::Concrete,
+                        },
+                        ArmorLayer {
+                            thickness: 0.8,
+                            mat: MaterialId::MildSteel,
+                        },
+                    ],
+                },
+            });
+            scene.targets.push(TargetSpec {
+                name: "Ready-Rack Comp-B Depot".to_string(),
+                pos: Vec2::new(15.5, 0.0),
+                angle_deg: 0.0,
+                vel: Vec2::ZERO,
+                temp_k: 293.0,
+                kind: TargetKind::SolidBox {
+                    width: 4.5,
+                    height: 18.0,
+                    mat: MaterialId::CompB,
+                },
+            });
+            scene.targets.push(TargetSpec {
+                name: "Rear Aluminum Witness Wall".to_string(),
+                pos: Vec2::new(25.0, 0.0),
+                angle_deg: 0.0,
+                vel: Vec2::ZERO,
+                temp_k: 293.0,
+                kind: TargetKind::SolidBox {
+                    width: 2.0,
+                    height: 46.0,
+                    mat: MaterialId::Aluminum,
+                },
+            });
+            let frag_bp = BuiltinProjectileBp::OctolFragShell.build();
+            scene.projectiles.push(ProjectileSpec::from_blueprint(
+                Vec2::new(-12.5, 0.0),
+                BuiltinProjectileBp::OctolFragShell.default_speed_kms(),
+                0.0,
+                frag_bp,
+            ));
+        }
+
+        ScenarioPreset::GravitySlingshotOrbits => {
+            scene.self_gravity = true;
+            scene.grav_g = 7.5e-5;
+            scene.targets.push(TargetSpec {
+                name: "Attractor Primary Core".to_string(),
+                pos: Vec2::new(-6.0, 0.0),
+                angle_deg: 0.0,
+                vel: Vec2::ZERO,
+                temp_k: 293.0,
+                kind: TargetKind::LayeredPlanet {
+                    shells: vec![PlanetShell {
+                        thickness: 5.5,
+                        mat: MaterialId::AttractorMass,
+                        temp_k: 293.0,
+                    }],
+                },
+            });
+            scene.targets.push(TargetSpec {
+                name: "Repulsor Shepherd Well".to_string(),
+                pos: Vec2::new(22.0, -5.0),
+                angle_deg: 0.0,
+                vel: Vec2::ZERO,
+                temp_k: 293.0,
+                kind: TargetKind::LayeredPlanet {
+                    shells: vec![PlanetShell {
+                        thickness: 3.6,
+                        mat: MaterialId::RepulsorMass,
+                        temp_k: 293.0,
+                    }],
+                },
+            });
+            let mut orb_sat = ProjectileSpec::default_with_shape(
+                ProjectileShape::DifferentiatedAsteroid,
+                Vec2::new(-6.0, 18.0),
+                MaterialId::WaterIce,
+            );
+            orb_sat.name = "Multi-Density Ice-Tungsten Satellite".to_string();
+            orb_sat.core_mat = MaterialId::Tungsten;
+            orb_sat.radius_cm = 2.6;
+            orb_sat.core_frac = 0.45;
+            orb_sat.temp_k = 210.0;
+            scene.projectiles.push(orb_sat);
+            if let Some((spd, ang)) = scene.compute_orbit_velocity(0, false, 1.0) {
+                scene.projectiles[0].speed_kms = spd;
+                scene.projectiles[0].angle_deg = ang;
+            }
+            let mut scatter = ProjectileSpec::default_with_shape(
+                ProjectileShape::Sphere,
+                Vec2::new(28.0, 14.0),
+                MaterialId::BasaltRock,
+            );
+            scatter.name = "Incoming Slingshot Rock".to_string();
+            scatter.radius_cm = 2.4;
+            scatter.set_vel_cm_per_us(Vec2::new(-0.18, -0.30));
+            scene.projectiles.push(scatter);
+        }
+
         ScenarioPreset::EmptySpace => {}
     }
 
@@ -1262,7 +1386,7 @@ pub fn build_scenario(preset: ScenarioPreset, dx: f32) -> ContinuumWorld {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blueprint::PixelBlueprint;
+    use crate::blueprint::{PixelBlueprint, SymmetryMode};
 
     #[test]
     fn empty_space_starts_empty() {
@@ -1318,7 +1442,7 @@ mod tests {
     fn heat_warhead_detonates_and_forms_hypervelocity_copper_jet() {
         let mut world = build_scenario(ScenarioPreset::HeatVsRhaArmor, 0.35);
         let mut peak_cu_vx = 0.0f32;
-        for _ in 0..1450 {
+        for _ in 0..5400usize {
             let dt = world.compute_cfl_dt();
             world.step(dt);
             for (i, m) in world.mat.iter().enumerate() {
@@ -1339,6 +1463,23 @@ mod tests {
             peak_cu_vx > 0.45,
             "Expected emergent hypervelocity copper Munroe jet (>4.5 km/s), got {:.2} km/s",
             peak_cu_vx * 10.0
+        );
+        let rha_dmg = world
+            .mat
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| **m == MaterialId::RhaSteel && world.damage[*i] > 0.35)
+            .count();
+        let cu_max_x = world
+            .mat
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| **m == MaterialId::Copper)
+            .map(|(i, _)| world.pos[i].x)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            rha_dmg >= 140 && cu_max_x >= 10.0,
+            "Expected HEAT Munroe jet to deeply crater RHA armor (rha_dmg={rha_dmg}, cu_max_x={cu_max_x:.2} cm)"
         );
     }
 
@@ -1416,7 +1557,7 @@ mod tests {
 
         // 1. Sub-hydrodynamic impact on Vulkan GPU: metal bends plastically with ZERO disintegration!
         let mut world_dent = build_scenario(ScenarioPreset::LowSpeedPlasticRicochet, 0.35);
-        for _ in 0..45 {
+        for _ in 0..50 {
             let dt = world_dent.compute_cfl_dt();
             vk_engine.step_batch(&mut world_dent, 10, dt);
         }
@@ -2623,5 +2764,229 @@ mod tests {
             .expect("packaging/rssim.png must decode into eframe IconData");
         assert_eq!((icon.width, icon.height), (256, 256));
         assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
+
+    #[test]
+    fn slider_jumble_and_extreme_speed_never_explodes_cpu_and_gpu() {
+        let make_torture = || {
+            let mut w = ContinuumWorld::new(0.35);
+            w.self_gravity = true;
+            w.grav_g = 4.0e-4; // Maximum UI gravity slider
+            // Attractor + Comp-B + RHA target
+            w.paint_matter_disc(Vec2::new(8.0, 0.0), 3.0, MaterialId::AttractorMass, Vec2::ZERO, None, 1);
+            spawn_oriented_box(
+                &mut w,
+                Vec2::new(3.0, 0.0),
+                Vec2::new(2.0, 6.0),
+                0.0,
+                Vec2::ZERO,
+                MaterialId::RhaSteel,
+                None,
+                None,
+            );
+            spawn_oriented_box(
+                &mut w,
+                Vec2::new(-1.0, 0.0),
+                Vec2::new(2.0, 4.0),
+                0.0,
+                Vec2::new(10.0, 0.0), // 100 km/s max slider speed!
+                MaterialId::CompB,
+                None,
+                None,
+            );
+            w
+        };
+
+        let mut w_cpu = make_torture();
+        let mut w_gpu = make_torture();
+        let mut vk_opt = crate::vulkan_gpu::VulkanPhysicsEngine::new().ok();
+
+        // Aggressively alternate tiny <-> full CFL scaling to stress Verlet dt-jumble stability
+        let dt_mults = [0.25f32, 1.0, 0.3, 1.0, 0.25, 1.0, 0.5, 1.0];
+        for cycle in 0..48usize {
+            let mult = dt_mults[cycle % dt_mults.len()];
+            for _ in 0..4 {
+                let dt = w_cpu.compute_cfl_dt() * mult;
+                w_cpu.step(dt);
+            }
+            if let Some(vk) = &mut vk_opt {
+                let dt = w_gpu.compute_cfl_dt() * mult;
+                vk.step_batch(&mut w_gpu, 4, dt);
+            }
+        }
+
+        for (tag, w) in [("CPU", &w_cpu), ("GPU", &w_gpu)] {
+            let mut max_speed_kms = 0.0f32;
+            for (i, (&p, &v)) in w.pos.iter().zip(w.vel.iter()).enumerate() {
+                assert!(
+                    p.is_finite() && v.is_finite(),
+                    "{tag} particle {i} became non-finite: pos={p:?} vel={v:?}"
+                );
+                max_speed_kms = max_speed_kms.max(v.length() * 10.0);
+            }
+            assert!(
+                max_speed_kms <= 150.1,
+                "{tag} velocity blew up past physical 150 km/s bound: {max_speed_kms:.2} km/s"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_density_composite_projectile_stability_cpu_and_gpu() {
+        // Construct a bonded 19:1 density-ratio projectile (Tungsten 17.5 + TNT 1.65 + Aluminum 2.81 + WaterIce 0.92)
+        let mut bp = PixelBlueprint::new_empty("MultiDensityTest", 36, 19);
+        let cy = 9;
+        bp.paint_rect((4, cy - 4), (11, cy + 4), true, 1, Some(MaterialId::Tungsten), SymmetryMode::None);
+        bp.paint_rect((12, cy - 4), (20, cy + 4), true, 1, Some(MaterialId::TntExplosive), SymmetryMode::None);
+        bp.paint_rect((21, cy - 4), (26, cy + 4), true, 1, Some(MaterialId::Aluminum), SymmetryMode::None);
+        bp.paint_rect((27, cy - 4), (32, cy + 4), true, 1, Some(MaterialId::WaterIce), SymmetryMode::None);
+
+        let make_proj = || {
+            let mut w = ContinuumWorld::new(0.35);
+            bp.spawn_into(&mut w, Vec2::ZERO, 0.0, Vec2::new(0.25, 0.0), Some(200.0));
+            w
+        };
+        let mut w_cpu = make_proj();
+        let mut w_gpu = make_proj();
+        let dt = 0.035;
+        for _ in 0..160 {
+            w_cpu.step(dt);
+        }
+        let mut vk_opt = crate::vulkan_gpu::VulkanPhysicsEngine::new().ok();
+        if let Some(vk) = &mut vk_opt {
+            vk.step_batch(&mut w_gpu, 160, dt);
+        } else {
+            for _ in 0..160 {
+                w_gpu.step(dt);
+            }
+        }
+
+        for (tag, w) in [("CPU", &w_cpu), ("GPU", &w_gpu)] {
+            assert_eq!(
+                w.fractured_count, 0,
+                "{tag} 19:1 multi-density projectile fractured/collapsed spontaneously in free flight!"
+            );
+            assert_eq!(w.detonated_count, 0, "{tag} TNT filler self-detonated in free flight!");
+            let min_rho_ratio = w
+                .rho
+                .iter()
+                .zip(w.rho0.iter())
+                .map(|(r, r0)| r / r0)
+                .fold(f32::INFINITY, f32::min);
+            let max_rho_ratio = w
+                .rho
+                .iter()
+                .zip(w.rho0.iter())
+                .map(|(r, r0)| r / r0)
+                .fold(0.0f32, f32::max);
+            assert!(
+                min_rho_ratio > 0.94 && max_rho_ratio < 1.06,
+                "{tag} 19:1 multi-density compression drifted in free flight: [{min_rho_ratio:.3}, {max_rho_ratio:.3}]"
+            );
+            let mean_vx: f32 = w.vel.iter().map(|v| v.x).sum::<f32>() / w.len() as f32;
+            assert!(
+                (mean_vx - 0.25).abs() < 0.002,
+                "{tag} multi-density projectile momentum drifted: mean_vx={mean_vx:.5}"
+            );
+        }
+
+        let com = |w: &ContinuumWorld| -> Vec2 {
+            w.pos.iter().copied().sum::<Vec2>() / w.len() as f32
+        };
+        let parity_err = (com(&w_cpu) - com(&w_gpu)).length();
+        assert!(
+            parity_err < 0.08,
+            "CPU vs GPU multi-density projectile COM drifted: err={parity_err:.4}"
+        );
+    }
+
+    #[test]
+    fn upgraded_octol_frag_explosion_and_standoff_blast_coupling() {
+        let mut vk_opt = crate::vulkan_gpu::VulkanPhysicsEngine::new().ok();
+
+        // 1. Both new presets build cleanly and integrate without errors
+        for p in [
+            ScenarioPreset::OctolFragDemolition,
+            ScenarioPreset::GravitySlingshotOrbits,
+        ] {
+            let mut w = build_scenario(p, 0.42);
+            assert!(!w.pos.is_empty());
+            for _ in 0..40 {
+                let dt = w.compute_cfl_dt();
+                w.step(dt);
+            }
+            assert!(w.pos.iter().all(|v| v.is_finite()));
+        }
+
+        // 2. Command-detonate Octol HE-Frag shell in air next to a standoff RHA witness plate:
+        //    casing fragments must reach > 1.0 km/s AND standoff blast wave must couple impulse to plate!
+        let make_blast_test = || {
+            let mut w = ContinuumWorld::new(0.36);
+            spawn_oriented_box(
+                &mut w,
+                Vec2::new(6.5, 0.0),
+                Vec2::new(1.5, 10.0),
+                0.0,
+                Vec2::ZERO,
+                MaterialId::RhaSteel,
+                None,
+                None,
+            );
+            BuiltinProjectileBp::OctolFragShell.build().spawn_into(
+                &mut w,
+                Vec2::new(-5.5, 0.0),
+                0.0,
+                Vec2::ZERO,
+                None,
+            );
+            let trig = w.detonate_explosives(None);
+            assert!(trig > 50, "Expected command-detonate to initiate Octol core");
+            w
+        };
+
+        let mut w_cpu = make_blast_test();
+        let mut w_gpu = make_blast_test();
+
+        for _ in 0..320 {
+            let dt = w_cpu.compute_cfl_dt();
+            w_cpu.step(dt);
+        }
+        if let Some(vk) = &mut vk_opt {
+            for _ in 0..80 {
+                let dt = w_gpu.compute_cfl_dt();
+                vk.step_batch(&mut w_gpu, 4, dt);
+            }
+        } else {
+            for _ in 0..320 {
+                let dt = w_gpu.compute_cfl_dt();
+                w_gpu.step(dt);
+            }
+        }
+
+        for (tag, w) in [("CPU", &w_cpu), ("GPU", &w_gpu)] {
+            assert!(w.detonated_count > 100, "{tag} Octol charge must detonate completely");
+            let max_steel_kms = w
+                .mat
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| **m == MaterialId::HhaSteel || **m == MaterialId::MildSteel)
+                .map(|(i, _)| w.vel[i].length() * 10.0)
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_steel_kms > 1.0,
+                "{tag} Octol frag casing must accelerate > 1.0 km/s, got {max_steel_kms:.2} km/s"
+            );
+            let rha_vx_sum: f32 = w
+                .mat
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| **m == MaterialId::RhaSteel)
+                .map(|(i, _)| w.vel[i].x)
+                .sum();
+            assert!(
+                rha_vx_sum > 0.15,
+                "{tag} standoff blast wave & fragments must push RHA plate positively (sum vx={rha_vx_sum:.4})"
+            );
+        }
     }
 }

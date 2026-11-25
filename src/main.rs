@@ -273,10 +273,13 @@ struct RustedSpaceSimApp {
     show_hud_graphs: bool,
     substeps_per_frame: usize,
     time_scale: f32,
+    substep_accum: f32,
+    wall_dt_last: f32,
 
     // Laboratory Instrumentation, Time-Scrubbing & Scene Persistence
     timeline: TimelineRecorder,
     gauges: GaugeBank,
+    pinned_probe_idx: Option<usize>,
     caliper_mode: bool,
     caliper_line: Option<(Vec2, Vec2)>,
     scene_save_name: String,
@@ -317,8 +320,6 @@ struct RustedSpaceSimApp {
     camera_track: CameraTrackMode,
     auto_slowmo: bool,
     slowmo_timer: f32,
-    camera_shake_enabled: bool,
-    camera_shake: f32,
     prev_detonated_count: usize,
 
     // Studio HUD Modals & Status Telemetry
@@ -330,6 +331,8 @@ struct RustedSpaceSimApp {
     gif_frames: Vec<GifFrame>,
     last_gif_capture_step: u64,
     remnant_report: Option<RemnantAnalysis>,
+    peak_vel_kms_session: f32,
+    peak_press_gpa_session: f32,
 
     // Vulkan GPU Compute Accelerator
     vulkan_engine: Option<VulkanPhysicsEngine>,
@@ -385,8 +388,11 @@ impl RustedSpaceSimApp {
             show_hud_graphs: true,
             substeps_per_frame: 8,
             time_scale: 1.0,
+            substep_accum: 0.0,
+            wall_dt_last: 0.016,
             timeline: TimelineRecorder::new(),
             gauges: GaugeBank::new(),
+            pinned_probe_idx: None,
             caliper_mode: false,
             caliper_line: None,
             scene_save_name: "Custom_Armor_Range".to_string(),
@@ -438,8 +444,6 @@ impl RustedSpaceSimApp {
             camera_track: CameraTrackMode::Free,
             auto_slowmo: false,
             slowmo_timer: 0.0,
-            camera_shake_enabled: true,
-            camera_shake: 0.0,
             prev_detonated_count: 0,
             show_scenario_browser: false,
             scenario_filter: ScenarioCategory::All,
@@ -449,6 +453,8 @@ impl RustedSpaceSimApp {
             gif_frames: Vec::new(),
             last_gif_capture_step: 0,
             remnant_report: None,
+            peak_vel_kms_session: 0.0,
+            peak_press_gpa_session: 0.0,
             vulkan_engine,
             vulkan_init_err,
             use_vulkan_gpu,
@@ -520,7 +526,7 @@ impl RustedSpaceSimApp {
     }
 
     fn apply_live_tool_continuous(&mut self, world_p: Vec2) {
-        let dt_eff = self.world.compute_cfl_dt().max(0.02) * 2.5;
+        let dt_eff = (self.wall_dt_last.clamp(0.002, 0.033) * 1.8).min(0.055);
         match self.canvas_drag {
             Some(CanvasDrag::UseToolBrush { body_id }) => {
                 self.timeline.commit_branch(&mut self.world);
@@ -589,22 +595,89 @@ impl RustedSpaceSimApp {
         self.check_cinematic_triggers();
     }
 
+    /// Adaptive Courant-safe chunked sub-stepping: refreshes `compute_cfl_dt()` every 4 substeps
+    /// so sudden impacts, detonations, or rapid speed-slider changes never overrun CFL mid-batch.
+    fn advance_physics_steps_chunked(&mut self, total_steps: usize, dt_mult: f32) {
+        if total_steps == 0 || self.world.len() == 0 {
+            return;
+        }
+        self.timeline.commit_branch(&mut self.world);
+        let mut rem = total_steps;
+        let mult = dt_mult.clamp(0.25, 1.0);
+        if self.use_vulkan_gpu && self.vulkan_engine.is_some() {
+            if let Some(vk) = &mut self.vulkan_engine {
+                while rem > 0 {
+                    let chunk = rem.min(4);
+                    let dt = (self.world.compute_cfl_dt() * mult).max(0.00015);
+                    vk.step_batch(&mut self.world, chunk, dt);
+                    rem -= chunk;
+                }
+            }
+        } else {
+            self.world.gpu_dirty = true;
+            while rem > 0 {
+                let chunk = rem.min(4);
+                let dt = (self.world.compute_cfl_dt() * mult).max(0.00015);
+                for _ in 0..chunk {
+                    self.world.step(dt);
+                }
+                rem -= chunk;
+            }
+        }
+        self.gauges.record_now(&self.world);
+        self.timeline.maybe_record(&self.world);
+        self.check_cinematic_triggers();
+    }
+
+    fn has_unreacted_energetics(&self) -> bool {
+        for i in 0..self.world.len() {
+            let mat = self.world.mat[i];
+            if (mat.props().is_energetic && mat != MaterialId::ImpactFuze || mat == MaterialId::ThermitePyro)
+                && self.world.det_state[i] == 0
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn command_detonate_now(&mut self, cursor_radius_only: bool) {
+        if self.world.len() == 0 {
+            return;
+        }
+        if self.phase == SimPhase::Staging {
+            self.start_simulation();
+        }
+        self.timeline.commit_branch(&mut self.world);
+        let filter = if cursor_radius_only {
+            self.hover_world_pos.map(|p| (p, (self.tool_radius * 3.0).max(6.0)))
+        } else {
+            None
+        };
+        let n = self.world.detonate_explosives(filter);
+        if n > 0 {
+            self.paused = false;
+            self.set_toast(format!("Detonated {n} energetic charge cell(s)!"));
+        } else {
+            self.set_toast("No unreacted high explosives found");
+        }
+    }
+
     fn check_cinematic_triggers(&mut self) {
         let new_det = self.world.detonated_count > self.prev_detonated_count + 3;
         self.prev_detonated_count = self.world.detonated_count;
+        if let Some(s) = self.world.history.last() {
+            self.peak_press_gpa_session = self.peak_press_gpa_session.max(s.peak_pressure_gpa);
+            self.peak_vel_kms_session = self.peak_vel_kms_session.max(s.max_speed_kms);
+        }
         let peak_p = self
             .world
             .history
             .last()
             .map(|s| s.peak_pressure_gpa)
             .unwrap_or(0.0);
-        if new_det || peak_p > 18.0 {
-            if self.auto_slowmo && self.slowmo_timer <= 0.05 {
-                self.slowmo_timer = 0.45;
-            }
-            if self.camera_shake_enabled && new_det {
-                self.camera_shake = (self.camera_shake + 0.35).min(0.85);
-            }
+        if (new_det || peak_p > 18.0) && self.auto_slowmo && self.slowmo_timer <= 0.05 {
+            self.slowmo_timer = 0.45;
         }
     }
 
@@ -852,6 +925,10 @@ impl RustedSpaceSimApp {
         self.world = self.scene.build_world(self.resolution.dx());
         self.timeline.reset_with_world(&self.world);
         self.gauges.clear_waveforms_keep_pins(&self.world);
+        self.pinned_probe_idx = None;
+        self.substep_accum = 0.0;
+        self.peak_vel_kms_session = 0.0;
+        self.peak_press_gpa_session = 0.0;
     }
 
     fn load_preset(&mut self, preset: ScenarioPreset) {
@@ -885,7 +962,9 @@ impl RustedSpaceSimApp {
                 self.cam.center = Vec2::new(2.0, 0.0);
                 self.cam.zoom = 11.5;
             }
-            ScenarioPreset::RocheLimitRingFormation | ScenarioPreset::BinaryPlanetInspiral => {
+            ScenarioPreset::RocheLimitRingFormation
+            | ScenarioPreset::BinaryPlanetInspiral
+            | ScenarioPreset::GravitySlingshotOrbits => {
                 self.cam.center = Vec2::ZERO;
                 self.cam.zoom = 8.5;
             }
@@ -893,7 +972,9 @@ impl RustedSpaceSimApp {
                 self.cam.center = Vec2::new(1.0, 0.0);
                 self.cam.zoom = 9.5;
             }
-            ScenarioPreset::KineticRodBunkerBuster | ScenarioPreset::EfpVsSpacedArmor => {
+            ScenarioPreset::KineticRodBunkerBuster
+            | ScenarioPreset::EfpVsSpacedArmor
+            | ScenarioPreset::OctolFragDemolition => {
                 self.cam.center = Vec2::new(8.0, 0.0);
                 self.cam.zoom = 11.5;
             }
@@ -915,7 +996,7 @@ impl RustedSpaceSimApp {
             self.paused = false;
             self.prev_detonated_count = self.world.detonated_count;
             self.slowmo_timer = 0.0;
-            self.camera_shake = 0.0;
+            self.substep_accum = 0.0;
             self.tab = WorkspaceTab::Simulation;
         } else {
             self.paused = !self.paused;
@@ -929,7 +1010,6 @@ impl RustedSpaceSimApp {
         self.last_laser_beam = None;
         self.last_gravity_well = None;
         self.slowmo_timer = 0.0;
-        self.camera_shake = 0.0;
         self.prev_detonated_count = 0;
         self.remnant_report = None;
         self.rebuild_staging_world();
@@ -950,7 +1030,6 @@ impl RustedSpaceSimApp {
         self.last_laser_beam = None;
         self.last_gravity_well = None;
         self.slowmo_timer = 0.0;
-        self.camera_shake = 0.0;
         self.prev_detonated_count = 0;
         self.remnant_report = None;
         self.pending_drag_undo = None;
@@ -1110,6 +1189,8 @@ impl RustedSpaceSimApp {
         let mut do_save = false;
         let mut do_single_step: Option<f32> = None;
         let mut do_png = false;
+        let mut do_detonate: Option<bool> = None;
+        let mut do_pin_probe = false;
         let mut scrub_delta: i32 = 0;
         ctx.input(|inp| {
             let cmd = inp.modifiers.ctrl || inp.modifiers.command;
@@ -1163,6 +1244,12 @@ impl RustedSpaceSimApp {
             }
             if inp.key_pressed(Key::C) && !cmd && !in_cad {
                 self.clear_scene();
+            }
+            if inp.key_pressed(Key::D) && !cmd && !in_cad {
+                do_detonate = Some(inp.modifiers.shift);
+            }
+            if inp.key_pressed(Key::I) && !cmd && !in_cad {
+                do_pin_probe = true;
             }
             if inp.key_pressed(Key::M) && !cmd && !in_cad {
                 self.caliper_mode = !self.caliper_mode;
@@ -1256,6 +1343,32 @@ impl RustedSpaceSimApp {
         if do_png {
             self.export_png_now();
         }
+        if let Some(near_cursor) = do_detonate {
+            self.command_detonate_now(near_cursor);
+        }
+        if do_pin_probe {
+            if self.pinned_probe_idx.take().is_some() {
+                self.set_toast("Unpinned particle inspector");
+            } else if let Some(wp) = self.hover_world_pos {
+                let mut best = None;
+                let mut best_d2 = (3.5 * self.world.dx).powi(2);
+                for (i, &p) in self.world.pos.iter().enumerate() {
+                    let d2 = (p - wp).length_squared();
+                    if d2 < best_d2 {
+                        best_d2 = d2;
+                        best = Some(i);
+                    }
+                }
+                self.pinned_probe_idx = best;
+                if let Some(idx) = best {
+                    self.set_toast(format!(
+                        "Pinned inspector on #{} ({})",
+                        idx,
+                        self.world.mat[idx].props().short_name
+                    ));
+                }
+            }
+        }
         if scrub_delta != 0 && !self.timeline.keyframes.is_empty() {
             self.paused = true;
             let cur = self
@@ -1312,6 +1425,7 @@ impl eframe::App for RustedSpaceSimApp {
         let now = Instant::now();
         let wall_dt = now.duration_since(self.last_frame_instant).as_secs_f32();
         self.last_frame_instant = now;
+        self.wall_dt_last = wall_dt.clamp(0.001, 0.05);
         if wall_dt > 1e-5 && wall_dt < 0.25 {
             self.fps_smooth = 0.90 * self.fps_smooth + 0.10 * (1.0 / wall_dt).min(240.0);
         }
@@ -1320,22 +1434,13 @@ impl eframe::App for RustedSpaceSimApp {
         if !matches!(self.canvas_drag, Some(CanvasDrag::UseToolGravity { .. })) {
             self.last_gravity_well = None;
         }
-        if !self.paused {
-            if self.slowmo_timer > 0.0 {
-                self.slowmo_timer = (self.slowmo_timer - wall_dt).max(0.0);
-            }
-            if self.camera_shake > 0.015 {
-                self.camera_shake *= (-wall_dt * 11.0).exp();
-            } else {
-                self.camera_shake = 0.0;
-            }
-        } else {
-            self.camera_shake = 0.0;
+        if !self.paused && self.slowmo_timer > 0.0 {
+            self.slowmo_timer = (self.slowmo_timer - wall_dt).max(0.0);
         }
 
         self.handle_hotkeys(ctx);
 
-        // Advance continuum physics only in Running phase
+        // Advance continuum physics in Courant-safe 4-substep chunks with fractional accumulation
         if self.phase == SimPhase::Running && !self.paused && self.world.len() > 0 {
             let t0 = Instant::now();
             let slowmo_mult = if self.auto_slowmo && self.slowmo_timer > 0.0 {
@@ -1343,16 +1448,17 @@ impl eframe::App for RustedSpaceSimApp {
             } else {
                 1.0
             };
-            let eff_scale = self.time_scale * slowmo_mult;
-            let target_steps =
-                ((self.substeps_per_frame as f32 * eff_scale).round() as usize).max(1);
-            let scale_rem = if self.substeps_per_frame as f32 * eff_scale < 1.0 {
-                (self.substeps_per_frame as f32 * eff_scale).clamp(0.05, 1.0)
+            let eff_scale = (self.time_scale * slowmo_mult).clamp(0.02, 4.0);
+            let desired = self.substeps_per_frame as f32 * eff_scale;
+            let dt_mult = if desired < 0.35 {
+                (desired / 0.35).clamp(0.25, 1.0)
             } else {
                 1.0
             };
-            let dt = self.world.compute_cfl_dt() * scale_rem;
-            self.advance_physics_steps(target_steps.min(36), dt);
+            self.substep_accum += desired / dt_mult;
+            let total_steps = (self.substep_accum.floor() as usize).min(40);
+            self.substep_accum = (self.substep_accum - total_steps as f32).clamp(0.0, 1.0);
+            self.advance_physics_steps_chunked(total_steps, dt_mult);
             self.physics_ms =
                 0.85 * self.physics_ms + 0.15 * (t0.elapsed().as_secs_f32() * 1000.0);
         } else {
@@ -1380,7 +1486,7 @@ impl eframe::App for RustedSpaceSimApp {
                     );
                     pill_badge(
                         ui,
-                        "v0.1.1",
+                        concat!("v", env!("CARGO_PKG_VERSION")),
                         ACCENT_CYAN,
                         Color32::from_rgb(16, 36, 54),
                     );
@@ -2020,6 +2126,7 @@ impl RustedSpaceSimApp {
                     }
                 }
                 if self.phase == SimPhase::Running {
+                    self.timeline.commit_branch(&mut self.world);
                     spec.spawn_into(&mut self.world);
                 } else {
                     let idx = self.scene.targets.len();
@@ -2076,12 +2183,32 @@ impl RustedSpaceSimApp {
                         &format!("SELECTED TARGET #{}", idx + 1),
                         ACCENT_CYAN,
                         |ui| {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 if ui.small_button("Duplicate").clicked() {
                                     dup = true;
                                 }
                                 if ui.small_button("Delete").clicked() {
                                     del = true;
+                                }
+                                if ui.small_button("Y=0").on_hover_text("Center vertically on Y=0").clicked() {
+                                    self.scene.targets[idx].pos.y = 0.0;
+                                    changed = true;
+                                }
+                                if ui.small_button("↔ Flip").on_hover_text("Flip orientation & drift horizontally").clicked() {
+                                    let t = &mut self.scene.targets[idx];
+                                    t.angle_deg = (180.0 - t.angle_deg).rem_euclid(360.0);
+                                    if t.angle_deg > 180.0 {
+                                        t.angle_deg -= 360.0;
+                                    }
+                                    t.vel.x = -t.vel.x;
+                                    if let TargetKind::Blueprint { bp } = &mut t.kind {
+                                        bp.flip_horizontal();
+                                    }
+                                    changed = true;
+                                }
+                                if ui.small_button("Vel=0").on_hover_text("Stop initial target drift").clicked() {
+                                    self.scene.targets[idx].vel = Vec2::ZERO;
+                                    changed = true;
                                 }
                             });
                             if let TargetKind::Blueprint { bp } = &self.scene.targets[idx].kind {
@@ -2161,6 +2288,7 @@ impl RustedSpaceSimApp {
                     );
                     self.proj_template = spec.clone();
                     if self.phase == SimPhase::Running {
+                        self.timeline.commit_branch(&mut self.world);
                         spec.spawn_into(&mut self.world);
                     } else {
                         let snap = self.snapshot();
@@ -2197,7 +2325,7 @@ impl RustedSpaceSimApp {
                     }
                     if idx < self.scene.projectiles.len() {
                         let snap = self.snapshot();
-                        let he = bp.world_half_extents(0.35);
+                        let he = bp.world_half_extents(self.resolution.dx());
                         let p = &mut self.scene.projectiles[idx];
                         p.name = bp.name.clone();
                         p.shape = ProjectileShape::CustomBlueprint;
@@ -2245,6 +2373,7 @@ impl RustedSpaceSimApp {
             if ui.button(egui::RichText::new(add_label).strong()).clicked() {
                 let spec = self.proj_template.clone();
                 if self.phase == SimPhase::Running {
+                    self.timeline.commit_branch(&mut self.world);
                     spec.spawn_into(&mut self.world);
                 } else {
                     let idx = self.scene.projectiles.len();
@@ -2301,12 +2430,27 @@ impl RustedSpaceSimApp {
                         &format!("SELECTED PROJECTILE #{}", idx + 1),
                         ACCENT_AMBER,
                         |ui| {
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 if ui.small_button("Duplicate").clicked() {
                                     dup = true;
                                 }
                                 if ui.small_button("Delete").clicked() {
                                     del = true;
+                                }
+                                if ui.small_button("Y=0").on_hover_text("Align projectile center vertically to Y=0").clicked() {
+                                    self.scene.projectiles[idx].pos.y = 0.0;
+                                    changed = true;
+                                }
+                                if ui.small_button("↔ Flip").on_hover_text("Mirror launch direction horizontally").clicked() {
+                                    let p = &mut self.scene.projectiles[idx];
+                                    p.angle_deg = (180.0 - p.angle_deg).rem_euclid(360.0);
+                                    if p.angle_deg > 180.0 {
+                                        p.angle_deg -= 360.0;
+                                    }
+                                    if let Some(bp) = &mut p.blueprint {
+                                        bp.flip_horizontal();
+                                    }
+                                    changed = true;
                                 }
                             });
                             if let Some(bp) = &self.scene.projectiles[idx].blueprint {
@@ -2659,6 +2803,24 @@ impl RustedSpaceSimApp {
                     ui.add(egui::Slider::new(&mut self.blast_vel, 0.08..=1.2).text("Impulse cm/µs"));
                 }
             }
+            if self.has_unreacted_energetics() {
+                ui.add_space(4.0);
+                let det_btn = egui::Button::new(
+                    egui::RichText::new("💥 Command-Detonate All HE (D)")
+                        .strong()
+                        .size(11.5)
+                        .color(Color32::from_rgb(25, 14, 10)),
+                )
+                .fill(ACCENT_AMBER)
+                .min_size(EguiVec2::new(ui.available_width(), 24.0));
+                if ui
+                    .add(det_btn)
+                    .on_hover_text("Trigger all unreacted Comp-B, Octol, C4, TNT & Thermite charges (Key: D, Shift+D at cursor)")
+                    .clicked()
+                {
+                    self.command_detonate_now(false);
+                }
+            }
         });
 
         // --- Visualization Modes ---
@@ -2713,11 +2875,36 @@ impl RustedSpaceSimApp {
                 );
             }
             ui.add(
-                egui::Slider::new(&mut self.time_scale, 0.05..=3.0)
+                egui::Slider::new(&mut self.time_scale, 0.05..=4.0)
                     .logarithmic(true)
                     .text("Slow-Mo / Speed"),
             );
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                for &(mult, lbl) in &[
+                    (0.10f32, "0.1×"),
+                    (0.25, "0.25×"),
+                    (0.50, "0.5×"),
+                    (1.00, "1×"),
+                    (2.00, "2×"),
+                    (4.00, "4×"),
+                ] {
+                    let active = (self.time_scale - mult).abs() < 0.015;
+                    if ui.selectable_label(active, lbl).clicked() {
+                        self.time_scale = mult;
+                    }
+                }
+            });
             ui.add(egui::Slider::new(&mut self.substeps_per_frame, 1..=32).text("Substeps / Frame"));
+            ui.label(
+                egui::RichText::new(format!(
+                    "CFL dt = {:.4} µs | 4-step Courant batching | CFL OK",
+                    self.world.last_dt
+                ))
+                .monospace()
+                .size(10.0)
+                .color(ACCENT_EMERALD),
+            );
 
             let mut grav_changed = false;
             let (eff_grav, _) = self.scene.effective_self_gravity();
@@ -2776,7 +2963,6 @@ impl RustedSpaceSimApp {
                     ui.checkbox(&mut self.show_hud_graphs, "HUD Graphs");
                     ui.end_row();
                     ui.checkbox(&mut self.auto_slowmo, "Bullet-Time");
-                    ui.checkbox(&mut self.camera_shake_enabled, "Impact Shake");
                     ui.end_row();
                 });
 
@@ -2864,6 +3050,37 @@ impl RustedSpaceSimApp {
                                 ui.end_row();
                             });
                     });
+            }
+            if let Some(latest) = self.world.history.last() {
+                let ke = latest.kinetic_energy.max(0.0);
+                let ie = latest.internal_energy.max(0.0);
+                let ee = latest.elastic_energy.max(0.0);
+                let tot_e = (ke + ie + ee).max(1e-6);
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Session Peak: {:.1} GPa | {:.2} km/s  (Det {} · Spall {} · Melt {})",
+                        self.peak_press_gpa_session.max(latest.peak_pressure_gpa),
+                        self.peak_vel_kms_session.max(latest.max_speed_kms),
+                        self.world.detonated_count,
+                        self.world.fractured_count,
+                        self.world.melted_count,
+                    ))
+                    .monospace()
+                    .size(10.0)
+                    .color(TEXT_SECONDARY),
+                );
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Energy Split: KE {:4.1}% | Thermal {:4.1}% | Elastic {:4.1}%",
+                        100.0 * ke / tot_e,
+                        100.0 * ie / tot_e,
+                        100.0 * ee / tot_e,
+                    ))
+                    .monospace()
+                    .size(10.0)
+                    .color(ACCENT_CYAN),
+                );
             }
         });
 
@@ -2992,10 +3209,8 @@ impl RustedSpaceSimApp {
                             self.blast_vel,
                             4800.0,
                         );
+                        self.paused = false;
                         if hit > 0 {
-                            if self.camera_shake_enabled && !self.paused {
-                                self.camera_shake = (self.camera_shake + 0.45).min(0.90);
-                            }
                             if self.auto_slowmo {
                                 self.slowmo_timer = 0.45;
                             }
@@ -3192,6 +3407,7 @@ impl RustedSpaceSimApp {
                         self.push_undo(snap);
                         self.rebuild_staging_world();
                     } else {
+                        self.timeline.commit_branch(&mut self.world);
                         spec.spawn_into(&mut self.world);
                     }
                     self.canvas_drag = None;
@@ -3231,15 +3447,7 @@ impl RustedSpaceSimApp {
         let rw = (vp_w.round() as usize).clamp(64, 4096);
         let rh = (vp_h.round() as usize).clamp(64, 2560);
         let trails_active = self.motion_trails && self.phase == SimPhase::Running && !self.paused;
-        let mut render_cam = self.cam;
-        if !self.paused && self.camera_shake > 0.015 {
-            let phase = (self.world.time_us * 1.37 + self.world.step_count as f32 * 0.71) % 62.83;
-            let amp = (self.camera_shake * 10.0 / self.cam.zoom.max(0.25)).min(3.5);
-            render_cam.center += Vec2::new(
-                (phase * 1.7).sin() * amp,
-                (phase * 2.3 + 1.1).cos() * amp,
-            );
-        }
+        let render_cam = self.cam;
         let render_key = ViewportRenderKey {
             world_id: self.world.world_id,
             state_epoch: self.world.state_epoch,
@@ -3472,9 +3680,12 @@ impl RustedSpaceSimApp {
                                     if ui
                                         .add(
                                             egui::Button::new(
-                                                egui::RichText::new("📂 Browse 17 Scenarios")
-                                                    .strong()
-                                                    .color(Color32::from_rgb(10, 22, 30)),
+                                                egui::RichText::new(format!(
+                                                    "📂 Browse {} Scenarios",
+                                                    ScenarioPreset::ALL.len() - 1
+                                                ))
+                                                .strong()
+                                                .color(Color32::from_rgb(10, 22, 30)),
                                             )
                                             .fill(ACCENT_CYAN)
                                             .corner_radius(CornerRadius::same(7)),
@@ -3545,11 +3756,22 @@ impl RustedSpaceSimApp {
             );
         }
 
-        // Hover Continuum Particle Probe
-        if let Some(hover_pos) = response.hover_pos() {
+        // Hover / Pinned Continuum Particle Probe
+        let hover_world = response.hover_pos().map(|hover_pos| {
             let local = Vec2::new(hover_pos.x - rect.min.x, hover_pos.y - rect.min.y);
-            let world_p = self.cam.screen_to_world(local, vp_w, vp_h);
-            draw_particle_probe(&painter, rect, &self.world, world_p);
+            self.cam.screen_to_world(local, vp_w, vp_h)
+        });
+        if hover_world.is_some() || self.pinned_probe_idx.is_some() {
+            draw_particle_probe(
+                &painter,
+                rect,
+                &self.cam,
+                vp_w,
+                vp_h,
+                &self.world,
+                hover_world,
+                self.pinned_probe_idx,
+            );
         }
 
         // Live Telemetry Charts
@@ -3774,6 +3996,23 @@ impl RustedSpaceSimApp {
                                     .clicked()
                                 {
                                     self.fit_camera_to_world();
+                                }
+                                if self.has_unreacted_energetics()
+                                    && ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("💥 Det (D)")
+                                                    .strong()
+                                                    .size(11.0)
+                                                    .color(Color32::from_rgb(24, 14, 10)),
+                                            )
+                                            .fill(ACCENT_AMBER)
+                                            .corner_radius(CornerRadius::same(7)),
+                                        )
+                                        .on_hover_text("Command-detonate unreacted explosives (Key: D)")
+                                        .clicked()
+                                {
+                                    self.command_detonate_now(false);
                                 }
                             });
                             if self.active_tool != ActiveTool::Interact {
@@ -4016,6 +4255,8 @@ impl RustedSpaceSimApp {
                                 for (k, d) in [
                                     ("Space", "Start simulation / Pause / Resume"),
                                     ("S / R / C", "Single CFL step / Reset to Staging / Clear Space"),
+                                    ("D / Shift+D", "Command-detonate all HE charges (or near cursor)"),
+                                    ("I", "Pin or unpin live Continuum Particle Inspector"),
                                     ("Q / B / E", "Interact / Matter Brush / Void Eraser"),
                                     ("L / G / X", "Thermal Laser / Gravity Vortex (Shift=Repel) / Shock Blast"),
                                     ("[  /  ]", "Decrease / Increase active tool brush radius"),
@@ -4940,69 +5181,106 @@ fn draw_scale_bar(painter: &egui::Painter, rect: Rect, zoom: f32) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_particle_probe(
     painter: &egui::Painter,
     rect: Rect,
+    cam: &Camera2D,
+    vp_w: f32,
+    vp_h: f32,
     world: &ContinuumWorld,
-    world_p: Vec2,
+    hover_world_p: Option<Vec2>,
+    pinned_idx: Option<usize>,
 ) {
-    let mut best_i = None;
-    let mut best_d2 = (2.8 * world.dx) * (2.8 * world.dx);
-    for i in 0..world.len() {
-        let d2 = (world.pos[i] - world_p).length_squared();
-        if d2 < best_d2 {
-            best_d2 = d2;
-            best_i = Some(i);
+    let valid_pinned = pinned_idx.filter(|&i| i < world.len());
+    let (i, is_pinned) = if let Some(pi) = valid_pinned {
+        (pi, true)
+    } else if let Some(wp) = hover_world_p {
+        let mut best_i = None;
+        let mut best_d2 = (2.8 * world.dx) * (2.8 * world.dx);
+        for k in 0..world.len() {
+            let d2 = (world.pos[k] - wp).length_squared();
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best_i = Some(k);
+            }
         }
-    }
-
-    let Some(i) = best_i else {
+        let Some(k) = best_i else {
+            return;
+        };
+        (k, false)
+    } else {
         return;
     };
+
+    if is_pinned && world.pos[i].is_finite() {
+        let sp = cam.world_to_screen(world.pos[i], vp_w, vp_h);
+        let cp = Pos2::new(rect.min.x + sp.x, rect.min.y + sp.y);
+        if rect.contains(cp) {
+            painter.circle_stroke(cp, 8.5, Stroke::new(1.8_f32, ACCENT_CYAN));
+            painter.circle_stroke(cp, 4.0, Stroke::new(1.2_f32, Color32::WHITE));
+        }
+    }
 
     let props = world.mat[i].props();
     let temp = world.temp[i];
     let dmg = world.damage[i];
     let eps_p = world.plastic_strain[i];
     let det = world.det_state[i];
+    let spd_kms = world.vel[i].length() * 10.0;
+    let mach = spd_kms / props.sound_speed_kms().max(0.05);
+    let comp_ratio = world.rho[i] / world.rho0[i].max(1e-4);
+    let melt_pct = (temp / props.melt_temp.max(50.0)) * 100.0;
     let phase = if det == 2 {
-        "DETONATION GAS PRODUCTS (JWL)"
+        "DETONATION GAS (JWL)"
     } else if det == 1 {
-        "ARMED DELAY FUZE (COUNTDOWN)"
+        "ARMED / BURNING FUZE"
     } else if temp >= props.melt_temp {
-        "HYDRODYNAMIC MOLTEN FLUID"
+        "MOLTEN FLUID"
     } else if dmg >= 0.85 {
-        "SPALLED / FRACTURED FRAGMENT"
+        "SPALLED FRAGMENT"
     } else if dmg > 0.15 {
-        "CRACKING / MICRO-DAMAGED"
+        "CRACKING"
     } else if eps_p > 0.015 {
-        "PLASTICALLY DEFORMED SOLID"
+        "PLASTIC SOLID"
     } else {
-        "INTACT ELASTIC SOLID"
+        "ELASTIC SOLID"
     };
 
+    let tag = if is_pinned { "[PINNED · I]" } else { "PROBE (I:Pin)" };
     let info = format!(
-        "PROBE: {}  [{}]\nSpeed: {:6.2} km/s  |  Pressure: {:+6.2} GPa  |  Shear σ_eq: {:5.2} GPa\nTemp:  {:6.0} K     |  Plastic εp: {:.3}    |  Damage: {:3.0}%",
-        props.name,
+        "{} #{} B{}: {} [{}]\nSpeed: {:5.2} km/s (M{:4.2}) | P: {:+6.2} GPa | σ_eq: {:5.2} GPa\nTemp: {:5.0} K ({:3.0}% Tm) | ρ/ρ₀: {:.3} | εp: {:.3} | Dmg: {:3.0}%",
+        tag,
+        i,
+        world.body_id[i],
+        props.short_name,
         phase,
-        world.vel[i].length() * 10.0,
+        spd_kms,
+        mach,
         world.net_pressure[i] * 100.0,
         world.von_mises_gpa(i),
         temp,
+        melt_pct,
+        comp_ratio,
         eps_p,
         dmg * 100.0,
     );
 
     let box_rect = Rect::from_min_size(
-        Pos2::new(rect.min.x + 14.0, rect.max.y - 104.0),
-        EguiVec2::new(445.0, 58.0),
+        Pos2::new(rect.min.x + 14.0, rect.max.y - 108.0),
+        EguiVec2::new(505.0, 62.0),
     );
-    draw_glass_panel(painter, box_rect, BORDER_GLASS, 8);
+    draw_glass_panel(
+        painter,
+        box_rect,
+        if is_pinned { ACCENT_CYAN } else { BORDER_GLASS },
+        8,
+    );
     painter.text(
         Pos2::new(box_rect.min.x + 10.0, box_rect.min.y + 8.0),
         Align2::LEFT_TOP,
         info,
-        FontId::monospace(10.8),
+        FontId::monospace(10.6),
         TEXT_PRIMARY,
     );
 }
@@ -5199,7 +5477,7 @@ fn run_headless_benchmark() {
 
 fn print_help() {
     println!(
-        "Rusted Space Simulation (rssim) v0.2.0
+        "Rusted Space Simulation (rssim) v0.10.0
 Vulkan GPU-Accelerated Continuum Elasto-Plastic, Reactive Detonation & Planetary Hydrocode
 (Mie-Gruneisen + JWL EOS + CSPM Renormalization + Johnson-Cook Viscoplasticity + 32x32 LDS Self-Gravity)
 
@@ -5211,8 +5489,8 @@ USAGE:
 KEY CAPABILITIES & INSTRUMENTATION:
     • 34 Continuum Materials (Metals, Ceramics, Polymers, Water, Octol, Thermite, Attractor & Repulsor)
     • Vulkan 1.2 SPIR-V Compute Pipeline (131K spatial hash, GPU-resident 32x32 LDS self-gravity, HOST_CACHED DMA)
-    • Live Physics Tools: Matter Brush, Void Eraser, Thermal Laser, Gravity Vortex, Shock Blast (Q/B/E/L/G/X)
-    • Orbital N-Body Trajectory Preview & 17 Presets (HEAT, EFP, ERA, APHE, Roche Ring, Binary Planets, Europa)
+    • Live Physics Tools: Matter Brush, Void Eraser, Thermal Laser, Gravity Vortex, Shock Blast, Detonate (Q/B/E/L/G/X/D)
+    • Orbital N-Body Trajectory Preview & 19 Presets (HEAT, EFP, ERA, APHE, HE-Frag, Attractor-Repulsor, Europa)
     • GIF89a Recorder, Remnant Cluster Analyzer, Caliper RHAe Analyzer (M), Witness Gauges & CSV/PNG (F12)"
     );
 }
@@ -5229,6 +5507,7 @@ fn main() -> eframe::Result<()> {
     }
 
     let mut viewport = egui::ViewportBuilder::default()
+        .with_app_id("rssim")
         .with_title("Rusted Space Simulation (rssim) — Continuum Impact & Shock Physics")
         .with_inner_size([1520.0, 920.0])
         .with_min_inner_size([1024.0, 640.0]);

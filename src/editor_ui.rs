@@ -468,6 +468,19 @@ impl BlueprintEditor {
                         self.bp_epoch = self.bp_epoch.wrapping_add(1);
                     }
                 }
+                if ui
+                    .small_button("⊕ Center")
+                    .on_hover_text("Center design inside current grid")
+                    .clicked()
+                    && self.bp.filled_count() > 0
+                {
+                    let prev = self.bp.clone();
+                    self.bp.auto_center();
+                    if self.bp != prev {
+                        self.push_undo(prev);
+                        self.bp_epoch = self.bp_epoch.wrapping_add(1);
+                    }
+                }
                 if ui.small_button("🗑 Clear").clicked() && self.bp.filled_count() > 0 {
                     let prev = self.bp.clone();
                     self.push_undo(prev);
@@ -725,6 +738,18 @@ impl BlueprintEditor {
                 .size(11.0)
                 .color(Color32::from_rgb(175, 210, 235)),
             );
+            let (c_mass, m_mass, c_over_m, gurney_kms) = self.bp.warhead_gurney_estimate(sim_dx);
+            if c_mass > 0.0 {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Warhead HE: {:.0} g/cm | Case: {:.0} g/cm (C/M {:.2}) | V_Gurney ~ {:.2} km/s",
+                        c_mass, m_mass, c_over_m, gurney_kms
+                    ))
+                    .monospace()
+                    .size(10.0)
+                    .color(Color32::from_rgb(255, 200, 110)),
+                );
+            }
 
             ui.horizontal(|ui| {
                 ui.label("Pos X:");

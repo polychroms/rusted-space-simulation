@@ -98,7 +98,6 @@ void main() {
         : clamp((temp_i - 300.0) / max(m_i.fracture.z - 300.0, 50.0), 0.0, 1.0);
     float intact_i = (det_i == 2u) ? 0.0 : (1.0 - dmg_i) * (1.0 - melt_i * sqrt(melt_i));
     vec3 s_i = s_i_raw * intact_i;
-    float rho_i2 = max(rho_i * rho_i, 1e-6);
 
     float cutoff = pc.cutoff;
     float cutoff_sq = cutoff * cutoff;
@@ -239,7 +238,7 @@ void main() {
 
                     float f_eos_part = p_eos_avg * area_c * ramp;
                     float f_visc_raw = (v_close > 0.0) ? ((z_eff * v_close + p_quad) * area_c * ramp) : 0.0;
-                    float f_visc_cap = 0.45 * m_red * v_close / max(pc.dt, 0.005);
+                    float f_visc_cap = 0.45 * m_red * v_close / max(pc.dt, 1e-4);
                     float f_visc = min(f_visc_raw, f_visc_cap);
                     // On separation (vn > 0), Riemann unloading smoothly drops contact pressure toward zero
                     float f_eos_used = (vn >= 0.0) ? (p_riemann * area_c * ramp) : f_eos_part;
@@ -255,7 +254,9 @@ void main() {
                         f_core = k_eff * (0.28 + 0.50 * solid_f) * ov_c * ov_c * area_c;
                     }
 
-                    float f_n = f_eos_used + f_visc + f_core;
+                    float f_n_raw = f_eos_used + f_visc + f_core;
+                    float f_n_cap = m_red * (1.25 * v_close + 0.45 * cbar) / max(pc.dt, 1e-4) + f_eos_part;
+                    float f_n = min(f_n_raw, f_n_cap);
                     float a_n = f_n / max(mass_i, 1e-6);
                     acc_i += nij * a_n;
 
@@ -290,7 +291,7 @@ void main() {
                     float vt_len = length(vt);
                     if (vt_len > 1e-5 && f_n > 0.0 && solid_f > 0.05) {
                         float mu_f = 0.5 * (m_i.flags.x + m_j.flags.x) * solid_f;
-                        float a_fric = min(mu_f * a_n, 0.30 * (2.0 * mj / max(mass_i + mj, 1e-6)) * vt_len / max(pc.dt, 0.005));
+                        float a_fric = min(mu_f * a_n, 0.30 * (2.0 * mj / max(mass_i + mj, 1e-6)) * vt_len / max(pc.dt, 1e-4));
                         vec2 f_tan = -(vt / vt_len) * a_fric;
                         acc_i += f_tan;
                         de += 0.25 * a_fric * vt_len;
@@ -316,14 +317,14 @@ void main() {
                 // Smoothly fade long-range (> d_hit) continuum coupling as cracks sever a solid body
                 float coh_gate = (c_coh > 0.03 && r > d_hit) ? clamp((c_coh - 0.03) / 0.32, 0.0, 1.0) : 1.0;
 
-                float rho_vol_j = (det_j == 2u) ? max(rho_j, 0.52 * rho0_j) : rho_j;
+                float rho_vol_j = (det_j == 2u) ? max(rho_j, 0.35 * rho0_j) : rho_j;
                 float vol_j = (mj / max(rho_vol_j, 1e-5)) * coh_gate;
                 float vij_dot_gradw = dot(vij, grad_w);
                 float gas_solid_comp = (det_i != 2u && det_j == 2u) ? min(2.0 * w_visc_i, 1.0) : 1.0;
                 drho += gas_solid_comp * rho_i * vol_j * vij_dot_gradw;
 
                 float cbar = 0.5 * (ci + m_j.eos.y);
-                if (det_i == det_j) {
+                if (det_i == det_j && mat_i == mat_j) {
                     float comp_diff = (rho_j / max(rho0_j, 1e-4)) - (rho_i / max(rho0_i, 1e-4));
                     float pos_kf = (r * (-dw_dr)) / (r2 + 0.01 * h2);
                     drho += 0.12 * pc.h * cbar * rho0_i * vol_j * 2.0 * comp_diff * pos_kf;
@@ -331,15 +332,13 @@ void main() {
 
                 // Monaghan artificial shock viscosity + impedance-matched Hugoniot heating partition (w_ij + w_ji = 1)
                 float vij_dot_xij = dot(vij, xij);
-                float pi_visc = 0.0;
+                float p_visc = 0.0;
                 if (vij_dot_xij < 0.0) {
                     float mu_v = (pc.h * vij_dot_xij) / (r2 + 0.01 * h2);
-                    float rho_bar = 0.5 * (rho_i + rho_j);
-                    pi_visc = ((-1.05 * cbar * mu_v + 2.00 * mu_v * mu_v) / max(rho_bar, 1e-4)) * coh_gate;
+                    float rho_harm = (2.0 * rho_i * rho_j) / max(rho_i + rho_j, 1e-4);
+                    p_visc = max(rho_harm * (-1.05 * cbar * mu_v + 2.00 * mu_v * mu_v), 0.0);
                     shock_comp += (-mu_v) * vol_j * w * cutoff;
                 }
-
-                float rho_j2 = max(rho_j * rho_j, 1e-6);
 
                 if (c_coh > 0.03) {
                     // Velocity gradient L = grad(v) + CSPM moment accumulation M = sum V_j (x_j - x_i) (x) grad_W
@@ -350,7 +349,7 @@ void main() {
                     m_xy += (-0.5 * (xij.x * grad_w.y + xij.y * grad_w.x)) * w_g;
                     m_yy += (-xij.y) * grad_w.y * w_g;
 
-                    // --- COHERENT CONTINUUM SOLID INTERACTION (Total Cauchy Stress = -P*I + S) ---
+                    // --- COHERENT CONTINUUM SOLID INTERACTION (Volume-Symmetric Cauchy Stress = -P*I + S) ---
                     vec3 s_j = stress_j.xyz * intact_j;
                     float sig_xx_i = -press_i + s_i.x;
                     float sig_yy_i = -press_i + s_i.y;
@@ -361,35 +360,44 @@ void main() {
                     float sig_xy_j = s_j.z;
 
                     // Gray-Monaghan tensile artificial stress prevents SPH pairing/clumping in tension
-                    float tens_i = max(max(sig_xx_i, sig_yy_i), 0.0) / rho_i2;
-                    float tens_j = max(max(sig_xx_j, sig_yy_j), 0.0) / rho_j2;
+                    float inv_rho_i = 1.0 / max(rho_i, 1e-5);
+                    float tens_sig_i = max(max(sig_xx_i, sig_yy_i), 0.0);
+                    float tens_sig_j = max(max(sig_xx_j, sig_yy_j), 0.0);
                     float fij = clamp(w / w_ref, 0.0, 1.25);
-                    float r_art = 0.30 * (tens_i + tens_j) * (fij * fij * fij * fij);
+                    float r_art_sig = 0.30 * (tens_sig_i + tens_sig_j) * (fij * fij * fij * fij);
 
-                    float t_xx = (sig_xx_i / rho_i2 + sig_xx_j / rho_j2 - r_art) * coh_gate - pi_visc;
-                    float t_yy = (sig_yy_i / rho_i2 + sig_yy_j / rho_j2 - r_art) * coh_gate - pi_visc;
-                    float t_xy = (sig_xy_i / rho_i2 + sig_xy_j / rho_j2) * coh_gate;
+                    float t_xx = sig_xx_i + sig_xx_j - r_art_sig - p_visc;
+                    float t_yy = sig_yy_i + sig_yy_j - r_art_sig - p_visc;
+                    float t_xy = sig_xy_i + sig_xy_j;
 
                     vec2 f_stress = vec2(
                         t_xx * grad_w.x + t_xy * grad_w.y,
                         t_xy * grad_w.x + t_yy * grad_w.y
                     );
-                    acc_i += mj * f_stress;
-                    // Exact 1st-Law Thermodynamics: reversible P_i/rho_i^2 * drho_i + impedance-partitioned shock viscosity!
-                    de += mj * (max(press_i, 0.0) / rho_i2 * coh_gate + w_visc_i * pi_visc) * vij_dot_gradw;
+                    acc_i += (inv_rho_i * vol_j) * f_stress;
+                    // Exact 1st-Law Thermodynamics: reversible P_i + impedance-partitioned shock viscosity
+                    de += inv_rho_i * vol_j * (max(press_i, 0.0) + w_visc_i * p_visc) * vij_dot_gradw;
 
-                    // Short-range lattice equilibrium core + ductile metallic cohesion
-                    float m_pair = (2.0 * mj) / max(mass_i + mj, 1e-6);
+                    // Force-symmetric harmonic lattice equilibrium core + bonded multi-material cohesion
+                    float v0_bar = 0.5 * (mass_i / max(rho0_i, 1e-4) + mj / max(rho0_j, 1e-4));
+                    float inv_mass_i = 1.0 / max(mass_i, 1e-6);
+                    bool i_duc = m_i.flags.z > 0.5;
+                    bool j_duc = m_j.flags.z > 0.5;
+                    bool cross_bond = (i_duc && j_duc) || (m_i.flags.y < 0.5 && m_j.flags.y < 0.5 && (i_duc || j_duc));
                     if (r < d_contact) {
                         float ov = 1.0 - r / d_contact;
-                        float k_rep = 1.15 * cbar * cbar / d_contact;
-                        acc_i += nij * (k_rep * ov * ov * m_pair);
-                    } else if (m_i.flags.z > 0.5 && m_j.flags.z > 0.5 && r > 1.14 * pc.dx && r < 1.58 * pc.dx) {
-                        // Active ONLY in the hex-lattice tensile stretch band (1.14..1.58*dx), strictly ZERO at rest (1.0*dx & 1.732*dx)!
-                        float y_coh = min(m_i.strength.y, m_j.strength.y) + 0.38 * min(m_i.fracture.x, m_j.fracture.x);
+                        float k_i = rho0_i * ci * ci;
+                        float k_j = rho0_j * m_j.eos.y * m_j.eos.y;
+                        float k_harm = (2.0 * k_i * k_j) / max(k_i + k_j, 1e-5);
+                        float f_rep = (1.15 * k_harm / d_contact) * ov * ov * v0_bar;
+                        acc_i += nij * (f_rep * inv_mass_i);
+                    } else if (cross_bond && r > 1.14 * pc.dx && r < 1.58 * pc.dx) {
                         float phase_s = sin(pi_c * (r - 1.14 * pc.dx) / (0.44 * pc.dx));
-                        float a_coh = (1.30 * c_coh * y_coh / (0.5 * (rho0_i + rho0_j) * pc.dx)) * phase_s;
-                        acc_i -= nij * (a_coh * m_pair * coh_gate);
+                        float y_coh = (i_duc && j_duc)
+                            ? (min(m_i.strength.y, m_j.strength.y) + 0.38 * min(m_i.fracture.x, m_j.fracture.x))
+                            : (0.38 * min(m_i.fracture.x, m_j.fracture.x));
+                        float f_coh = (1.30 * c_coh * y_coh / pc.dx) * phase_s * v0_bar * coh_gate;
+                        acc_i -= nij * (f_coh * inv_mass_i);
                     }
 
                     xsph += (0.075 * c_coh + 0.015) * vol_j * (vj - vi) * w;
@@ -397,13 +405,35 @@ void main() {
                     // --- DETONATION GAS FLUID INTERACTION (det_i == 2 || det_j == 2) ---
                     float p_pos_i = max(press_i, 0.0);
                     float p_pos_j = max(press_j, 0.0);
-                    float rho_eff_i = (det_i == 2u) ? max(rho_i, 0.45 * rho0_i) : rho_i;
-                    float rho_eff_j = (det_j == 2u) ? max(rho_j, 0.45 * rho0_j) : rho_j;
-                    float p_term = p_pos_i / max(rho_eff_i * rho_eff_i, 1e-6)
-                                 + p_pos_j / max(rho_eff_j * rho_eff_j, 1e-6)
-                                 + pi_visc;
-                    acc_i -= mj * p_term * grad_w;
-                    de += mj * (p_pos_i / rho_i2 + w_visc_i * pi_visc) * vij_dot_gradw;
+                    float rho_vol_i = (det_i == 2u) ? max(rho_i, 0.35 * rho0_i) : max(rho_i, 1e-5);
+                    float inv_rho_v_i = 1.0 / max(rho_vol_i, 1e-5);
+                    // Symmetric acoustic-impedance wall reflection across gas/solid boundaries
+                    float refl_mult = 1.0;
+                    if ((det_i == 2u) != (det_j == 2u) && mat_i != 22u && mat_j != 22u) {
+                        float z_sol = (det_i == 2u) ? z_j : z_i;
+                        float z_g = (det_i == 2u) ? z_i : z_j;
+                        float refl = clamp(2.0 * z_sol / max(z_sol + z_g, 1e-5), 1.0, 2.0);
+                        refl_mult = 2.45 * refl;
+                    }
+                    acc_i -= (inv_rho_v_i * vol_j * (refl_mult * (p_pos_i + p_pos_j) + p_visc)) * grad_w;
+                    de += (1.0 / max(rho_i, 1e-5)) * vol_j * (p_pos_i + w_visc_i * p_visc) * vij_dot_gradw;
+
+                    // Anti-tunneling standoff blast stagnation contact when supersonic gas overlaps solid core (< 0.92*dx)
+                    if ((det_i == 2u) != (det_j == 2u) && r < 0.92 * pc.dx && mat_i != 22u && mat_j != 22u) {
+                        float v_close_g = max(-dot(vij, nij), 0.0);
+                        if (v_close_g > 0.0) {
+                            float ramp_g = clamp((0.92 * pc.dx - r) / (0.22 * pc.dx), 0.0, 1.0);
+                            float m_red_g = (mass_i * mj) / max(mass_i + mj, 1e-6);
+                            float rho_g = (det_i == 2u) ? rho_i : rho_j;
+                            float p_stag = 1.65 * rho_g * v_close_g * v_close_g + 0.5 * (p_pos_i + p_pos_j);
+                            float f_stag_raw = p_stag * (0.94 * pc.dx) * ramp_g;
+                            float f_stag_cap = 1.25 * m_red_g * v_close_g / max(pc.dt, 1e-4);
+                            float f_stag = min(f_stag_raw, f_stag_cap);
+                            acc_i += nij * (f_stag / max(mass_i, 1e-6));
+                            de += w_visc_i * (0.06 * f_stag * v_close_g) / max(mass_i, 1e-6);
+                        }
+                    }
+
                     xsph += 0.025 * vol_j * (vj - vi) * w;
                 }
             }

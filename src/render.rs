@@ -351,13 +351,13 @@ fn particle_color(world: &ContinuumWorld, i: usize, mode: VisMode) -> ([u8; 3], 
             } else {
                 1.0
             };
-            // Subtle metallic shock compression sheen (avoids oversaturated cyan tinting)
-            let comp_boost = ((world.rho[i] / world.rho0[i] - 1.0) * 0.95).clamp(0.0, 0.24);
-            let shock_flash = (world.shock_rate[i] * 1.4).clamp(0.0, 0.26);
+            // Crisp metallic shock compression sheen + luminous traveling stress front
+            let comp_boost = ((world.rho[i] / world.rho0[i] - 1.0) * 1.10).clamp(0.0, 0.28);
+            let shock_flash = (world.shock_rate[i] * 2.1).clamp(0.0, 0.44);
             let mut rgb = [
-                (base[0] * crack_shade + 0.28 * comp_boost + 0.36 * shock_flash).clamp(0.0, 1.0),
-                (base[1] * crack_shade + 0.32 * comp_boost + 0.42 * shock_flash).clamp(0.0, 1.0),
-                (base[2] * crack_shade + 0.38 * comp_boost + 0.50 * shock_flash).clamp(0.0, 1.0),
+                (base[0] * crack_shade + 0.30 * comp_boost + 0.40 * shock_flash).clamp(0.0, 1.0),
+                (base[1] * crack_shade + 0.35 * comp_boost + 0.48 * shock_flash).clamp(0.0, 1.0),
+                (base[2] * crack_shade + 0.42 * comp_boost + 0.60 * shock_flash).clamp(0.0, 1.0),
             ];
             let (glow, g_amt) = blackbody_glow(temp);
             if g_amt > 0.0 {
@@ -695,10 +695,10 @@ impl PixelCanvas {
                         (world.rho[i] / world.rho0[i].max(1e-4)).clamp(0.045, 2.4);
                     let age = world.det_age[i].max(0.0);
                     let exp_scale = (1.0 / rho_rel).sqrt().clamp(1.0, 4.4);
-                    let age_swell = (1.0 + 0.14 * age).clamp(1.0, 2.4);
+                    let age_swell = (1.0 + 0.12 * age).clamp(1.0, 2.2);
                     let pr = intact_r
                         * det_power
-                        * (1.42 * exp_scale.max(age_swell)).clamp(1.42, 5.2);
+                        * (1.18 * exp_scale.max(age_swell)).clamp(1.18, 3.85);
                     if !pr.is_finite() || !age.is_finite() || pr <= 0.02 {
                         return None;
                     }
@@ -709,8 +709,8 @@ impl PixelCanvas {
                     };
                     let temp_c = (eff_temp * 0.1).clamp(40.0, 3000.0) as i16;
                     let v_code = (world.vel[i].length() * 35.0).clamp(0.0, 255.0) as u8;
-                    let hr = if hot_halo && mat != MaterialId::ImpactFuze {
-                        (pr * (1.65 - 0.04 * age).max(1.0)).min(64.0)
+                    let hr = if mat != MaterialId::ImpactFuze && (hot_halo || age < 22.0) {
+                        (pr * (1.58 - 0.025 * age).clamp(0.70, 1.58)).min(68.0)
                     } else {
                         0.0
                     };
@@ -797,10 +797,12 @@ impl PixelCanvas {
                 let spd = vel.length();
                 let (tx_off, ty_off) = if layer == 2
                     && rich_tex
-                    && world.temp[i] >= 1100.0
-                    && spd >= 0.12
+                    && spd >= 0.11
+                    && (world.temp[i] >= 480.0
+                        || (dmg >= 0.48 && spd >= 0.18)
+                        || (mat == MaterialId::Copper && spd >= 0.25))
                 {
-                    let raw_len = (crumb_r * 1.20 + spd * 2.6 * cam.zoom).min(7.5 * intact_r);
+                    let raw_len = (crumb_r * 1.65 + spd * 4.2 * cam.zoom).min(11.0 * intact_r);
                     let inv_spd = 1.0 / spd;
                     (-vel.x * inv_spd * raw_len, vel.y * inv_spd * raw_len)
                 } else {
@@ -883,12 +885,12 @@ impl PixelCanvas {
         }
 
         let band_len = BAND_H * width;
+        let rich_tex = mode == VisMode::MaterialThermal;
         let draw_items = &self.draw_items;
         let band_buckets = &mut self.band_buckets[..num_bands];
         let star_buckets = &self.star_buckets[..num_bands];
         let grid_v = &self.grid_v_cols;
         let grid_h = &self.grid_h_rows;
-        let rich_tex = mode == VisMode::MaterialThermal;
         let templates = crumb_templates();
         let inv_h = 1.0 / (height.max(1) as f32);
 
@@ -960,18 +962,36 @@ impl PixelCanvas {
                     let idx = (packed & 0x0FFF_FFFF) as usize;
                     let it = &draw_items[idx];
                     if layer == 3 {
-                        let hot_fade = (1.0 - (it.angle / 16.0).clamp(0.0, 1.0)).max(0.15);
-                        splat_additive_halo_band(
-                            band_px,
-                            width,
-                            band_y0,
-                            band_y1,
-                            it.cx,
-                            it.cy,
-                            it.halo_r,
-                            it.col,
-                            0.14 * hot_fade,
-                        );
+                        if it.render_kind == 1 {
+                            splat_fireball_plasma_band(
+                                band_px,
+                                width,
+                                band_y0,
+                                band_y1,
+                                it.cx,
+                                it.cy,
+                                it.halo_r,
+                                it.angle,
+                                it.dmg,
+                                it.bevel as f32 * 10.0,
+                                it.seed,
+                                it.col,
+                                rich_tex,
+                            );
+                        } else {
+                            let hot_fade = (1.0 - (it.angle / 16.0).clamp(0.0, 1.0)).max(0.15);
+                            splat_additive_halo_band(
+                                band_px,
+                                width,
+                                band_y0,
+                                band_y1,
+                                it.cx,
+                                it.cy,
+                                it.halo_r,
+                                it.col,
+                                0.20 * hot_fade,
+                            );
+                        }
                     } else if it.render_kind == 1 {
                         splat_explosion_plume_band(
                             band_px,
@@ -1574,6 +1594,35 @@ fn splat_crumb_polygon_band(
     }
 }
 
+#[inline(always)]
+fn sample_plume_lut_bilinear(
+    lut: &[[u8; 2]; 256 * 256],
+    u_fp: i32,
+    v_fp: i32,
+    seed_lx: i32,
+    seed_ly: i32,
+) -> (f32, f32) {
+    let ix0 = ((u_fp >> 13).wrapping_add(seed_lx)) & 255;
+    let iy0 = ((v_fp >> 13).wrapping_add(seed_ly)) & 255;
+    let ix1 = (ix0 + 1) & 255;
+    let iy1 = (iy0 + 1) & 255;
+    let fx = (u_fp & 8191) as f32 * (1.0 / 8192.0);
+    let fy = (v_fp & 8191) as f32 * (1.0 / 8192.0);
+    let c00 = lut[((iy0 as usize) << 8) | (ix0 as usize)];
+    let c10 = lut[((iy0 as usize) << 8) | (ix1 as usize)];
+    let c01 = lut[((iy1 as usize) << 8) | (ix0 as usize)];
+    let c11 = lut[((iy1 as usize) << 8) | (ix1 as usize)];
+    let w00 = (1.0 - fx) * (1.0 - fy);
+    let w10 = fx * (1.0 - fy);
+    let w01 = (1.0 - fx) * fy;
+    let w11 = fx * fy;
+    let n1 = (c00[0] as f32 * w00 + c10[0] as f32 * w10 + c01[0] as f32 * w01 + c11[0] as f32 * w11)
+        * (1.0 / 255.0);
+    let billow = (c00[1] as f32 * w00 + c10[1] as f32 * w10 + c01[1] as f32 * w01 + c11[1] as f32 * w11)
+        * (1.0 / 255.0);
+    (n1, billow)
+}
+
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn splat_explosion_plume_band(
@@ -1653,12 +1702,16 @@ fn splat_explosion_plume_band(
     let seed_lx = ((seed >> 16) & 255) as i32;
     let seed_ly = ((seed >> 24) & 255) as i32;
 
-    // Incandescent plasma flash -> bright fireball -> warm ember-lit atmospheric smoke veil
-    let young_flash = (1.0 - (det_age / 3.2).clamp(0.0, 1.0)).powf(1.3);
-    let fire_life = (1.0 - (det_age / 42.0).clamp(0.0, 1.0)).powf(1.10);
-    let heat_norm = ((temp_k - 700.0) / 3400.0).clamp(0.0, 1.25);
-    let hot_drive = (heat_norm * (0.20 + 0.80 * fire_life)).max(0.85 * fire_life);
-    let gas_optical = (0.14 + 0.34 * fire_life) * (0.64 + 0.36 * rho_rel.clamp(0.0, 1.0));
+    // Cool dark charcoal smoke envelope in layer 1; active plasma fire radiates additively on layer 3
+    let fire_life = (1.0 - (det_age / 24.0).clamp(0.0, 1.0)).powf(1.25);
+    let heat_lit = ((temp_k - 650.0) / 2800.0).clamp(0.18, 1.20);
+    let smoke_life = if det_age < 0.8 {
+        (det_age / 0.8) * 0.25
+    } else {
+        (0.25 + 0.35 * ((det_age - 0.8) / 14.0).clamp(0.0, 1.0))
+            * (1.0 - ((det_age - 28.0) / 48.0).clamp(0.0, 0.55))
+    };
+    let gas_optical = smoke_life * (0.55 + 0.45 * rho_rel.clamp(0.0, 1.0));
 
     let start_dx = (x0 as f32 + 0.5) - cx;
     let r_bound_sq = r_bound * r_bound;
@@ -1683,55 +1736,34 @@ fn splat_explosion_plume_band(
                 continue;
             }
             let r_lin = d2.sqrt() * inv_rb;
-
-            // L1-cached 2-octave fBm plume warp lookup
-            let lx = ((cu >> 13).wrapping_add(seed_lx)) & 255;
-            let ly = ((cv >> 13).wrapping_add(seed_ly)) & 255;
-            let [n1_u, b_u] = lut[((ly as usize) << 8) | (lx as usize)];
-            let n1 = n1_u as f32 * (1.0 / 255.0);
-            let billow = b_u as f32 * (1.0 / 255.0);
-            let r_warped = (r_lin + 0.44 * (n1 - 0.5)).clamp(0.0, 1.0);
+            let (n1, billow) = sample_plume_lut_bilinear(lut, cu, cv, seed_lx, seed_ly);
+            let r_warped = (r_lin + 0.48 * (n1 - 0.5)).clamp(0.0, 1.0);
             let omr = 1.0 - r_warped;
             let cloud_env = omr * omr * (1.0 + 2.0 * r_warped);
 
-            let plume_density = (cloud_env * (0.68 + 0.52 * billow)).clamp(0.0, 1.0);
-            if plume_density <= 0.025 {
+            let plume_density = (cloud_env * (0.55 + 0.65 * billow)).clamp(0.0, 1.0);
+            if plume_density <= 0.03 {
                 continue;
             }
 
-            let alpha = (plume_density * gas_optical).clamp(0.0, 0.72);
+            let alpha = (plume_density * gas_optical).clamp(0.0, 0.42);
             let a_u16 = (alpha * 256.0) as u16;
             let inv_a = 256 - a_u16;
 
             let out_rgb = if !rich_tex {
-                let mod_f = 0.80 + 0.30 * billow;
+                let mod_f = 0.78 + 0.32 * billow;
                 [
                     (tint_col[0] as f32 * mod_f).clamp(0.0, 255.0) as u8,
                     (tint_col[1] as f32 * mod_f).clamp(0.0, 255.0) as u8,
                     (tint_col[2] as f32 * mod_f).clamp(0.0, 255.0) as u8,
                 ]
             } else {
-                let t_local = (hot_drive * (0.35 + 0.82 * plume_density) * (0.40 + 0.60 * billow)
-                    + 0.45 * young_flash * (1.0 - r_lin * r_lin))
-                    .clamp(0.0, 1.35);
-
-                let c = if t_local > 1.02 {
-                    // Actinic plasma detonation front
-                    lerp_rgb([1.00, 0.98, 0.88], [0.92, 0.97, 1.00], (t_local - 1.02) / 0.33)
-                } else if t_local > 0.68 {
-                    // Luminous gold-white fireball core
-                    lerp_rgb([1.00, 0.70, 0.14], [1.00, 0.98, 0.88], (t_local - 0.68) / 0.34)
-                } else if t_local > 0.38 {
-                    // Fiery orange-crimson combustion waves
-                    lerp_rgb([0.82, 0.20, 0.05], [1.00, 0.70, 0.14], (t_local - 0.38) / 0.30)
-                } else if t_local > 0.18 {
-                    // Ember-lit warm soot gradient
-                    lerp_rgb([0.21, 0.19, 0.21], [0.82, 0.20, 0.05], (t_local - 0.18) / 0.20)
-                } else {
-                    // Soft translucent charcoal-slate smoke billow
-                    let soot_l = 0.14 + 0.12 * billow;
-                    [soot_l * 0.98, soot_l, soot_l * 1.05]
-                };
+                // Dark billowing ash/soot illuminated internally by deep crimson underside embers
+                let soot_l = 0.08 + 0.14 * billow;
+                let ash = [soot_l * 0.96, soot_l * 0.98, soot_l * 1.08];
+                let ember_lit =
+                    (fire_life * heat_lit * plume_density * (0.45 + 0.55 * billow)).clamp(0.0, 0.72);
+                let c = lerp_rgb(ash, [0.58, 0.16, 0.05], ember_lit);
                 [
                     (c[0] * 255.0) as u8,
                     (c[1] * 255.0) as u8,
@@ -1744,6 +1776,119 @@ fn splat_explosion_plume_band(
                 ((out_rgb[0] as u16 * a_u16 + bg[0] as u16 * inv_a) >> 8) as u8,
                 ((out_rgb[1] as u16 * a_u16 + bg[1] as u16 * inv_a) >> 8) as u8,
                 ((out_rgb[2] as u16 * a_u16 + bg[2] as u16 * inv_a) >> 8) as u8,
+            );
+        }
+    }
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn splat_fireball_plasma_band(
+    band_px: &mut [Color32],
+    width: usize,
+    band_y0: usize,
+    band_y1: usize,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    det_age: f32,
+    rho_rel: f32,
+    temp_k: f32,
+    seed: u32,
+    tint_col: [u8; 3],
+    rich_tex: bool,
+) {
+    if !cx.is_finite()
+        || !cy.is_finite()
+        || !r.is_finite()
+        || r <= 0.35
+        || width == 0
+        || band_y0 > band_y1
+    {
+        return;
+    }
+    if !rich_tex {
+        let hot_fade = (1.0 - (det_age / 16.0).clamp(0.0, 1.0)).max(0.15);
+        splat_additive_halo_band(band_px, width, band_y0, band_y1, cx, cy, r, tint_col, 0.16 * hot_fade);
+        return;
+    }
+
+    let x0_i = (cx - r).floor() as isize;
+    let x1_i = (cx + r).ceil() as isize;
+    let y0_i = (cy - r).floor() as isize;
+    let y1_i = (cy + r).ceil() as isize;
+    let w_max = width as isize - 1;
+    if x1_i < 0 || x0_i > w_max || y1_i < band_y0 as isize || y0_i > band_y1 as isize {
+        return;
+    }
+    let x0 = x0_i.max(0) as usize;
+    let x1 = x1_i.min(w_max) as usize;
+    let y0 = (y0_i.max(band_y0 as isize)) as usize;
+    let y1 = (y1_i.min(band_y1 as isize)) as usize;
+
+    let inv_r = 1.0 / r.max(0.25);
+    let swirl = (seed as f32 * 0.0021) + det_age * 0.19 * if (seed & 1) == 0 { 1.0 } else { -1.0 };
+    let (sin_s, cos_s) = swirl.sin_cos();
+    let tex_scale = (2.8 * 65536.0) * inv_r;
+    let du_dx = (cos_s * tex_scale).round() as i32;
+    let dv_dx = (-sin_s * tex_scale).round() as i32;
+    let age_shift = (det_age * 1.15).round() as i32;
+    let u_off = (((seed & 0xFF) as i32) << 12).wrapping_add(age_shift << 15);
+    let v_off = ((((seed >> 8) & 0xFF) as i32) << 12).wrapping_sub(age_shift << 14);
+    let lut = plume_fbm_lut();
+    let seed_lx = ((seed >> 16) & 255) as i32;
+    let seed_ly = ((seed >> 24) & 255) as i32;
+
+    let flash = (1.0 - (det_age / 2.6).clamp(0.0, 1.0)).powf(1.3);
+    let fire_life = (1.0 - (det_age / 24.0).clamp(0.0, 1.0)).powf(1.25);
+    let heat = ((temp_k - 850.0) / 3100.0).clamp(0.0, 1.35);
+    let drive = (fire_life * (0.45 + 0.65 * heat) + 0.55 * flash)
+        * (0.65 + 0.35 * rho_rel.clamp(0.0, 1.0));
+    if drive <= 0.02 {
+        return;
+    }
+
+    let r2_max = r * r;
+    let start_dx = (x0 as f32 + 0.5) - cx;
+    for y in y0..=y1 {
+        let dy = (y as f32 + 0.5) - cy;
+        let dy2 = dy * dy;
+        let row = (y - band_y0) * width;
+        let mut u_fp = ((start_dx * cos_s + dy * sin_s) * tex_scale).round() as i32 + u_off;
+        let mut v_fp = ((-start_dx * sin_s + dy * cos_s) * tex_scale).round() as i32 + v_off;
+        for x in x0..=x1 {
+            let dx = (x as f32 + 0.5) - cx;
+            let d2 = dx * dx + dy2;
+            let cu = u_fp;
+            let cv = v_fp;
+            u_fp = u_fp.wrapping_add(du_dx);
+            v_fp = v_fp.wrapping_add(dv_dx);
+            if d2 >= r2_max {
+                continue;
+            }
+            let r_lin = d2.sqrt() * inv_r;
+            let (n1, billow) = sample_plume_lut_bilinear(lut, cu, cv, seed_lx, seed_ly);
+            let r_w = (r_lin + 0.42 * (n1 - 0.5)).clamp(0.0, 1.0);
+            let core_fall = (1.0 - r_w).powi(2);
+            let flame = (core_fall * (0.50 + 0.85 * billow)).clamp(0.0, 1.0);
+            let e = flame * drive;
+            if e <= 0.015 {
+                continue;
+            }
+            // HDR blackbody ramp scaled gently per-splat so overlaps build blinding core without blowing out fringes
+            let c = if e > 0.72 || flash > 0.55 && r_w < 0.55 {
+                lerp_rgb([1.00, 0.78, 0.24], [1.00, 0.98, 0.88], ((e - 0.72) / 0.50).clamp(0.0, 1.0))
+            } else if e > 0.32 {
+                lerp_rgb([0.96, 0.28, 0.05], [1.00, 0.78, 0.24], (e - 0.32) / 0.40)
+            } else {
+                lerp_rgb([0.48, 0.08, 0.02], [0.96, 0.28, 0.05], e / 0.32)
+            };
+            let w_add = (e * 0.26 * 255.0).clamp(0.0, 215.0);
+            let bg = band_px[row + x].to_array();
+            band_px[row + x] = Color32::from_rgb(
+                (bg[0] as u16 + (c[0] * w_add) as u16).min(255) as u8,
+                (bg[1] as u16 + (c[1] * w_add) as u16).min(255) as u8,
+                (bg[2] as u16 + (c[2] * w_add) as u16).min(255) as u8,
             );
         }
     }
@@ -1902,7 +2047,7 @@ fn splat_ember_streak_band(
             if d2 < w_r * w_r {
                 let radial = (1.0 - d2 / (w_r * w_r)).sqrt();
                 let axial = 1.0 - t;
-                let glow = (radial * axial * 0.62).clamp(0.0, 0.65);
+                let glow = (radial * axial * 0.84).clamp(0.0, 0.86);
                 let g_u16 = (glow * 256.0) as u16;
                 let bg = band_px[row + x].to_array();
                 band_px[row + x] = Color32::from_rgb(
@@ -2396,6 +2541,51 @@ mod tests {
             distinct.len() > 25,
             "Expected rich turbulent explosion texture, got only {} colors",
             distinct.len()
+        );
+    }
+
+    #[test]
+    fn explosion_canvas_renders_hdr_fireball_structure() {
+        let mut world = crate::scenarios::build_scenario(
+            crate::scenarios::ScenarioPreset::OctolFragDemolition,
+            0.36,
+        );
+        // Trigger shock blast & advance substeps so detonation gas radiates HDR plasma + smoke
+        world.trigger_shock_blast(Vec2::new(6.0, 0.0), 4.5, 0.65, 4800.0);
+        for _ in 0..90 {
+            let dt = world.compute_cfl_dt();
+            world.step(dt);
+        }
+
+        let mut canvas = PixelCanvas::new();
+        let cam = Camera2D {
+            center: Vec2::new(6.0, 0.0),
+            zoom: 12.0,
+        };
+        canvas.render_with_opts(
+            &world,
+            &cam,
+            480,
+            320,
+            VisMode::MaterialThermal,
+            false,
+            false,
+        );
+
+        let mut hot_core_px = 0usize;
+        let mut fiery_flame_px = 0usize;
+        for p in &canvas.pixels {
+            let (r, g, b) = (p.r(), p.g(), p.b());
+            if r >= 235 && g >= 205 && b >= 120 {
+                hot_core_px += 1;
+            }
+            if r >= 185 && (40..=185).contains(&g) && b <= 95 {
+                fiery_flame_px += 1;
+            }
+        }
+        assert!(
+            hot_core_px >= 20 && fiery_flame_px >= 40,
+            "Expected blazing HDR fireball + flame tongues (core={hot_core_px}, flame={fiery_flame_px})"
         );
     }
 }

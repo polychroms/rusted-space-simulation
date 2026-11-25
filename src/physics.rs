@@ -419,21 +419,26 @@ impl ContinuumWorld {
         }
     }
 
-    /// Adaptive Courant-Friedrichs-Lewy (CFL) timestep including nonlinear shock stiffening & shear wave speed!
+    /// Adaptive Courant-Friedrichs-Lewy (CFL) timestep including nonlinear shock stiffening,
+    /// shear wave speed, acceleration spikes & smooth dt-growth damping for Verlet stability.
     pub fn compute_cfl_dt(&self) -> f32 {
         let n = self.pos.len();
         if n == 0 {
             return 0.05;
         }
+        let grav_len = self.grav_acc.len();
         let calc_sig = |i: usize| -> f32 {
-            let v = self.vel[i].length();
+            let v_vec = self.vel[i];
+            let v = if v_vec.is_finite() { v_vec.length().min(15.0) } else { 0.0 };
             let mp = self.mat[i].props();
             let det = self.det_state[i];
             let c_eff = if det == 2 {
                 mp.detonation_vel.max(0.80)
             } else {
-                let rho = self.rho[i].max(0.1);
-                let p_pos = self.sph_pressure[i].max(0.0);
+                let rho_raw = self.rho[i];
+                let rho = if rho_raw.is_finite() { rho_raw.max(0.1) } else { mp.rho0.max(0.1) };
+                let p_raw = self.sph_pressure[i];
+                let p_pos = if p_raw.is_finite() { p_raw.max(0.0) } else { 0.0 };
                 let mu = (rho / mp.rho0.max(1e-4) - 1.0).max(0.0);
                 let c_shock_sq = mp.c0 * mp.c0
                     + (1.0 + 2.0 * mp.hugoniot_s * mu) * p_pos / rho
@@ -445,7 +450,12 @@ impl ContinuumWorld {
                     c_long
                 }
             };
-            c_eff + 1.45 * v
+            let c_grav = if self.self_gravity && i < grav_len && self.grav_acc[i].is_finite() {
+                (self.h * self.grav_acc[i].length().min(1.0e4)).max(0.0).sqrt()
+            } else {
+                0.0
+            };
+            c_eff + 1.45 * v + c_grav
         };
 
         let max_signal = if n >= 2048 {
@@ -453,7 +463,12 @@ impl ContinuumWorld {
         } else {
             (0..n).map(calc_sig).fold(0.45f32, f32::max)
         };
-        (0.22 * self.h / max_signal).clamp(0.0010, 0.085)
+        let raw_dt = (0.22 * self.h / max_signal).clamp(0.00015, 0.085);
+        if self.step_count > 0 && self.last_dt.is_finite() && self.last_dt > 0.0 {
+            raw_dt.min(self.last_dt * 1.25).clamp(0.00015, 0.085)
+        } else {
+            raw_dt
+        }
     }
 
     /// Compute `[min_x, min_y, box_span, grav_g]` for GPU-resident 32x32 self-gravity grid!
@@ -815,17 +830,36 @@ impl ContinuumWorld {
             self.step_scratch.resize(n, ContinuumStepOut::default());
         }
 
-        // 1. Velocity-Verlet first half-kick + XSPH drift
+        // 1. Velocity-Verlet first half-kick + XSPH drift (substep-limited & speed-bounded)
         if self.step_count > 0 {
             let half_dt = 0.5 * dt;
+            let dt_safe = dt.max(1e-4);
+            let max_dv = 0.45 * self.dx / dt_safe;
+            let max_step = 0.65 * self.dx;
             self.pos
                 .par_iter_mut()
                 .zip(self.vel.par_iter_mut())
                 .zip(self.acc.par_iter())
                 .zip(self.xsph_dv.par_iter())
                 .for_each(|(((pos, vel), acc), xsph)| {
-                    *vel += *acc * half_dt;
-                    *pos += (*vel + *xsph) * dt;
+                    if !vel.is_finite() {
+                        *vel = Vec2::ZERO;
+                    }
+                    let dv = if acc.is_finite() {
+                        (*acc * half_dt).clamp_length_max(max_dv)
+                    } else {
+                        Vec2::ZERO
+                    };
+                    *vel = (*vel + dv).clamp_length_max(15.0);
+                    let xs = if xsph.is_finite() {
+                        xsph.clamp_length_max(3.0)
+                    } else {
+                        Vec2::ZERO
+                    };
+                    let dp = ((*vel + xs) * dt).clamp_length_max(max_step);
+                    if pos.is_finite() {
+                        *pos += dp;
+                    }
                 });
         }
 
@@ -855,7 +889,7 @@ impl ContinuumWorld {
                     let p_jwl = a * (1.0 - omega / (r1 * v_rel)) * (-r1 * v_rel).exp()
                         + b * (1.0 - omega / (r2 * v_rel)) * (-r2 * v_rel).exp()
                         + omega * rho * e;
-                    *p_out = p_jwl.clamp(0.0, 0.95);
+                    *p_out = p_jwl.clamp(0.0, 1.80);
                 } else {
                     let mu = (rho / rho0 - 1.0).clamp(-0.16, 0.72);
                     let k1 = rho0 * m.c0 * m.c0;
@@ -972,7 +1006,6 @@ impl ContinuumWorld {
                 let s_ix = s_xx_ref[i] * intact_i;
                 let s_iy = s_yy_ref[i] * intact_i;
                 let s_ixy = s_xy_ref[i] * intact_i;
-                let rho_i2 = (rho_i * rho_i).max(1e-6);
 
                 let cx = (pi.x / grid_cell_size).floor() as i32;
                 let cy = (pi.y / grid_cell_size).floor() as i32;
@@ -1114,7 +1147,7 @@ impl ContinuumWorld {
                                 } else {
                                     0.0
                                 };
-                                let f_visc_cap = 0.45 * m_red * v_close / dt.max(0.005);
+                                let f_visc_cap = 0.45 * m_red * v_close / dt.max(1e-4);
                                 let f_visc = f_visc_raw.min(f_visc_cap);
                                 let f_eos_used = if vn >= 0.0 {
                                     p_riemann * area_c * ramp
@@ -1133,7 +1166,10 @@ impl ContinuumWorld {
                                     0.0
                                 };
 
-                                let f_n = f_eos_used + f_visc + f_core;
+                                let f_n_raw = f_eos_used + f_visc + f_core;
+                                let f_n_cap =
+                                    m_red * (1.25 * v_close + 0.45 * cbar) / dt.max(1e-4) + f_eos_part;
+                                let f_n = f_n_raw.min(f_n_cap);
                                 let a_n = f_n / mass_i.max(1e-6);
                                 acc_i += nij * a_n;
 
@@ -1187,7 +1223,7 @@ impl ContinuumWorld {
                                     let mu_f = 0.5 * (m_i.friction + m_j.friction) * solid_f;
                                     let a_fric = (mu_f * a_n).min(
                                         0.30 * (2.0 * mj / (mass_i + mj).max(1e-6)) * vt_len
-                                            / dt.max(0.005),
+                                            / dt.max(1e-4),
                                     );
                                     let f_tan = -(vt / vt_len) * a_fric;
                                     acc_i += f_tan;
@@ -1222,7 +1258,7 @@ impl ContinuumWorld {
                             };
 
                             let rho_vol_j = if det_j == 2 {
-                                rho_j.max(0.52 * rho0_j)
+                                rho_j.max(0.35 * rho0_j)
                             } else {
                                 rho_j
                             };
@@ -1236,7 +1272,7 @@ impl ContinuumWorld {
                             drho += gas_solid_comp * rho_i * vol_j * vij_dot_gradw;
 
                             let cbar = 0.5 * (m_i.c0 + m_j.c0);
-                            if det_i == det_j {
+                            if det_i == det_j && mat_i == mat_ref[j] {
                                 let comp_diff =
                                     (rho_j / rho0_j.max(1e-4)) - (rho_i / rho0_i.max(1e-4));
                                 let pos_kf = (r * (-dw_dr)) / (r2 + 0.01 * h2);
@@ -1244,17 +1280,14 @@ impl ContinuumWorld {
                             }
 
                             let vij_dot_xij = vij.dot(xij);
-                            let pi_visc = if vij_dot_xij < 0.0 {
+                            let p_visc = if vij_dot_xij < 0.0 {
                                 let mu_v = (h * vij_dot_xij) / (r2 + 0.01 * h2);
-                                let rho_bar = 0.5 * (rho_i + rho_j);
+                                let rho_harm = (2.0 * rho_i * rho_j) / (rho_i + rho_j).max(1e-4);
                                 shock_comp += (-mu_v) * vol_j * w * cutoff;
-                                ((-1.05 * cbar * mu_v + 2.00 * mu_v * mu_v) / rho_bar.max(1e-4))
-                                    * coh_gate
+                                (rho_harm * (-1.05 * cbar * mu_v + 2.00 * mu_v * mu_v)).max(0.0)
                             } else {
                                 0.0
                             };
-
-                            let rho_j2 = (rho_j * rho_j).max(1e-6);
 
                             if c_coh > 0.03 {
                                 let vji = vj - vi;
@@ -1276,47 +1309,58 @@ impl ContinuumWorld {
                                 let sig_xx_j = -press_j + s_jx;
                                 let sig_yy_j = -press_j + s_jy;
 
-                                let tens_i = sig_xx_i.max(sig_yy_i).max(0.0) / rho_i2;
-                                let tens_j = sig_xx_j.max(sig_yy_j).max(0.0) / rho_j2;
+                                // Volume-symmetric momentum-conserving Cauchy stress across multi-density boundaries:
+                                // m_i * acc_i = V_i * V_j * coh_gate * (sig_i + sig_j - r_art_sig - p_visc * I) * grad_w
+                                let inv_rho_i = 1.0 / rho_i.max(1e-5);
+                                let tens_sig_i = sig_xx_i.max(sig_yy_i).max(0.0);
+                                let tens_sig_j = sig_xx_j.max(sig_yy_j).max(0.0);
                                 let fij = (w / w_ref).clamp(0.0, 1.25);
                                 let fij2 = fij * fij;
-                                let r_art = 0.30 * (tens_i + tens_j) * fij2 * fij2;
+                                let r_art_sig = 0.30 * (tens_sig_i + tens_sig_j) * fij2 * fij2;
 
-                                let t_xx = (sig_xx_i / rho_i2 + sig_xx_j / rho_j2 - r_art)
-                                    * coh_gate
-                                    - pi_visc;
-                                let t_yy = (sig_yy_i / rho_i2 + sig_yy_j / rho_j2 - r_art)
-                                    * coh_gate
-                                    - pi_visc;
-                                let t_xy = (s_ixy / rho_i2 + s_jxy / rho_j2) * coh_gate;
+                                let t_xx = sig_xx_i + sig_xx_j - r_art_sig - p_visc;
+                                let t_yy = sig_yy_i + sig_yy_j - r_art_sig - p_visc;
+                                let t_xy = s_ixy + s_jxy;
 
-                                acc_i += mj
+                                acc_i += (inv_rho_i * vol_j)
                                     * Vec2::new(
                                         t_xx * grad_w.x + t_xy * grad_w.y,
                                         t_xy * grad_w.x + t_yy * grad_w.y,
                                     );
-                                de += mj
-                                    * (press_i.max(0.0) / rho_i2 * coh_gate + w_visc_i * pi_visc)
+                                de += inv_rho_i
+                                    * vol_j
+                                    * (press_i.max(0.0) + w_visc_i * p_visc)
                                     * vij_dot_gradw;
 
-                                let m_pair = (2.0 * mj) / (mass_i + mj).max(1e-6);
+                                // Force-symmetric harmonic core & bonded multi-material interface cohesion
+                                let v0_bar = 0.5
+                                    * (mass_i / rho0_i.max(1e-4) + mj / rho0_j.max(1e-4));
+                                let inv_mass_i = 1.0 / mass_i.max(1e-6);
+                                let cross_bond = (i_ductile && m_j.is_ductile())
+                                    || (!m_i.is_energetic
+                                        && !m_j.is_energetic
+                                        && (i_ductile || m_j.is_ductile()));
                                 if r < d_contact {
                                     let ov = 1.0 - r / d_contact;
-                                    let k_rep = 1.15 * cbar * cbar / d_contact;
-                                    acc_i += nij * (k_rep * ov * ov * m_pair);
-                                } else if i_ductile
-                                    && m_j.is_ductile()
-                                    && r > 1.14 * dx_val
-                                    && r < 1.58 * dx_val
-                                {
-                                    let y_coh = m_i.yield_strength.min(m_j.yield_strength)
-                                        + 0.38 * m_i.spall_strength.min(m_j.spall_strength);
+                                    let k_i = rho0_i * m_i.c0 * m_i.c0;
+                                    let k_j = rho0_j * m_j.c0 * m_j.c0;
+                                    let k_harm = (2.0 * k_i * k_j) / (k_i + k_j).max(1e-5);
+                                    let f_rep = (1.15 * k_harm / d_contact) * ov * ov * v0_bar;
+                                    acc_i += nij * (f_rep * inv_mass_i);
+                                } else if cross_bond && r > 1.14 * dx_val && r < 1.58 * dx_val {
                                     let phase_s =
                                         (pi_c * (r - 1.14 * dx_val) / (0.44 * dx_val)).sin();
-                                    let a_coh = (1.30 * c_coh * y_coh
-                                        / (0.5 * (rho0_i + rho0_j) * dx_val))
-                                        * phase_s;
-                                    acc_i -= nij * (a_coh * m_pair * coh_gate);
+                                    let y_coh = if i_ductile && m_j.is_ductile() {
+                                        m_i.yield_strength.min(m_j.yield_strength)
+                                            + 0.38 * m_i.spall_strength.min(m_j.spall_strength)
+                                    } else {
+                                        0.38 * m_i.spall_strength.min(m_j.spall_strength)
+                                    };
+                                    let f_coh = (1.30 * c_coh * y_coh / dx_val)
+                                        * phase_s
+                                        * v0_bar
+                                        * coh_gate;
+                                    acc_i -= nij * (f_coh * inv_mass_i);
                                 }
 
                                 xsph += (0.075 * c_coh + 0.015) * vol_j * (vj - vi) * w;
@@ -1324,23 +1368,58 @@ impl ContinuumWorld {
                                 // DETONATION GAS FLUID INTERACTION (det_i == 2 || det_j == 2)
                                 let p_pos_i = press_i.max(0.0);
                                 let p_pos_j = press_j.max(0.0);
-                                let rho_eff_i = if det_i == 2 {
-                                    rho_i.max(0.45 * rho0_i)
+                                let rho_vol_i = if det_i == 2 {
+                                    rho_i.max(0.35 * rho0_i)
                                 } else {
-                                    rho_i
+                                    rho_i.max(1e-5)
                                 };
-                                let rho_eff_j = if det_j == 2 {
-                                    rho_j.max(0.45 * rho0_j)
+                                let inv_rho_v_i = 1.0 / rho_vol_i.max(1e-5);
+                                // Symmetric acoustic-impedance wall reflection across gas/solid boundaries
+                                let refl_mult = if (det_i == 2) != (det_j == 2)
+                                    && mat_i != MaterialId::ImpactFuze
+                                    && mat_ref[j] != MaterialId::ImpactFuze
+                                {
+                                    let (z_sol, z_g) =
+                                        if det_i == 2 { (z_j, z_i) } else { (z_i, z_j) };
+                                    let refl = (2.0 * z_sol / (z_sol + z_g).max(1e-5))
+                                        .clamp(1.0, 2.0);
+                                    2.45 * refl
                                 } else {
-                                    rho_j
+                                    1.0
                                 };
-                                let p_term = p_pos_i / (rho_eff_i * rho_eff_i).max(1e-6)
-                                    + p_pos_j / (rho_eff_j * rho_eff_j).max(1e-6)
-                                    + pi_visc;
-                                acc_i -= mj * p_term * grad_w;
-                                de += mj
-                                    * (p_pos_i / rho_i2 + w_visc_i * pi_visc)
+                                acc_i -= (inv_rho_v_i
+                                    * vol_j
+                                    * (refl_mult * (p_pos_i + p_pos_j) + p_visc))
+                                    * grad_w;
+                                de += (1.0 / rho_i.max(1e-5))
+                                    * vol_j
+                                    * (p_pos_i + w_visc_i * p_visc)
                                     * vij_dot_gradw;
+
+                                // Anti-tunneling standoff blast stagnation contact when supersonic gas overlaps solid core (< 0.92*dx)
+                                if (det_i == 2) != (det_j == 2)
+                                    && r < 0.92 * dx_val
+                                    && mat_i != MaterialId::ImpactFuze
+                                    && mat_ref[j] != MaterialId::ImpactFuze
+                                {
+                                    let v_close_g = (-vij.dot(nij)).max(0.0);
+                                    if v_close_g > 0.0 {
+                                        let ramp_g = ((0.92 * dx_val - r) / (0.22 * dx_val))
+                                            .clamp(0.0, 1.0);
+                                        let m_red_g = (mass_i * mj) / (mass_i + mj).max(1e-6);
+                                        let rho_g = if det_i == 2 { rho_i } else { rho_j };
+                                        let p_stag = 1.65 * rho_g * v_close_g * v_close_g
+                                            + 0.5 * (p_pos_i + p_pos_j);
+                                        let f_stag_raw = p_stag * (0.94 * dx_val) * ramp_g;
+                                        let f_stag_cap =
+                                            1.25 * m_red_g * v_close_g / dt.max(1e-4);
+                                        let f_stag = f_stag_raw.min(f_stag_cap);
+                                        acc_i += nij * (f_stag / mass_i.max(1e-6));
+                                        de += w_visc_i * (0.06 * f_stag * v_close_g)
+                                            / mass_i.max(1e-6);
+                                    }
+                                }
+
                                 xsph += 0.025 * vol_j * (vj - vi) * w;
                             }
                         }
@@ -1475,13 +1554,14 @@ impl ContinuumWorld {
                     *shock_r = 0.65 * *shock_r + 0.35 * fo.shock_comp;
 
                     // Density update (rate-limited per substep to prevent single-cell detonation Euler overshoot)
-                    let delta_rho = (fo.drho * dt).clamp(-0.10 * rho0, 0.12 * rho0);
+                    let rho_lim = if *det_state == 2 { 0.14 } else { 0.10 };
+                    let delta_rho = (fo.drho * dt).clamp(-rho_lim * rho0, 0.14 * rho0);
                     let mut new_rho = *rho + delta_rho;
                     if *det_state == 2 {
-                        if fo.neighbors < 10 {
+                        if *det_age > 4.5 && fo.neighbors <= 3 {
                             let target_gas = 0.08 * rho0;
                             if new_rho > target_gas {
-                                new_rho -= (new_rho - target_gas) * (0.35 * dt).min(0.25);
+                                new_rho -= (new_rho - target_gas) * (0.18 * dt).min(0.16);
                             }
                         }
                         *rho = new_rho.clamp(0.05 * rho0, 2.2 * rho0);
@@ -1592,14 +1672,21 @@ impl ContinuumWorld {
                         }
                         let k1 = (rho0 * m.c0 * m.c0).max(0.05);
                         let triax = sigma_mean / sigma_eq_eff.max(m.yield_strength.max(0.005));
+                        let hydro_shear = if sph_p > 0.18 && tau_max > 1.35 * m.yield_strength {
+                            ((sph_p - 0.18) / 0.30).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
                         let eps_f_jc = if sigma_mean > 0.0 {
                             m.fracture_strain * (0.38 + 0.62 * (-1.3 * triax).exp()).max(0.35)
                         } else {
-                            m.fracture_strain * (1.5 + 4.5 * sph_p.max(0.0) / k1).min(3.0)
+                            let conf_mult = (1.5 + 4.5 * sph_p.max(0.0) / k1).min(3.0);
+                            m.fracture_strain * (conf_mult * (1.0 - 0.65 * hydro_shear)).max(0.55)
                         };
                         if *eps_p > eps_f_jc {
                             let over_jc = (*eps_p - eps_f_jc) / eps_f_jc.max(0.05);
-                            *dmg = (*dmg + dt * 2.80 * over_jc).clamp(0.0, 1.0);
+                            *dmg = (*dmg + dt * (2.80 + 4.20 * hydro_shear) * over_jc)
+                                .clamp(0.0, 1.0);
                         }
                     } else {
                         if sigma_mean > 0.15 * spall_th && sigma_1_tens > spall_th {
@@ -1672,12 +1759,33 @@ impl ContinuumWorld {
                         }
                     }
 
-                    // Velocity kick + thermal update
-                    if first_step {
-                        *vel += *acc * dt;
-                        *pos += (*vel + *xsph) * dt;
+                    // Velocity kick + thermal update (substep kick-limited & speed-clamped)
+                    let dt_safe = dt.max(1e-4);
+                    let max_dv_end = if first_step {
+                        0.60 * dx_val / dt_safe
                     } else {
-                        *vel += *acc * half_dt;
+                        0.45 * dx_val / dt_safe
+                    };
+                    if !acc.is_finite() {
+                        *acc = Vec2::ZERO;
+                    }
+                    if !xsph.is_finite() {
+                        *xsph = Vec2::ZERO;
+                    }
+                    if !vel.is_finite() {
+                        *vel = Vec2::ZERO;
+                    }
+                    if first_step {
+                        let dv = (*acc * dt).clamp_length_max(max_dv_end);
+                        *vel = (*vel + dv).clamp_length_max(15.0);
+                        let dp = ((*vel + xsph.clamp_length_max(3.0)) * dt)
+                            .clamp_length_max(0.65 * dx_val);
+                        if pos.is_finite() {
+                            *pos += dp;
+                        }
+                    } else {
+                        let dv = (*acc * half_dt).clamp_length_max(max_dv_end);
+                        *vel = (*vel + dv).clamp_length_max(15.0);
                     }
 
                     let mut rad_cool_e = 0.0f32;
@@ -1697,8 +1805,8 @@ impl ContinuumWorld {
                     }
 
                     let mut mech_e = (*energy + fo.de * dt + plastic_heat).max(0.0);
-                    if *det_state == 2 && fo.neighbors < 8 {
-                        mech_e *= (1.0 - 0.14 * dt).max(0.85);
+                    if *det_state == 2 && *det_age > 5.0 && fo.neighbors < 4 {
+                        mech_e *= (1.0 - 0.08 * dt).max(0.90);
                     }
                     let mech_de = mech_e - *energy;
                     *energy = (mech_e - rad_cool_e).max(0.0);
@@ -2276,7 +2384,8 @@ impl ContinuumWorld {
             return;
         }
         let soft = 2.8 * self.dx.max(0.1);
-        let scale = dt_eff.max(0.015);
+        let scale = dt_eff.clamp(0.005, 0.05);
+        let max_kick = (0.45 * (scale / 0.03)).min(0.55);
         let pos_ref = &self.pos;
         self.vel.par_iter_mut().enumerate().for_each(|(i, vel)| {
             let d = center - pos_ref[i];
@@ -2284,14 +2393,44 @@ impl ContinuumWorld {
             let n_hat = d / r;
             let t_hat = Vec2::new(-n_hat.y, n_hat.x);
             let a = n_hat * (strength / (r + soft)) + t_hat * (swirl / (r + 1.25 * soft));
-            let dv = (a * scale).clamp_length_max(1.25);
-            *vel += dv;
+            let dv = (a * scale).clamp_length_max(max_kick);
+            *vel = (*vel + dv).clamp_length_max(15.0);
         });
         self.gpu_dirty = true;
         self.state_epoch = self.state_epoch.wrapping_add(1);
     }
 
-    /// Detonate an instantaneous radial shockwave + thermal flash over `radius`.
+    /// Command-detonate all armed/unreacted energetics (or only within an optional `(center, radius)`).
+    pub fn detonate_explosives(&mut self, center_filter: Option<(Vec2, f32)>) -> usize {
+        let mut count = 0usize;
+        let r2_max = center_filter.map(|(_, r)| r * r).unwrap_or(f32::INFINITY);
+        for i in 0..self.pos.len() {
+            if let Some((c, _)) = center_filter {
+                if (self.pos[i] - c).length_squared() > r2_max {
+                    continue;
+                }
+            }
+            let mat = self.mat[i];
+            let m = mat.props();
+            if m.is_energetic && mat != MaterialId::ImpactFuze && self.det_state[i] == 0 {
+                self.det_state[i] = 1;
+                self.det_timer[i] = 0.01;
+                count += 1;
+            } else if mat == MaterialId::ThermitePyro && self.det_state[i] == 0 {
+                self.det_state[i] = 1;
+                self.det_age[i] = 0.0;
+                self.temp[i] = self.temp[i].max(1280.0);
+                count += 1;
+            }
+        }
+        if count > 0 {
+            self.gpu_dirty = true;
+            self.state_epoch = self.state_epoch.wrapping_add(1);
+        }
+        count
+    }
+
+    /// Detonate an instantaneous radial shockwave + Rankine-Hugoniot compression over `radius`.
     pub fn trigger_shock_blast(
         &mut self,
         center: Vec2,
@@ -2299,29 +2438,39 @@ impl ContinuumWorld {
         peak_vel: f32,
         peak_temp_k: f32,
     ) -> usize {
-        let r_max = radius.max(self.dx);
-        let r2_max = r_max * r_max;
+        let r_core = radius.max(self.dx);
+        let r_outer = 1.45 * r_core;
+        let r2_outer = r_outer * r_outer;
         let mut hit = 0usize;
         for i in 0..self.pos.len() {
             let d = self.pos[i] - center;
             let r2 = d.length_squared();
-            if r2 > r2_max {
+            if r2 > r2_outer {
                 continue;
             }
             let r = r2.sqrt();
-            let f = (1.0 - r / r_max).clamp(0.0, 1.0).powf(1.25);
+            let f = if r <= r_core {
+                (1.0 - r / r_core).clamp(0.0, 1.0).powf(1.15)
+            } else {
+                0.28 * (1.0 - (r - r_core) / (r_outer - r_core)).clamp(0.0, 1.0).powi(2)
+            };
             let dir = if r > 1e-4 { d / r } else { Vec2::X };
             let m = self.mat[i].props();
 
-            self.vel[i] += dir * (peak_vel * f / m.rho0.sqrt().max(0.55));
+            let imp = peak_vel * f * (1.8 / (0.65 + 0.35 * m.rho0.sqrt()));
+            self.vel[i] = (self.vel[i] + dir * imp).clamp_length_max(15.0);
+            if self.det_state[i] != 2 && r <= r_core {
+                self.rho[i] = (self.rho[i] + 0.16 * f * self.rho0[i]).min(1.65 * self.rho0[i]);
+            }
             let d_temp = (peak_temp_k - self.temp[i]).max(0.0) * f;
             self.energy[i] += d_temp * m.cv;
             self.temp[i] = (self.temp[i] + d_temp).clamp(50.0, 24_000.0);
-            self.shock_rate[i] += 1.4 * f;
-            self.damage[i] = (self.damage[i] + 0.90 * f * f).min(1.0);
+            self.shock_rate[i] += 1.8 * f;
+            self.damage[i] = (self.damage[i] + 0.95 * f * f).min(1.0);
             if m.category == crate::materials::MaterialCategory::ExplosivesFuzes
                 && m.detonation_vel > 0.0
                 && self.det_state[i] == 0
+                && r <= r_core
             {
                 self.det_state[i] = 1;
                 self.det_timer[i] = 0.01;

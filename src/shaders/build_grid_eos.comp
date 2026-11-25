@@ -68,11 +68,44 @@ void main() {
     Particle p = particles[i];
     vec2 pos = p.pos_vel.xy;
     vec2 vel = p.pos_vel.zw;
+    if (any(isnan(vel)) || any(isinf(vel))) {
+        vel = vec2(0.0);
+    }
 
-    // Velocity-Verlet first half-kick + XSPH drift
+    // Velocity-Verlet first half-kick + XSPH drift (substep-limited & speed-bounded)
     if (pc.step_index > 0u) {
-        vel += 0.5 * pc.dt * p.acc_xsph.xy;
-        pos += pc.dt * (vel + p.acc_xsph.zw);
+        float dt_safe = max(pc.dt, 1e-4);
+        float max_dv = 0.45 * pc.dx / dt_safe;
+        vec2 dv = 0.5 * pc.dt * p.acc_xsph.xy;
+        if (any(isnan(dv)) || any(isinf(dv))) {
+            dv = vec2(0.0);
+        }
+        float dvl = length(dv);
+        if (dvl > max_dv && dvl > 1e-8) {
+            dv *= max_dv / dvl;
+        }
+        vel += dv;
+        float vl = length(vel);
+        if (vl > 15.0) {
+            vel *= 15.0 / vl;
+        }
+        vec2 xs = p.acc_xsph.zw;
+        if (any(isnan(xs)) || any(isinf(xs))) {
+            xs = vec2(0.0);
+        }
+        float xsl = length(xs);
+        if (xsl > 3.0) {
+            xs *= 3.0 / xsl;
+        }
+        vec2 dp = pc.dt * (vel + xs);
+        float max_dp = 0.65 * pc.dx;
+        float dpl = length(dp);
+        if (dpl > max_dp && dpl > 1e-8) {
+            dp *= max_dp / dpl;
+        }
+        if (!any(isnan(pos)) && !any(isinf(pos))) {
+            pos += dp;
+        }
         p.pos_vel = vec4(pos, vel);
     }
 
@@ -104,7 +137,7 @@ void main() {
         float p_jwl = a * (1.0 - omega / (r1 * v_rel)) * exp(-r1 * v_rel)
                     + b * (1.0 - omega / (r2 * v_rel)) * exp(-r2 * v_rel)
                     + omega * rho * e;
-        sph_p = clamp(p_jwl, 0.0, 0.95);
+        sph_p = clamp(p_jwl, 0.0, 1.80);
     } else {
         float mu = clamp(rho / rho0 - 1.0, -0.16, 0.72);
         float k1 = rho0 * m.eos.y * m.eos.y;

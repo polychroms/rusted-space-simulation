@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO="polychroms/rusted-space-simulation"
-VERSION="v0.2.0"
+VERSION="v0.10.0"
 INSTALL_DIR="${INSTALL_DIR:-}"
 FROM_SOURCE=0
 
@@ -14,7 +14,7 @@ Usage:
   install.sh [options]
 
 Options:
-  --version <tag>   GitHub release tag to install (default: v0.2.0)
+  --version <tag>   GitHub release tag to install (default: v0.10.0)
   --dir <path>      Target bin directory (default: ~/bin, or /usr/local/bin if root)
   --from-source     Download GitHub source archive and build with cargo --release
   -h, --help        Show this help message
